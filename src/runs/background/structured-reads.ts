@@ -123,7 +123,9 @@ export interface SubagentCapabilities {
 		getTranscript: true;
 		getCapabilities: true;
 	};
-	rpcMethods: readonly ["ping", "status", "spawn", "interrupt", "stop", "listRuns", "getRun", "awaitRuns", "getTranscript", "getCapabilities", "steer", "resume"];
+	rpcMethods: readonly ["ping", "status", "spawn", "interrupt", "stop", "listRuns", "getRun", "awaitRuns", "getTranscript", "getCapabilities", "steer", "resume", "allocateWorktree", "getWorktree", "acquireCheckoutLease", "getCheckoutLease", "releaseCheckoutLease", "recoverCheckoutLease"];
+	worktrees: { allocate: true; get: true };
+	checkoutLeases: { acquire: true; get: true; release: true; recover: true };
 	toolActions: {
 		status: true;
 		fleet: true;
@@ -670,7 +672,9 @@ export function getSubagentCapabilities(): SubagentCapabilities {
 			getTranscript: true,
 			getCapabilities: true,
 		},
-		rpcMethods: ["ping", "status", "spawn", "interrupt", "stop", "listRuns", "getRun", "awaitRuns", "getTranscript", "getCapabilities", "steer", "resume"],
+		rpcMethods: ["ping", "status", "spawn", "interrupt", "stop", "listRuns", "getRun", "awaitRuns", "getTranscript", "getCapabilities", "steer", "resume", "allocateWorktree", "getWorktree", "acquireCheckoutLease", "getCheckoutLease", "releaseCheckoutLease", "recoverCheckoutLease"],
+		worktrees: { allocate: true, get: true },
+		checkoutLeases: { acquire: true, get: true, release: true, recover: true },
 		toolActions: {
 			status: true,
 			fleet: true,

@@ -28,7 +28,9 @@ describe("structured owner reads (P-02)", () => {
 			getTranscript: true,
 			getCapabilities: true,
 		});
-		assert.deepEqual(capabilities.rpcMethods, ["ping", "status", "spawn", "interrupt", "stop", "listRuns", "getRun", "awaitRuns", "getTranscript", "getCapabilities", "steer", "resume"]);
+		assert.deepEqual(capabilities.rpcMethods, ["ping", "status", "spawn", "interrupt", "stop", "listRuns", "getRun", "awaitRuns", "getTranscript", "getCapabilities", "steer", "resume", "allocateWorktree", "getWorktree", "acquireCheckoutLease", "getCheckoutLease", "releaseCheckoutLease", "recoverCheckoutLease"]);
+		assert.deepEqual(capabilities.worktrees, { allocate: true, get: true });
+		assert.deepEqual(capabilities.checkoutLeases, { acquire: true, get: true, release: true, recover: true });
 		assert.equal(capabilities.controls.takeover, false);
 		assert.equal(capabilities.toolActions.steer, true);
 		assert.equal(capabilities.toolActions.resume, true);
