@@ -1,21 +1,63 @@
+import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Compile } from "typebox/compile";
 import { resolveAsyncRunLocation } from "../runs/background/async-resume.ts";
 import { deliverTimeoutRequest } from "../runs/background/control-channel.ts";
+import {
+	buildAsyncResultTranscriptPage,
+	buildAsyncRunTranscriptPage,
+	buildNestedRunTranscriptPage,
+	getSubagentCapabilities,
+	listSubagentRunSnapshots,
+	type SubagentRunSnapshot,
+} from "../runs/background/structured-reads.ts";
 import { reconcileAsyncRun } from "../runs/background/stale-run-reconciler.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
-import { type Details, ASYNC_DIR, RESULTS_DIR } from "../shared/types.ts";
+import {
+	type Details,
+	type SubagentControlOperationV1,
+	type SubagentState,
+	ASYNC_DIR,
+	RESULTS_DIR,
+	SUBAGENT_ASYNC_COMPLETE_EVENT,
+	SUBAGENT_ASYNC_STARTED_EVENT,
+	SUBAGENT_CONTROL_EVENT,
+} from "../shared/types.ts";
 import { readStatus } from "../shared/utils.ts";
-import { SubagentParams } from "./schemas.ts";
+import { writeAtomicJson } from "../shared/atomic-json.ts";
+import {
+	SubagentParams,
+	SubagentRpcAwaitRunsV1,
+	SubagentRpcControlV1,
+	SubagentRpcEmptyV1,
+	SubagentRpcLegacyControlV1,
+	SubagentRpcRunTargetV1,
+	SubagentRpcTranscriptV1,
+} from "./schemas.ts";
 
 export const SUBAGENT_RPC_PROTOCOL_VERSION = 1;
 export const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 export const SUBAGENT_RPC_READY_EVENT = "subagents:rpc:v1:ready";
 export const SUBAGENT_RPC_REPLY_EVENT_PREFIX = "subagents:rpc:v1:reply:";
+export const SUBAGENT_LIFECYCLE_EVENT = "subagents:lifecycle:v1:event";
 
-export const SUBAGENT_RPC_METHODS = ["ping", "status", "spawn", "interrupt", "stop"] as const;
+export const SUBAGENT_RPC_METHODS = [
+	"ping",
+	"status",
+	"spawn",
+	"interrupt",
+	"stop",
+	"listRuns",
+	"getRun",
+	"awaitRuns",
+	"getTranscript",
+	"getCapabilities",
+	"steer",
+	"resume",
+] as const;
 export type SubagentRpcMethod = typeof SUBAGENT_RPC_METHODS[number];
 
 export interface SubagentRpcRequestEnvelope {
@@ -54,7 +96,8 @@ type SubagentRpcErrorCode =
 	| "no_active_session"
 	| "execution_failed"
 	| "not_found"
-	| "invalid_state";
+	| "invalid_state"
+	| "revision_conflict";
 
 interface EventBus {
 	on(event: string, handler: (data: unknown) => void): (() => void) | void;
@@ -71,10 +114,14 @@ interface RegisterSubagentRpcBridgeOptions {
 		onUpdate: ((result: AgentToolResult<Details>) => void) | undefined,
 		ctx: ExtensionContext,
 	) => Promise<AgentToolResult<Details>>;
+	state?: SubagentState;
+	ownerInstance?: string;
 	asyncDirRoot?: string;
 	resultsDir?: string;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	now?: () => number;
+	sleep?: (ms: number) => Promise<void>;
+	pollIntervalMs?: number;
 }
 
 class SubagentRpcError extends Error {
@@ -88,6 +135,14 @@ class SubagentRpcError extends Error {
 }
 
 const subagentParamsValidator = Compile(SubagentParams);
+const rpcParamValidators = {
+	empty: Compile(SubagentRpcEmptyV1),
+	target: Compile(SubagentRpcRunTargetV1),
+	legacyControl: Compile(SubagentRpcLegacyControlV1),
+	control: Compile(SubagentRpcControlV1),
+	awaitRuns: Compile(SubagentRpcAwaitRunsV1),
+	transcript: Compile(SubagentRpcTranscriptV1),
+};
 
 export function subagentRpcReplyEvent(requestId: string): string {
 	return `${SUBAGENT_RPC_REPLY_EVENT_PREFIX}${requestId}`;
@@ -95,6 +150,10 @@ export function subagentRpcReplyEvent(requestId: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function now(options: RegisterSubagentRpcBridgeOptions): number {
+	return options.now?.() ?? Date.now();
 }
 
 function assertRequestId(value: unknown): string {
@@ -108,6 +167,37 @@ function assertRecordParams(params: unknown, method: SubagentRpcMethod): Record<
 	if (params === undefined) return {};
 	if (!isRecord(params)) throw new SubagentRpcError("invalid_params", `RPC ${method} params must be an object.`);
 	return params;
+}
+
+function validateRpcParams(
+	params: unknown,
+	method: SubagentRpcMethod,
+	validator: { Check(value: unknown): boolean; Errors(value: unknown): Iterable<{ message: string }> },
+): Record<string, unknown> {
+	const input = assertRecordParams(params, method);
+	if (validator.Check(input)) return input;
+	const messages = [...validator.Errors(input)]
+		.slice(0, 4)
+		.map((error) => error.message);
+	throw new SubagentRpcError("invalid_params", `RPC ${method} params: ${messages.join("; ")}`);
+}
+
+function optionalString(input: Record<string, unknown>, key: string): string | undefined {
+	const value = input[key];
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || !value.trim()) {
+		throw new SubagentRpcError("invalid_params", `${key} must be a non-empty string.`);
+	}
+	return value;
+}
+
+function optionalInteger(input: Record<string, unknown>, key: string): number | undefined {
+	const value = input[key];
+	if (value === undefined) return undefined;
+	if (!Number.isInteger(value) || (value as number) < 0) {
+		throw new SubagentRpcError("invalid_params", `${key} must be a non-negative integer.`);
+	}
+	return value as number;
 }
 
 function assertSubagentParams(params: SubagentParamsLike, label: string): void {
@@ -157,21 +247,22 @@ function sessionData(ctx: ExtensionContext | null): { cwd?: string; sessionId?: 
 	};
 }
 
-function pingData(ctx: ExtensionContext | null) {
+function ownerInstance(options: RegisterSubagentRpcBridgeOptions): string {
+	return options.ownerInstance ?? "pi-subagents";
+}
+
+function pingData(ctx: ExtensionContext | null, options: RegisterSubagentRpcBridgeOptions) {
 	return {
 		version: SUBAGENT_RPC_PROTOCOL_VERSION,
 		methods: [...SUBAGENT_RPC_METHODS],
-		capabilities: {
-			status: true,
-			asyncSpawn: true,
-			interrupt: true,
-			stop: true,
-		},
+		capabilities: getSubagentCapabilities(),
 		events: {
 			ready: SUBAGENT_RPC_READY_EVENT,
 			request: SUBAGENT_RPC_REQUEST_EVENT,
 			replyPrefix: SUBAGENT_RPC_REPLY_EVENT_PREFIX,
+			lifecycle: SUBAGENT_LIFECYCLE_EVENT,
 		},
+		ownerInstance: ownerInstance(options),
 		session: sessionData(ctx),
 	};
 }
@@ -202,6 +293,201 @@ function spawnParams(params: unknown): SubagentParamsLike {
 		throw new SubagentRpcError("invalid_params", "RPC spawn cannot open the clarify UI; omit clarify or set clarify: false.");
 	}
 	return { ...(input as SubagentParamsLike), async: true, clarify: false };
+}
+
+function snapshots(options: RegisterSubagentRpcBridgeOptions): SubagentRunSnapshot[] {
+	const runs = listSubagentRunSnapshots({
+		asyncDirRoot: options.asyncDirRoot,
+		resultsDir: options.resultsDir,
+		kill: options.kill,
+		now: options.now,
+		state: options.state,
+		ownerInstance: ownerInstance(options),
+	});
+	const operations = readOperationsByRun(options);
+	return runs.map((run) => ({ ...run, operations: operations.get(run.runId) ?? [] }));
+}
+
+function targetId(input: Record<string, unknown>): string {
+	const id = optionalString(input, "id") ?? optionalString(input, "runId");
+	if (!id) throw new SubagentRpcError("invalid_params", "id or runId is required.");
+	return id;
+}
+
+function findRun(options: RegisterSubagentRpcBridgeOptions, id: string): SubagentRunSnapshot {
+	const matches = snapshots(options).filter((run) => run.runId === id || run.runId.startsWith(id));
+	const exact = matches.find((run) => run.runId === id);
+	if (exact) return exact;
+	if (matches.length === 0) throw new SubagentRpcError("not_found", `Run '${id}' was not found.`);
+	if (matches.length > 1) throw new SubagentRpcError("invalid_params", `Run id prefix '${id}' is ambiguous.`);
+	return matches[0]!;
+}
+
+function operationDir(options: RegisterSubagentRpcBridgeOptions): string {
+	return path.join(options.resultsDir ?? RESULTS_DIR, ".rpc-operations");
+}
+
+function operationPath(options: RegisterSubagentRpcBridgeOptions, operationId: string): string {
+	return path.join(operationDir(options), `${Buffer.from(operationId).toString("base64url")}.json`);
+}
+
+function readOperation(
+	options: RegisterSubagentRpcBridgeOptions,
+	operationId: string,
+): SubagentControlOperationV1 | undefined {
+	try {
+		return JSON.parse(fs.readFileSync(operationPath(options, operationId), "utf-8")) as SubagentControlOperationV1;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+function readOperationsByRun(options: RegisterSubagentRpcBridgeOptions): Map<string, SubagentControlOperationV1[]> {
+	const byRun = new Map<string, SubagentControlOperationV1[]>();
+	const dir = operationDir(options);
+	if (!fs.existsSync(dir)) return byRun;
+	for (const name of fs.readdirSync(dir)) {
+		try {
+			const value = JSON.parse(fs.readFileSync(path.join(dir, name), "utf-8")) as SubagentControlOperationV1;
+			const values = byRun.get(value.runId) ?? [];
+			values.push(value);
+			byRun.set(value.runId, values);
+		} catch {
+			// Ignore malformed operation evidence while preserving other queryable outcomes.
+		}
+	}
+	for (const values of byRun.values()) {
+		values.sort((a, b) => a.createdAt - b.createdAt);
+	}
+	return byRun;
+}
+
+function writeOperation(options: RegisterSubagentRpcBridgeOptions, operation: SubagentControlOperationV1): void {
+	writeAtomicJson(operationPath(options, operation.operationId), operation);
+}
+
+function ownerControlOutcome(
+	result: AgentToolResult<Details>,
+	action: "interrupt" | "steer" | "resume",
+	runId: string,
+): SubagentControlOperationV1["outcome"] {
+	const control = result.details?.control;
+	if (!control || control.action !== action || (control.runId && control.runId !== runId)) {
+		throw new SubagentRpcError("execution_failed", `Owner did not report a valid structured ${action} outcome for run '${runId}'.`);
+	}
+	if (result.isError && control.outcome !== "unsupported") {
+		throw new SubagentRpcError("execution_failed", `Owner ${action} operation failed.`);
+	}
+	return control.outcome;
+}
+
+async function controlOperation(
+	request: SubagentRpcRequestEnvelope,
+	options: RegisterSubagentRpcBridgeOptions,
+	ctx: ExtensionContext,
+): Promise<SubagentControlOperationV1> {
+	const input = validateRpcParams(request.params, request.method, rpcParamValidators.control);
+	const runId = targetId(input);
+	const operationId = optionalString(input, "operationId")!;
+	const prior = readOperation(options, operationId);
+	if (prior) {
+		if (prior.runId !== runId || prior.action !== request.method) {
+			throw new SubagentRpcError("invalid_params", `operationId '${operationId}' is already bound to another control.`);
+		}
+		return prior;
+	}
+
+	const run = findRun(options, runId);
+	const expectedRevision = optionalString(input, "expectedRevision");
+	let operation: SubagentControlOperationV1 = {
+		version: 1,
+		operationId,
+		action: request.method as SubagentControlOperationV1["action"],
+		runId: run.runId,
+		expectedRevision,
+		observedRevision: run.revision,
+		state: "accepted",
+		outcome: "queued",
+		createdAt: now(options),
+		updatedAt: now(options),
+	};
+	if (run.evidence.status === "invalid") {
+		operation = {
+			...operation,
+			state: "rejected",
+			outcome: "failed",
+			message: run.evidence.failures.join(" "),
+			updatedAt: now(options),
+		};
+		writeOperation(options, operation);
+		return operation;
+	}
+	if (expectedRevision && expectedRevision !== run.revision) {
+		operation = {
+			...operation,
+			state: "rejected",
+			outcome: "revision_conflict",
+			message: `Expected revision '${expectedRevision}', observed '${run.revision}'.`,
+			updatedAt: now(options),
+		};
+		writeOperation(options, operation);
+		return operation;
+	}
+	const availability = run.allowedActions.find((entry) => entry.action === request.method);
+	if (availability && availability.availability !== "available") {
+		operation = {
+			...operation,
+			state: "completed",
+			outcome: "unsupported",
+			message: availability.reason ?? `Owner reported ${request.method} unsupported.`,
+			updatedAt: now(options),
+		};
+		writeOperation(options, operation);
+		return operation;
+	}
+
+	writeOperation(options, operation);
+	try {
+		let outcome: SubagentControlOperationV1["outcome"];
+		if (request.method === "stop") {
+			stopAsyncRun({ ...input, id: run.runId }, options, ctx);
+			outcome = "delivered";
+		} else {
+			const params: SubagentParamsLike = {
+				action: request.method,
+				id: run.runId,
+				...(input.index !== undefined ? { index: input.index as number } : {}),
+				...(typeof input.message === "string" ? { message: input.message } : {}),
+			};
+			const controller = new AbortController();
+			const result = await options.execute(
+				`rpc-${request.method}-${operationId}`,
+				params,
+				controller.signal,
+				undefined,
+				ctx,
+			);
+			outcome = ownerControlOutcome(result, request.method, run.runId);
+		}
+		operation = {
+			...operation,
+			state: "completed",
+			outcome,
+			...(outcome === "unsupported" ? { message: `Owner reported ${request.method} unsupported.` } : {}),
+			updatedAt: now(options),
+		};
+	} catch (error) {
+		operation = {
+			...operation,
+			state: "failed",
+			outcome: "failed",
+			message: error instanceof Error ? error.message : String(error),
+			updatedAt: now(options),
+		};
+	}
+	writeOperation(options, operation);
+	return operation;
 }
 
 function stopAsyncRun(
@@ -267,26 +553,116 @@ function stopAsyncRun(
 	};
 }
 
+async function awaitRuns(params: unknown, options: RegisterSubagentRpcBridgeOptions) {
+	const input = validateRpcParams(params, "awaitRuns", rpcParamValidators.awaitRuns);
+	const ids = Array.isArray(input.runIds)
+		? input.runIds.map((value) => {
+			if (typeof value !== "string" || !value) {
+				throw new SubagentRpcError("invalid_params", "runIds must contain non-empty strings.");
+			}
+			return value;
+		})
+		: [targetId(input)];
+	const revisions = isRecord(input.revisions) ? input.revisions : {};
+	const timeoutMs = optionalInteger(input, "timeoutMs") ?? 30 * 60 * 1000;
+	const started = now(options);
+	while (true) {
+		const runs = ids.map((id) => findRun(options, id));
+		const terminal = runs.some((run) => run.settlement.terminal);
+		const changed = runs.some((run) => (
+			typeof revisions[run.runId] === "string" && revisions[run.runId] !== run.revision
+		));
+		if (terminal || changed || now(options) - started >= timeoutMs) {
+			return {
+				reason: terminal ? "terminal" : changed ? "changed" : "timeout",
+				runs,
+			};
+		}
+		const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+		await sleep(Math.max(10, options.pollIntervalMs ?? 250));
+	}
+}
+
+function transcript(params: unknown, options: RegisterSubagentRpcBridgeOptions) {
+	const input = validateRpcParams(params, "getTranscript", rpcParamValidators.transcript);
+	const run = findRun(options, targetId(input));
+	const index = optionalInteger(input, "index");
+	const lines = optionalInteger(input, "lines");
+	if (run.kind === "remembered-foreground") {
+		throw new SubagentRpcError("invalid_state", "Remembered foreground transcript paging is unavailable; inspect its artifact links.");
+	}
+	if (run.kind === "nested") {
+		const candidates = [
+			...(options.state?.foregroundControls.values() ?? []),
+			...(options.state?.asyncJobs.values() ?? []),
+		].flatMap((entry) => entry.nestedChildren ?? []);
+		const nested = candidates.find((entry) => entry.id === run.runId);
+		if (!nested) throw new SubagentRpcError("not_found", `Nested run '${run.runId}' was not found.`);
+		return buildNestedRunTranscriptPage(nested, { index, lines });
+	}
+	const location = resolveAsyncRunLocation(
+		{ id: run.runId },
+		options.asyncDirRoot ?? ASYNC_DIR,
+		options.resultsDir ?? RESULTS_DIR,
+	);
+	if (location.asyncDir) {
+		const status = readStatus(location.asyncDir);
+		if (status) return buildAsyncRunTranscriptPage(status, location.asyncDir, { index, lines });
+	}
+	if (location.resultPath) {
+		const data = JSON.parse(fs.readFileSync(location.resultPath, "utf-8"));
+		return buildAsyncResultTranscriptPage(data, location.resultPath, { index, lines });
+	}
+	throw new SubagentRpcError("not_found", `Transcript for '${run.runId}' was not found.`);
+}
+
 async function handleRequest(
 	request: SubagentRpcRequestEnvelope,
 	options: RegisterSubagentRpcBridgeOptions,
 ): Promise<unknown> {
 	const ctx = options.getContext();
-	if (request.method === "ping") return pingData(ctx);
+	if (request.method === "ping") return pingData(ctx, options);
 	if (!ctx) throw new SubagentRpcError("no_active_session", "No active extension context for subagent RPC.");
 
 	if (request.method === "spawn") {
 		return executeChecked(options, ctx, request.requestId, request.method, spawnParams(request.params));
 	}
 	if (request.method === "status") {
-		return executeChecked(options, ctx, request.requestId, request.method, { action: "status", ...normalizeTargetParams(request.params, "status") });
+		return executeChecked(options, ctx, request.requestId, request.method, {
+			action: "status",
+			...normalizeTargetParams(request.params, "status"),
+		});
 	}
-	if (request.method === "interrupt") {
-		return executeChecked(options, ctx, request.requestId, request.method, { action: "interrupt", ...normalizeTargetParams(request.params, "interrupt") });
+	if (["interrupt", "stop", "steer", "resume"].includes(request.method)) {
+		const rawInput = assertRecordParams(request.params, request.method);
+		const legacy = rawInput.operationId === undefined && rawInput.expectedRevision === undefined;
+		if (legacy && request.method === "interrupt") {
+			validateRpcParams(request.params, request.method, rpcParamValidators.legacyControl);
+			return executeChecked(options, ctx, request.requestId, request.method, {
+				action: "interrupt",
+				...normalizeTargetParams(request.params, "interrupt"),
+			});
+		}
+		if (legacy && request.method === "stop") {
+			validateRpcParams(request.params, request.method, rpcParamValidators.legacyControl);
+			return stopAsyncRun(request.params, options, ctx);
+		}
+		return controlOperation(request, options, ctx);
 	}
-	if (request.method === "stop") {
-		return stopAsyncRun(request.params, options, ctx);
+	if (request.method === "getCapabilities") {
+		validateRpcParams(request.params, request.method, rpcParamValidators.empty);
+		return getSubagentCapabilities();
 	}
+	if (request.method === "listRuns") {
+		validateRpcParams(request.params, request.method, rpcParamValidators.empty);
+		return { version: 1, runs: snapshots(options) };
+	}
+	if (request.method === "getRun") {
+		const input = validateRpcParams(request.params, "getRun", rpcParamValidators.target);
+		return findRun(options, targetId(input));
+	}
+	if (request.method === "awaitRuns") return awaitRuns(request.params, options);
+	if (request.method === "getTranscript") return transcript(request.params, options);
 	throw new SubagentRpcError("unsupported_method", `Unsupported subagent RPC method: ${String(request.method)}`);
 }
 
@@ -336,15 +712,24 @@ function errorReply(raw: unknown, error: unknown): SubagentRpcReplyEnvelope {
 	};
 }
 
+function lifecycleRunId(payload: unknown): string | undefined {
+	if (!isRecord(payload)) return undefined;
+	if (typeof payload.runId === "string") return payload.runId;
+	return typeof payload.id === "string" ? payload.id : undefined;
+}
+
 export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOptions): {
 	emitReady: (ctx?: ExtensionContext | null) => void;
 	dispose: () => void;
 } {
-	const unsubscribe = options.events.on(SUBAGENT_RPC_REQUEST_EVENT, async (raw) => {
+	const instance = options.ownerInstance ?? randomUUID();
+	const effective = { ...options, ownerInstance: instance };
+	const unsubscribes: Array<() => void> = [];
+	const requestUnsubscribe = options.events.on(SUBAGENT_RPC_REQUEST_EVENT, async (raw) => {
 		let request: SubagentRpcRequestEnvelope | undefined;
 		try {
 			request = parseRequest(raw);
-			const data = await handleRequest(request, options);
+			const data = await handleRequest(request, effective);
 			options.events.emit(subagentRpcReplyEvent(request.requestId), {
 				version: SUBAGENT_RPC_PROTOCOL_VERSION,
 				requestId: request.requestId,
@@ -357,13 +742,34 @@ export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOpti
 			options.events.emit(subagentRpcReplyEvent(reply.requestId), reply);
 		}
 	});
+	if (typeof requestUnsubscribe === "function") unsubscribes.push(requestUnsubscribe);
+
+	const lifecycleEvents = [
+		[SUBAGENT_ASYNC_STARTED_EVENT, "started"],
+		[SUBAGENT_ASYNC_COMPLETE_EVENT, "settled"],
+		[SUBAGENT_CONTROL_EVENT, "control"],
+	] as const;
+	for (const [source, reason] of lifecycleEvents) {
+		const unsubscribe = options.events.on(source, (payload) => {
+			const runId = lifecycleRunId(payload);
+			options.events.emit(SUBAGENT_LIFECYCLE_EVENT, {
+				version: 1,
+				owner: "pi-subagents",
+				ownerInstance: instance,
+				...(runId ? { runId } : {}),
+				reason,
+				observedAt: now(options),
+			});
+		});
+		if (typeof unsubscribe === "function") unsubscribes.push(unsubscribe);
+	}
 
 	return {
 		emitReady: (ctx) => {
-			options.events.emit(SUBAGENT_RPC_READY_EVENT, pingData(ctx ?? options.getContext()));
+			options.events.emit(SUBAGENT_RPC_READY_EVENT, pingData(ctx ?? options.getContext(), effective));
 		},
 		dispose: () => {
-			if (typeof unsubscribe === "function") unsubscribe();
+			for (const unsubscribe of unsubscribes.splice(0)) unsubscribe();
 		},
 	};
 }

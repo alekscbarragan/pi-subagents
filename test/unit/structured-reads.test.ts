@@ -7,6 +7,7 @@ import { formatAsyncRunTranscript } from "../../src/runs/background/fleet-view.t
 import {
 	SUBAGENT_STRUCTURED_READ_VERSION,
 	buildAsyncRunTranscriptPage,
+	getRememberedForegroundSnapshot,
 	getSubagentCapabilities,
 	getSubagentRunSnapshotFromAsyncStatus,
 	listSubagentRunSnapshots,
@@ -16,17 +17,18 @@ import {
 import type { AsyncStatus, NestedRunSummary, SubagentState } from "../../src/shared/types.ts";
 
 describe("structured owner reads (P-02)", () => {
-	it("advertises structured read capabilities without changing RPC method registrations", () => {
+	it("advertises structured read and RPC capabilities", () => {
 		const capabilities = getSubagentCapabilities();
 		assert.equal(capabilities.version, SUBAGENT_STRUCTURED_READ_VERSION);
 		assert.equal(capabilities.owner, "pi-subagents");
 		assert.deepEqual(capabilities.structuredReads, {
 			listRuns: true,
 			getRun: true,
+			awaitRuns: true,
 			getTranscript: true,
 			getCapabilities: true,
 		});
-		assert.deepEqual(capabilities.rpcMethods, ["ping", "status", "spawn", "interrupt", "stop"]);
+		assert.deepEqual(capabilities.rpcMethods, ["ping", "status", "spawn", "interrupt", "stop", "listRuns", "getRun", "awaitRuns", "getTranscript", "getCapabilities", "steer", "resume"]);
 		assert.equal(capabilities.controls.takeover, false);
 		assert.equal(capabilities.toolActions.steer, true);
 		assert.equal(capabilities.toolActions.resume, true);
@@ -130,6 +132,21 @@ describe("structured owner reads (P-02)", () => {
 		assert.equal(nestedSnapshot.cwd, undefined);
 	});
 
+	it("does not claim remembered foreground output final without durable result evidence", () => {
+		const snapshot = getRememberedForegroundSnapshot({
+			runId: "remembered-1",
+			mode: "single",
+			cwd: "/repo",
+			updatedAt: 10,
+			children: [{ agent: "worker", index: 0, status: "completed", finalOutput: "done" }],
+		});
+
+		assert.equal(snapshot.settlement.terminal, true);
+		assert.equal(snapshot.settlement.output, "incomplete");
+		assert.equal(snapshot.settlement.artifacts, "incomplete");
+		assert.match(snapshot.settlement.reasons[0] ?? "", /no durable result\/output evidence/i);
+	});
+
 	it("reports owner truncation on transcript pages and preserves human renderer output", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-structured-reads-transcript-"));
 		try {
@@ -172,7 +189,7 @@ describe("structured owner reads (P-02)", () => {
 		assert.ok(live.find((entry) => entry.action === "interrupt")?.availability === "available");
 		assert.ok(live.find((entry) => entry.action === "stop")?.availability === "available");
 		assert.ok(live.find((entry) => entry.action === "steer")?.availability === "available");
-		assert.ok(live.find((entry) => entry.action === "resume")?.availability === "unavailable");
+		assert.ok(live.find((entry) => entry.action === "resume")?.availability === "available");
 
 		const paused = resolveAllowedActions({ kind: "async", state: "paused", hasSessionFile: true });
 		assert.ok(paused.find((entry) => entry.action === "resume")?.availability === "available");

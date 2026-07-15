@@ -555,7 +555,7 @@ function interruptAsyncRun(
 		}
 		return {
 			content: [{ type: "text", text: `Interrupt requested for async run ${target.asyncId}.` }],
-			details: { mode: "management", results: [] },
+			details: { mode: "management", results: [], control: { action: "interrupt", outcome: "delivered", runId: target.asyncId } },
 		};
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -623,7 +623,7 @@ function steerAsyncRun(input: {
 	const childText = input.index !== undefined ? ` child ${input.index}` : " running child";
 	return {
 		content: [{ type: "text", text: `Steering queued for async run ${status.runId}${childText}. Delivery requires a live Pi child session that supports mid-run steering.` }],
-		details: { mode: "management", results: [] },
+		details: { mode: "management", results: [], control: { action: "steer", outcome: "queued", runId: status.runId, ...(input.index !== undefined ? { index: input.index } : {}) } },
 	};
 }
 
@@ -906,7 +906,7 @@ function directNestedAsyncInterrupt(target: ResolvedSubagentRunId & { kind: "nes
 	if (!status || status.state !== "running" || typeof pid !== "number" || pid <= 0) return undefined;
 	try {
 		deliverInterruptRequest({ asyncDir, pid, source: "nested-interrupt" });
-		return { content: [{ type: "text", text: `Interrupt requested for nested async run ${run.id}.` }], details: { mode: "management", results: [] } };
+		return { content: [{ type: "text", text: `Interrupt requested for nested async run ${run.id}.` }], details: { mode: "management", results: [], control: { action: "interrupt", outcome: "delivered", runId: run.id } } };
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return { content: [{ type: "text", text: `Failed to interrupt nested async run ${run.id}: ${message}` }], isError: true, details: { mode: "management", results: [] } };
@@ -926,7 +926,7 @@ function directNestedAsyncSteer(input: { target: ResolvedSubagentRunId & { kind:
 		if (step && step.status !== "running" && step.status !== "pending") return { content: [{ type: "text", text: `Nested async run ${run.id} child ${input.index} is ${step.status} and cannot be steered.` }], isError: true, details: { mode: "management", results: [] } };
 	}
 	requestAsyncSteer(asyncDir, { message: input.message, targetIndex: input.index, source: "nested-steer" });
-	return { content: [{ type: "text", text: `Steering queued for nested async run ${run.id}. Delivery requires a live Pi child session that supports mid-run steering.` }], details: { mode: "management", results: [] } };
+	return { content: [{ type: "text", text: `Steering queued for nested async run ${run.id}. Delivery requires a live Pi child session that supports mid-run steering.` }], details: { mode: "management", results: [], control: { action: "steer", outcome: "queued", runId: run.id, ...(input.index !== undefined ? { index: input.index } : {}) } } };
 }
 
 async function interruptNestedRun(target: ResolvedSubagentRunId & { kind: "nested" }): Promise<AgentToolResult<Details>> {
@@ -935,7 +935,7 @@ async function interruptNestedRun(target: ResolvedSubagentRunId & { kind: "neste
 	if (run.state === "failed") return { content: [{ type: "text", text: `Nested run ${run.id} has failed and cannot be interrupted.` }], isError: true, details: { mode: "management", results: [] } };
 	if (run.state === "paused") return { content: [{ type: "text", text: `Nested run ${run.id} is already paused.` }], isError: true, details: { mode: "management", results: [] } };
 	const result = await sendNestedControlRequest(target, "interrupt");
-	if (result) return { content: [{ type: "text", text: result.message }], isError: result.ok ? undefined : true, details: { mode: "management", results: [] } };
+	if (result) return { content: [{ type: "text", text: result.message }], isError: result.ok ? undefined : true, details: { mode: "management", results: [], control: { action: "interrupt", outcome: result.ok ? "delivered" : "unsupported", runId: run.id } } };
 	const direct = directNestedAsyncInterrupt(target);
 	if (direct) return direct;
 	return { content: [{ type: "text", text: `Nested run ${run.id} owner is not reachable and no safe direct async interrupt fallback is available.` }], isError: true, details: { mode: "management", results: [] } };
@@ -944,8 +944,8 @@ async function interruptNestedRun(target: ResolvedSubagentRunId & { kind: "neste
 async function resumeLiveNestedRun(input: { target: ResolvedSubagentRunId & { kind: "nested" }; message: string }): Promise<AgentToolResult<Details>> {
 	const run = input.target.match.run;
 	const result = await sendNestedControlRequest(input.target, "resume", input.message);
-	if (result) return { content: [{ type: "text", text: result.message }], isError: result.ok ? undefined : true, details: { mode: "management", results: [] } };
-	return { content: [{ type: "text", text: `Nested run ${run.id} appears live but its owner route is not reachable. Wait for completion, then retry action='resume'.` }], isError: true, details: { mode: "management", results: [] } };
+	if (result) return { content: [{ type: "text", text: result.message }], isError: result.ok ? undefined : true, details: { mode: "management", results: [], control: { action: "resume", outcome: result.ok ? "delivered" : "unsupported", runId: run.id } } };
+	return { content: [{ type: "text", text: `Nested run ${run.id} appears live but its owner route is not reachable. Wait for completion, then retry action='resume'.` }], isError: true, details: { mode: "management", results: [], control: { action: "resume", outcome: "unsupported", runId: run.id } } };
 }
 
 function steerNestedRun(input: { target: ResolvedSubagentRunId & { kind: "nested" }; message: string; index?: number }): AgentToolResult<Details> {
@@ -953,7 +953,7 @@ function steerNestedRun(input: { target: ResolvedSubagentRunId & { kind: "nested
 	if (run.state !== "running" && run.state !== "queued") return { content: [{ type: "text", text: `Nested run ${run.id} is ${run.state} and cannot be steered.` }], isError: true, details: { mode: "management", results: [] } };
 	const direct = directNestedAsyncSteer(input);
 	if (direct) return direct;
-	return { content: [{ type: "text", text: `Nested run ${run.id} is not a live async Pi child session with a steering inbox. action='steer' cannot target foreground nested runs.` }], isError: true, details: { mode: "management", results: [] } };
+	return { content: [{ type: "text", text: `Nested run ${run.id} is not a live async Pi child session with a steering inbox. action='steer' cannot target foreground nested runs.` }], isError: true, details: { mode: "management", results: [], control: { action: "steer", outcome: "unsupported", runId: run.id } } };
 }
 
 async function resumeAsyncRun(input: {
@@ -1032,13 +1032,13 @@ async function resumeAsyncRun(input: {
 		if (delivered) {
 			return {
 				content: [{ type: "text", text: [`Interrupted live async child, then delivered follow-up.`, `Run: ${target.runId}`, `Intercom target: ${target.intercomTarget}`].join("\n") }],
-				details: { mode: "management", results: [] },
+				details: { mode: "management", results: [], control: { action: "resume", outcome: "delivered", runId: target.runId, index: target.index } },
 			};
 		}
 		return {
 			content: [{ type: "text", text: [`Async child appears live but its intercom target is not registered.`, `Run: ${target.runId}`, `Intercom target: ${target.intercomTarget}`, `Wait for completion, then retry action='resume'.`].join("\n") }],
 			isError: true,
-			details: { mode: "management", results: [] },
+			details: { mode: "management", results: [], control: { action: "resume", outcome: "unsupported", runId: target.runId, index: target.index } },
 		};
 	}
 
@@ -1195,7 +1195,7 @@ async function resumeAsyncRun(input: {
 		revivedTarget ? `Intercom target: ${revivedTarget} (if registered)` : undefined,
 		`Status if needed: subagent({ action: "status", id: "${revivedId}" })`,
 	].filter((line): line is string => Boolean(line));
-	return { content: [{ type: "text", text: formatAsyncStartedMessage(lines.join("\n")) }], details: result.details };
+	return { content: [{ type: "text", text: formatAsyncStartedMessage(lines.join("\n")) }], details: { ...result.details, control: { action: "resume", outcome: "revived", runId: target.runId, index: target.index } } };
 }
 
 function resultSummaryForIntercom(result: SingleResult): string {
@@ -3214,7 +3214,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					return { content: [{ type: "text", text }], isError: true, details: { mode: "management", results: [] } };
 				}
 				if (resolved?.kind === "nested") return steerNestedRun({ target: resolved, message, index: paramsWithResolvedCwd.index });
-				if (resolved?.kind === "foreground") return { content: [{ type: "text", text: "action='steer' currently supports live async Pi child sessions only; use action='interrupt' or action='resume' for foreground runs." }], isError: true, details: { mode: "management", results: [] } };
+				if (resolved?.kind === "foreground") return { content: [{ type: "text", text: "action='steer' currently supports live async Pi child sessions only; use action='interrupt' or action='resume' for foreground runs." }], isError: true, details: { mode: "management", results: [], control: { action: "steer", outcome: "unsupported", runId: resolved.id } } };
 				if (resolved?.kind !== "async") return { content: [{ type: "text", text: `No async run found for '${targetRunId}'.` }], isError: true, details: { mode: "management", results: [] } };
 				return steerAsyncRun({ state: deps.state, runId: resolved.id, message, index: paramsWithResolvedCwd.index, kill: deps.kill, location: resolved.location });
 			}
@@ -3251,7 +3251,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						foreground.currentActivityState = undefined;
 						return {
 							content: [{ type: "text", text: `Interrupt requested for foreground run ${foreground.runId}.` }],
-							details: { mode: "management", results: [] },
+							details: { mode: "management", results: [], control: { action: "interrupt", outcome: "delivered", runId: foreground.runId } },
 						};
 					}
 					return {

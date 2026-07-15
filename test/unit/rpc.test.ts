@@ -4,7 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { timeoutRequestPath } from "../../src/runs/background/control-channel.ts";
+import { SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT } from "../../src/shared/types.ts";
 import {
+	SUBAGENT_LIFECYCLE_EVENT,
 	SUBAGENT_RPC_PROTOCOL_VERSION,
 	SUBAGENT_RPC_READY_EVENT,
 	SUBAGENT_RPC_REQUEST_EVENT,
@@ -195,12 +197,17 @@ describe("subagent extension RPC bridge", () => {
 				executedParams = params;
 				return { content: [{ type: "text", text: "Interrupt requested for async run abc123." }], details: { mode: "management", results: [] } } as any;
 			},
+			state: { foregroundControls: new Map() } as any,
 		});
 
 		const reply = await request(events, "interrupt-1", "interrupt", { id: "abc123" });
 
 		assert.equal(reply.success, true);
 		assert.deepEqual(executedParams, { action: "interrupt", id: "abc123" });
+		assert.deepEqual((reply as any).data, {
+			text: "Interrupt requested for async run abc123.",
+			details: { mode: "management", results: [] },
+		});
 
 		bridge.dispose();
 	});
@@ -244,6 +251,211 @@ describe("subagent extension RPC bridge", () => {
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("exposes structured lifecycle reads, capabilities, await, transcripts, and event-loss reconciliation", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-reads-"));
+		try {
+			const events = new FakeEvents();
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			const asyncDir = path.join(asyncRoot, "run-read");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-read", sessionId: "session-123", mode: "single", state: "running", cwd: root,
+				startedAt: 100, lastUpdate: 200, currentStep: 0,
+				steps: [{ agent: "worker", status: "running", startedAt: 100 }],
+			}), "utf-8");
+			fs.writeFileSync(path.join(asyncDir, "output-0.log"), "one\ntwo\nthree\n", "utf-8");
+			const state = { currentSessionId: "session-123", baseCwd: root, foregroundControls: new Map(), foregroundRuns: new Map(), asyncJobs: new Map() } as any;
+			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => assert.fail("reads must not call executor"), state, asyncDirRoot: asyncRoot, resultsDir, kill: () => true, ownerInstance: "owner-read" });
+
+			const capabilities = await request(events, "caps-1", "getCapabilities");
+			assert.equal(capabilities.success, true);
+			assert.equal((capabilities as any).data.structuredReads.awaitRuns, true);
+
+			// No lifecycle event was emitted for this fixture: durable reread still discovers it.
+			const listed = await request(events, "list-1", "listRuns");
+			assert.equal(listed.success, true);
+			assert.equal((listed as any).data.runs[0].runId, "run-read");
+			assert.equal((listed as any).data.runs[0].checkoutIdentity.canonicalPath, fs.realpathSync(root));
+
+			const got = await request(events, "get-1", "getRun", { id: "run-read" });
+			assert.equal((got as any).data.revision, "run-read:running:200");
+			assert.equal((got as any).data.settlement.output, "pending");
+
+			const awaited = await request(events, "await-1", "awaitRuns", { runId: "run-read", revisions: { "run-read": "older" }, timeoutMs: 1 });
+			assert.equal((awaited as any).data.reason, "changed");
+
+			const transcript = await request(events, "transcript-1", "getTranscript", { id: "run-read", lines: 2 });
+			assert.deepEqual((transcript as any).data.lines, ["two", "three"]);
+			assert.equal((transcript as any).data.truncated, true);
+			assert.equal((transcript as any).data.finality, "pending");
+			bridge.dispose();
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("keeps evidence failures local to the affected run and rejects only its control", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-evidence-"));
+		try {
+			const events = new FakeEvents(); const asyncRoot = path.join(root, "runs"); const resultsDir = path.join(root, "results");
+			for (const [runId, cwd, lastUpdate] of [["run-healthy", root, 20], ["run-no-evidence", undefined, 10]] as const) {
+				const dir = path.join(asyncRoot, runId); fs.mkdirSync(dir, { recursive: true });
+				fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ runId, sessionId: "session-123", mode: "single", state: "running", ...(cwd ? { cwd } : {}), startedAt: 1, lastUpdate, steps: [{ agent: "worker", status: "running" }] }), "utf-8");
+			}
+			let executeCalls = 0;
+			const state = { currentSessionId: "session-123", baseCwd: root, foregroundControls: new Map(), foregroundRuns: new Map(), asyncJobs: new Map() } as any;
+			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => { executeCalls++; return { content: [], details: { mode: "management", results: [] } } as any; }, state, asyncDirRoot: asyncRoot, resultsDir, kill: () => true });
+			const listed = await request(events, "evidence-list", "listRuns");
+			assert.equal(listed.success, true);
+			const runs = (listed as any).data.runs;
+			assert.equal(runs.find((run: any) => run.runId === "run-healthy").evidence.status, "valid");
+			assert.equal(runs.find((run: any) => run.runId === "run-no-evidence").evidence.status, "invalid");
+			const healthy = await request(events, "evidence-get", "getRun", { id: "run-healthy" });
+			assert.equal((healthy as any).data.runId, "run-healthy");
+			const rejected = await request(events, "evidence-control", "steer", { id: "run-no-evidence", operationId: "op-no-evidence", message: "continue" });
+			assert.equal((rejected as any).data.state, "rejected");
+			assert.match((rejected as any).data.message, /cwd/i);
+			assert.equal(executeCalls, 0);
+			bridge.dispose();
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("treats paused runs as non-terminal when awaiting", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-paused-"));
+		try {
+			const events = new FakeEvents(); const asyncRoot = path.join(root, "runs"); const resultsDir = path.join(root, "results"); const dir = path.join(asyncRoot, "run-paused");
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ runId: "run-paused", sessionId: "session-123", mode: "single", state: "paused", cwd: root, startedAt: 1, lastUpdate: 2, steps: [{ agent: "worker", status: "paused" }] }), "utf-8");
+			const state = { currentSessionId: "session-123", baseCwd: root, foregroundControls: new Map(), foregroundRuns: new Map(), asyncJobs: new Map() } as any;
+			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => assert.fail("await must not execute"), state, asyncDirRoot: asyncRoot, resultsDir });
+			const got = await request(events, "paused-get", "getRun", { id: "run-paused" });
+			assert.equal((got as any).data.settlement.terminal, false);
+			assert.equal((got as any).data.settlement.output, "pending");
+			const awaited = await request(events, "paused-await", "awaitRuns", { runId: "run-paused", timeoutMs: 0 });
+			assert.equal((awaited as any).data.reason, "timeout");
+			bridge.dispose();
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("strictly validates new RPC params and control indexes", async () => {
+		const events = new FakeEvents();
+		const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => assert.fail("invalid params must not execute") });
+		for (const [id, method, params] of [
+			["invalid-empty", "getCapabilities", { extra: true }],
+			["invalid-target", "getRun", { id: "run", extra: true }],
+			["invalid-transcript", "getTranscript", { id: "run", lines: 0 }],
+			["invalid-index", "interrupt", { id: "run", index: 1.5 }],
+			["invalid-control", "steer", { id: "run", operationId: "op", message: "x", extra: true }],
+		] as const) {
+			const reply = await request(events, id, method, params);
+			assert.equal(reply.success, false);
+			assert.equal((reply as any).error.code, "invalid_params");
+		}
+		bridge.dispose();
+	});
+
+	it("emits additive lifecycle hints for existing lifecycle events", async () => {
+		const events = new FakeEvents();
+		const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => assert.fail("events must not execute"), ownerInstance: "owner-events", now: () => 444 });
+		const started = once(events, SUBAGENT_LIFECYCLE_EVENT) as Promise<any>;
+		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: "run-event" });
+		assert.deepEqual(await started, { version: 1, owner: "pi-subagents", ownerInstance: "owner-events", runId: "run-event", reason: "started", observedAt: 444 });
+		const settled = once(events, SUBAGENT_LIFECYCLE_EVENT) as Promise<any>;
+		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { runId: "run-event" });
+		assert.equal((await settled).reason, "settled");
+		bridge.dispose();
+	});
+
+	it("persists revision-aware control outcomes, replays operation ids, and exposes them through getRun", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-controls-"));
+		try {
+			const events = new FakeEvents();
+			const asyncRoot = path.join(root, "runs"); const resultsDir = path.join(root, "results"); const asyncDir = path.join(asyncRoot, "run-control");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "run-control", sessionId: "session-123", mode: "single", state: "running", cwd: root, startedAt: 100, lastUpdate: 200, steps: [{ agent: "worker", status: "running" }] }), "utf-8");
+			const state = { currentSessionId: "session-123", baseCwd: root, foregroundControls: new Map(), foregroundRuns: new Map(), asyncJobs: new Map() } as any;
+			const calls: any[] = [];
+			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async (_id, params) => {
+				calls.push(params);
+				if (params.message === "missing-outcome") return { content: [{ type: "text", text: "owner result without structured outcome" }], details: { mode: "management", results: [] } } as any;
+				const outcome = params.message === "unsupported" ? "unsupported" : params.action === "resume" ? "revived" : params.action === "steer" ? "queued" : "delivered";
+				return { content: [{ type: "text", text: "owner result" }], ...(outcome === "unsupported" ? { isError: true } : {}), details: { mode: "management", results: [], control: { action: params.action, outcome, runId: params.id } } } as any;
+			}, state, asyncDirRoot: asyncRoot, resultsDir, kill: () => true, now: () => 300 });
+
+			const conflict = await request(events, "conflict", "interrupt", { id: "run-control", operationId: "op-conflict", expectedRevision: "stale" });
+			assert.equal((conflict as any).data.state, "rejected");
+			assert.equal((conflict as any).data.outcome, "revision_conflict");
+			assert.equal(calls.length, 0);
+
+			for (const [method, operationId, message, outcome] of [["interrupt", "op-interrupt", undefined, "delivered"], ["stop", "op-stop", undefined, "delivered"], ["steer", "op-steer", "focus", "queued"], ["resume", "op-resume", "continue", "revived"]] as const) {
+				const reply = await request(events, operationId, method, { id: "run-control", operationId, expectedRevision: "run-control:running:200", ...(message ? { message } : {}) });
+				assert.equal((reply as any).data.state, "completed");
+				assert.equal((reply as any).data.outcome, outcome);
+			}
+			const unsupported = await request(events, "unsupported-request", "steer", { id: "run-control", operationId: "op-unsupported", message: "unsupported" });
+			assert.equal((unsupported as any).data.state, "completed");
+			assert.equal((unsupported as any).data.outcome, "unsupported");
+			assert.doesNotMatch((unsupported as any).data.message, /owner result/);
+
+			const missingOutcome = await request(events, "missing-outcome-request", "steer", { id: "run-control", operationId: "op-missing-outcome", message: "missing-outcome" });
+			assert.equal((missingOutcome as any).data.state, "failed");
+			assert.match((missingOutcome as any).data.message, /structured steer outcome/);
+
+			const steerCallsBeforeReplay = calls.filter((entry) => entry.action === "steer").length;
+			const replay = await request(events, "replay-request", "steer", { id: "run-control", operationId: "op-steer", expectedRevision: "run-control:running:200", message: "different ignored replay" });
+			assert.equal((replay as any).data.operationId, "op-steer");
+			assert.equal(calls.filter((entry) => entry.action === "steer").length, steerCallsBeforeReplay);
+
+			const queried = await request(events, "query-operations", "getRun", { id: "run-control" });
+			assert.deepEqual((queried as any).data.operations.map((entry: any) => entry.operationId).sort(), ["op-conflict", "op-interrupt", "op-missing-outcome", "op-resume", "op-steer", "op-stop", "op-unsupported"]);
+			bridge.dispose();
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("keeps an accepted operation durable after the registering caller disposes", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-abort-"));
+		try {
+			const events = new FakeEvents(); const asyncRoot = path.join(root, "runs"); const resultsDir = path.join(root, "results"); const asyncDir = path.join(asyncRoot, "run-abort");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "run-abort", sessionId: "session-123", mode: "single", state: "running", cwd: root, startedAt: 1, lastUpdate: 2, steps: [{ agent: "worker", status: "running" }] }), "utf-8");
+			const state = { currentSessionId: "session-123", baseCwd: root, foregroundControls: new Map(), foregroundRuns: new Map(), asyncJobs: new Map() } as any;
+			let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async (_id, params) => { await gate; return { content: [{ type: "text", text: "ok" }], details: { mode: "management", results: [], control: { action: "steer", outcome: "queued", runId: params.id } } } as any; }, state, asyncDirRoot: asyncRoot, resultsDir, now: () => 9 });
+			const replyPromise = once(events, subagentRpcReplyEvent("abort-control")) as Promise<any>;
+			events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "abort-control", method: "steer", params: { id: "run-abort", operationId: "op-abort", message: "continue" } });
+			await new Promise((resolve) => setImmediate(resolve));
+			bridge.dispose(); release();
+			assert.equal((await replyPromise).data.state, "completed");
+
+			const reader = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => assert.fail("query must not execute"), state, asyncDirRoot: asyncRoot, resultsDir });
+			const queried = await request(events, "abort-query", "getRun", { id: "run-abort" });
+			assert.equal((queried as any).data.operations.find((entry: any) => entry.operationId === "op-abort").state, "completed");
+			reader.dispose();
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("reports terminal output and artifacts explicitly incomplete without durable final evidence", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-finality-"));
+		try {
+			const events = new FakeEvents(); const asyncRoot = path.join(root, "runs"); const resultsDir = path.join(root, "results"); const asyncDir = path.join(asyncRoot, "run-incomplete");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "run-incomplete", sessionId: "session-123", mode: "single", state: "failed", cwd: root, startedAt: 1, endedAt: 2, lastUpdate: 2, currentStep: 0, steps: [{ agent: "worker", status: "failed" }] }), "utf-8");
+			fs.writeFileSync(path.join(asyncDir, "output-0.log"), "one\ntwo\nthree\n", "utf-8");
+			const state = { currentSessionId: "session-123", baseCwd: root, foregroundControls: new Map(), foregroundRuns: new Map(), asyncJobs: new Map() } as any;
+			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => assert.fail("read must not execute"), state, asyncDirRoot: asyncRoot, resultsDir, kill: () => true });
+			const reply = await request(events, "incomplete", "getRun", { id: "run-incomplete" });
+			assert.equal((reply as any).data.settlement.terminal, true);
+			assert.equal((reply as any).data.settlement.output, "incomplete");
+			assert.equal((reply as any).data.settlement.artifacts, "incomplete");
+			assert.ok((reply as any).data.settlement.reasons.length >= 1);
+			const transcript = await request(events, "incomplete-transcript", "getTranscript", { id: "run-incomplete", lines: 2 });
+			assert.equal((transcript as any).data.truncated, true);
+			assert.equal((transcript as any).data.finality, "incomplete");
+			assert.equal("cursor" in (transcript as any).data, false);
+			assert.equal("nextCursor" in (transcript as any).data, false);
+			bridge.dispose();
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
 	it("rejects stop requests for async runs from a different session", async () => {

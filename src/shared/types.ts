@@ -214,6 +214,29 @@ export type SubagentRunMode = "single" | "parallel" | "chain";
 export const SUBAGENT_LIFECYCLE_ARTIFACT_VERSION = 1;
 export type SubagentLifecycleArtifactVersion = typeof SUBAGENT_LIFECYCLE_ARTIFACT_VERSION;
 
+export interface SubagentControlOperationV1 {
+	version: 1;
+	operationId: string;
+	action: "interrupt" | "stop" | "steer" | "resume";
+	runId: string;
+	expectedRevision?: string;
+	observedRevision: string;
+	state: "accepted" | "completed" | "rejected" | "failed";
+	outcome: "queued" | "delivered" | "revived" | "unsupported" | "revision_conflict" | "failed";
+	message?: string;
+	createdAt: number;
+	updatedAt: number;
+}
+
+export interface SubagentLifecycleHintV1 {
+	version: 1;
+	owner: "pi-subagents";
+	ownerInstance: string;
+	runId?: string;
+	reason: "started" | "settled" | "control";
+	observedAt: number;
+}
+
 export type PublicNestedStepSummary = Pick<
 	NestedStepSummary,
 	"agent" | "status" | "sessionFile" | "transcriptPath" | "transcriptError" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "startedAt" | "endedAt" | "error" | "timedOut"
@@ -503,6 +526,12 @@ export interface SingleResult {
 
 export interface Details {
 	mode: SubagentRunMode | "management";
+	control?: {
+		action: "interrupt" | "steer" | "resume";
+		outcome: "queued" | "delivered" | "revived" | "unsupported";
+		runId?: string;
+		index?: number;
+	};
 	runId?: string;
 	context?: "fresh" | "fork";
 	results: SingleResult[];

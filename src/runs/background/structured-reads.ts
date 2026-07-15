@@ -13,6 +13,7 @@ import {
 	type NestedRunSummary,
 	type SubagentRunMode,
 	type SubagentState,
+	type SubagentControlOperationV1,
 } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { formatAsyncRunOutputPath, listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
@@ -67,6 +68,9 @@ export interface SubagentRunSnapshot {
 	state: string;
 	mode?: SubagentRunMode | string;
 	cwd?: string;
+	checkoutIdentity?: { canonicalPath: string };
+	evidence: { status: "valid" | "invalid"; failures: string[] };
+	authority: { access: "unknown" | "read" | "write"; evidence: "unavailable" | "observed"; scope?: string[] };
 	parentRunId?: string;
 	rootRunId?: string;
 	agent?: string;
@@ -80,6 +84,13 @@ export interface SubagentRunSnapshot {
 	artifacts: SubagentArtifactLinks;
 	children: SubagentChildSnapshot[];
 	allowedActions: SubagentAllowedAction[];
+	operations: SubagentControlOperationV1[];
+	settlement: {
+		terminal: boolean;
+		output: "pending" | "final" | "incomplete";
+		artifacts: "pending" | "final" | "incomplete";
+		reasons: string[];
+	};
 }
 
 export interface SubagentTranscriptPage {
@@ -92,6 +103,7 @@ export interface SubagentTranscriptPage {
 	agent?: string;
 	source: string;
 	lines: string[];
+	finality: "pending" | "final" | "incomplete";
 	truncated: boolean;
 	lineLimit: number;
 	warnings: string[];
@@ -107,10 +119,11 @@ export interface SubagentCapabilities {
 	structuredReads: {
 		listRuns: true;
 		getRun: true;
+		awaitRuns: true;
 		getTranscript: true;
 		getCapabilities: true;
 	};
-	rpcMethods: readonly ["ping", "status", "spawn", "interrupt", "stop"];
+	rpcMethods: readonly ["ping", "status", "spawn", "interrupt", "stop", "listRuns", "getRun", "awaitRuns", "getTranscript", "getCapabilities", "steer", "resume"];
 	toolActions: {
 		status: true;
 		fleet: true;
@@ -368,6 +381,52 @@ function revisionFrom(...parts: Array<string | number | undefined>): string {
 	return parts.filter((part) => part !== undefined && part !== "").join(":");
 }
 
+function canonicalPath(cwd: string | undefined): string | undefined {
+	if (!cwd) return undefined;
+	try {
+		return fs.realpathSync(cwd);
+	} catch {
+		return path.resolve(cwd);
+	}
+}
+
+function snapshotEvidence(input: {
+	runId: string;
+	state: string;
+	cwd?: string;
+	artifacts: SubagentArtifactLinks;
+	resultFinal?: boolean;
+}) {
+	const canonical = canonicalPath(input.cwd);
+	const terminal = ["complete", "completed", "failed", "remembered foreground"].includes(input.state);
+	const finalEvidence = input.resultFinal === true;
+	const reasons: string[] = [];
+	if (terminal && !finalEvidence) reasons.push("Owner terminal state has no durable result/output evidence.");
+	const evidenceFailures = [
+		...(!input.cwd ? ["Observed cwd is unavailable."] : []),
+		...(!canonical ? ["Canonical checkout identity is unavailable."] : []),
+	];
+	return {
+		...(canonical ? { checkoutIdentity: { canonicalPath: canonical } } : {}),
+		evidence: { status: evidenceFailures.length ? "invalid" as const : "valid" as const, failures: evidenceFailures },
+		authority: { access: "unknown" as const, evidence: "unavailable" as const },
+		operations: [],
+		settlement: {
+			terminal,
+			output: terminal ? (finalEvidence ? "final" as const : "incomplete" as const) : "pending" as const,
+			artifacts: terminal ? (finalEvidence ? "final" as const : "incomplete" as const) : "pending" as const,
+			reasons,
+		},
+	};
+}
+
+function transcriptEvidence(state: string, lines: string[], truncated: boolean) {
+	const terminal = ["complete", "completed", "failed", "remembered foreground"].includes(state);
+	return {
+		finality: terminal ? (!truncated && lines.length > 0 ? "final" as const : "incomplete" as const) : "pending" as const,
+	};
+}
+
 function hasExistingSessionFile(value: unknown): value is string {
 	return typeof value === "string" && fs.existsSync(value);
 }
@@ -397,7 +456,7 @@ export function resolveAllowedActions(input: {
 		if (input.kind === "async") actions.push(available("stop"));
 		else actions.push(unavailable("stop", "Stop is only supported for running async runs."));
 		actions.push(available("steer"));
-		actions.push(unavailable("resume", "Resume requires a paused or terminal run with a persisted session."));
+		actions.push(available("resume"));
 	} else if (paused) {
 		actions.push(unavailable("interrupt", "Run is already paused."));
 		actions.push(unavailable("stop", "Stop only supports running async runs."));
@@ -428,10 +487,19 @@ function allowedActionsForAsync(run: Pick<AsyncRunSummary, "state" | "sessionFil
 	return resolveAllowedActions({ kind: "async", state: run.state, hasSessionFile: hasSession });
 }
 
-function snapshotFromAsyncSummary(run: AsyncRunSummary, ownerInstance?: string): SubagentRunSnapshot {
+function snapshotFromAsyncSummary(run: AsyncRunSummary, ownerInstance?: string, resultsDir = RESULTS_DIR): SubagentRunSnapshot {
 	const outputPath = formatAsyncRunOutputPath(run);
 	const eventsPath = path.join(run.asyncDir, "events.jsonl");
 	const logPath = path.join(run.asyncDir, `subagent-log-${run.id}.md`);
+	const resultPath = path.join(resultsDir, `${run.id}.json`);
+	const artifacts: SubagentArtifactLinks = {
+		asyncDir: run.asyncDir,
+		...(outputPath ? { outputPaths: [outputPath] } : {}),
+		...(run.sessionFile ? { sessionFile: run.sessionFile } : {}),
+		...(fs.existsSync(eventsPath) ? { eventsPath } : {}),
+		...(fs.existsSync(logPath) ? { logPath } : {}),
+		...(fs.existsSync(resultPath) ? { resultPath } : {}),
+	};
 	return {
 		version: SUBAGENT_STRUCTURED_READ_VERSION,
 		kind: "async",
@@ -449,13 +517,8 @@ function snapshotFromAsyncSummary(run: AsyncRunSummary, ownerInstance?: string):
 		updatedAt: run.lastUpdate,
 		endedAt: run.endedAt,
 		error: run.error,
-		artifacts: {
-			asyncDir: run.asyncDir,
-			...(outputPath ? { outputPaths: [outputPath] } : {}),
-			...(run.sessionFile ? { sessionFile: run.sessionFile } : {}),
-			...(fs.existsSync(eventsPath) ? { eventsPath } : {}),
-			...(fs.existsSync(logPath) ? { logPath } : {}),
-		},
+		artifacts,
+		...snapshotEvidence({ runId: run.id, state: run.state, cwd: run.cwd, artifacts, resultFinal: fs.existsSync(resultPath) }),
 		children: run.steps.map((step) => ({
 			index: step.index,
 			agent: step.agent,
@@ -498,7 +561,8 @@ function snapshotFromAsyncStatus(status: AsyncStatus, asyncDir: string, ownerIns
 	return snapshotFromAsyncSummary(summaryLike, ownerInstance);
 }
 
-function snapshotFromForegroundControl(control: ForegroundControl, ownerInstance?: string): SubagentRunSnapshot {
+function snapshotFromForegroundControl(control: ForegroundControl, ownerInstance?: string, cwd?: string): SubagentRunSnapshot {
+	const artifacts: SubagentArtifactLinks = {};
 	return {
 		version: SUBAGENT_STRUCTURED_READ_VERSION,
 		kind: "foreground",
@@ -507,12 +571,14 @@ function snapshotFromForegroundControl(control: ForegroundControl, ownerInstance
 		revision: revisionFrom(control.runId, "running", control.updatedAt),
 		state: "running",
 		mode: control.mode,
+		...(cwd ? { cwd } : {}),
 		agent: control.currentAgent,
 		activityState: control.currentActivityState,
 		lastActivityAt: control.lastActivityAt,
 		startedAt: control.startedAt,
 		updatedAt: control.updatedAt,
-		artifacts: {},
+		artifacts,
+		...snapshotEvidence({ runId: control.runId, state: "running", cwd, artifacts }),
 		children: control.currentAgent
 			? [{
 				index: control.currentIndex ?? 0,
@@ -526,6 +592,12 @@ function snapshotFromForegroundControl(control: ForegroundControl, ownerInstance
 
 function snapshotFromRememberedForeground(run: ForegroundResumeRun, ownerInstance?: string): SubagentRunSnapshot {
 	const hasSession = run.children.some((child) => child.status !== "detached" && hasExistingSessionFile(child.sessionFile));
+	const artifacts: SubagentArtifactLinks = {
+		...(run.children.find((child) => child.sessionFile)?.sessionFile
+			? { sessionFile: run.children.find((child) => child.sessionFile)!.sessionFile }
+			: {}),
+		outputPaths: run.children.flatMap((child) => child.artifactPaths?.outputPath ? [child.artifactPaths.outputPath] : []),
+	};
 	return {
 		version: SUBAGENT_STRUCTURED_READ_VERSION,
 		kind: "remembered-foreground",
@@ -536,11 +608,8 @@ function snapshotFromRememberedForeground(run: ForegroundResumeRun, ownerInstanc
 		mode: run.mode,
 		cwd: run.cwd,
 		updatedAt: run.updatedAt,
-		artifacts: {
-			...(run.children.find((child) => child.sessionFile)?.sessionFile
-				? { sessionFile: run.children.find((child) => child.sessionFile)!.sessionFile }
-				: {}),
-		},
+		artifacts,
+		...snapshotEvidence({ runId: run.runId, state: "remembered foreground", cwd: run.cwd, artifacts }),
 		children: run.children.map((child) => ({
 			index: child.index,
 			agent: child.agent,
@@ -552,9 +621,13 @@ function snapshotFromRememberedForeground(run: ForegroundResumeRun, ownerInstanc
 	};
 }
 
-export function snapshotFromNestedRun(run: NestedRunSummary, rootRunId?: string, ownerInstance?: string): SubagentRunSnapshot {
+export function snapshotFromNestedRun(run: NestedRunSummary, rootRunId?: string, ownerInstance?: string, cwd?: string): SubagentRunSnapshot {
 	const hasSession = hasExistingSessionFile(run.sessionFile)
 		|| (run.steps ?? []).some((step) => hasExistingSessionFile(step.sessionFile));
+	const artifacts: SubagentArtifactLinks = {
+		...(run.asyncDir ? { asyncDir: run.asyncDir } : {}),
+		...(run.sessionFile ? { sessionFile: run.sessionFile } : {}),
+	};
 	return {
 		version: SUBAGENT_STRUCTURED_READ_VERSION,
 		kind: "nested",
@@ -563,6 +636,7 @@ export function snapshotFromNestedRun(run: NestedRunSummary, rootRunId?: string,
 		revision: revisionFrom(run.id, run.state, run.lastActivityAt ?? run.startedAt),
 		state: run.state,
 		mode: run.mode,
+		...(cwd ? { cwd } : {}),
 		parentRunId: run.parentRunId,
 		rootRunId: rootRunId,
 		agent: run.agent,
@@ -571,10 +645,8 @@ export function snapshotFromNestedRun(run: NestedRunSummary, rootRunId?: string,
 		lastActivityAt: run.lastActivityAt,
 		startedAt: run.startedAt,
 		error: run.error,
-		artifacts: {
-			...(run.asyncDir ? { asyncDir: run.asyncDir } : {}),
-			...(run.sessionFile ? { sessionFile: run.sessionFile } : {}),
-		},
+		artifacts,
+		...snapshotEvidence({ runId: run.id, state: run.state, cwd, artifacts }),
 		children: (run.steps ?? []).map((step, index) => ({
 			index,
 			agent: step.agent,
@@ -594,10 +666,11 @@ export function getSubagentCapabilities(): SubagentCapabilities {
 		structuredReads: {
 			listRuns: true,
 			getRun: true,
+			awaitRuns: true,
 			getTranscript: true,
 			getCapabilities: true,
 		},
-		rpcMethods: ["ping", "status", "spawn", "interrupt", "stop"],
+		rpcMethods: ["ping", "status", "spawn", "interrupt", "stop", "listRuns", "getRun", "awaitRuns", "getTranscript", "getCapabilities", "steer", "resume"],
 		toolActions: {
 			status: true,
 			fleet: true,
@@ -618,18 +691,33 @@ export function listSubagentRunSnapshots(deps: StructuredReadDeps = {}): Subagen
 	if (deps.childSafe) return [];
 
 	const asyncRuns = listAsyncRuns(deps.asyncDirRoot ?? ASYNC_DIR, {
-		states: ["queued", "running"],
 		sessionId: deps.state?.currentSessionId ?? undefined,
 		resultsDir: deps.resultsDir ?? RESULTS_DIR,
 		kill: deps.kill,
 		now: deps.now,
 	});
 	const foreground = deps.state ? [...deps.state.foregroundControls.values()] : [];
-	const snapshots = [
-		...foreground.map((control) => snapshotFromForegroundControl(control, deps.ownerInstance)),
-		...asyncRuns.map((run) => snapshotFromAsyncSummary(run, deps.ownerInstance)),
+	const remembered = deps.state?.foregroundRuns ? [...deps.state.foregroundRuns.values()] : [];
+	const nestedRoots = [
+		...foreground.flatMap((control) => control.nestedChildren ?? []),
+		...[...(deps.state?.asyncJobs?.values() ?? [])].flatMap((job) => job.nestedChildren ?? []),
 	];
-	return snapshots.sort((left, right) => (right.updatedAt ?? right.startedAt ?? 0) - (left.updatedAt ?? left.startedAt ?? 0));
+	const nested: SubagentRunSnapshot[] = [];
+	const visitNested = (run: NestedRunSummary, rootRunId?: string) => {
+		nested.push(snapshotFromNestedRun(run, rootRunId, deps.ownerInstance, deps.state?.baseCwd));
+		for (const child of run.children ?? []) visitNested(child, rootRunId ?? run.id);
+		for (const child of run.steps?.flatMap((step) => step.children ?? []) ?? []) visitNested(child, rootRunId ?? run.id);
+	};
+	for (const run of nestedRoots) visitNested(run, run.parentRunId);
+	const snapshots = [
+		...foreground.map((control) => snapshotFromForegroundControl(control, deps.ownerInstance, deps.state?.baseCwd)),
+		...remembered.map((run) => snapshotFromRememberedForeground(run, deps.ownerInstance)),
+		...asyncRuns.map((run) => snapshotFromAsyncSummary(run, deps.ownerInstance, deps.resultsDir ?? RESULTS_DIR)),
+		...nested,
+	];
+	const unique = new Map<string, SubagentRunSnapshot>();
+	for (const snapshot of snapshots) if (!unique.has(`${snapshot.kind}:${snapshot.runId}`)) unique.set(`${snapshot.kind}:${snapshot.runId}`, snapshot);
+	return [...unique.values()].sort((left, right) => (right.updatedAt ?? right.startedAt ?? 0) - (left.updatedAt ?? left.startedAt ?? 0));
 }
 
 export function getSubagentRunSnapshotFromAsyncStatus(
@@ -697,6 +785,7 @@ export function buildAsyncRunTranscriptPage(
 		...(selected.step ? { agent: selected.step.agent } : {}),
 		source: transcriptSource,
 		lines: transcriptLines,
+		...transcriptEvidence(status.state, transcriptLines, truncated),
 		truncated,
 		lineLimit,
 		warnings,
@@ -730,6 +819,7 @@ export function buildNestedRunTranscriptPage(run: NestedRunSummary, options: Tra
 			...(run.agent ? { agent: run.agent } : {}),
 			source: "Transcript tail",
 			lines: [],
+			...transcriptEvidence(run.state, [], false),
 			truncated: false,
 			lineLimit,
 			warnings: [],
@@ -748,6 +838,7 @@ export function buildNestedRunTranscriptPage(run: NestedRunSummary, options: Tra
 		...(run.agent ? { agent: run.agent } : {}),
 		source: `Session transcript tail from ${run.sessionFile}`,
 		lines: sessionTail.lines,
+		...transcriptEvidence(run.state, sessionTail.lines, false),
 		truncated: false,
 		lineLimit,
 		warnings: sessionTail.warnings,
@@ -787,15 +878,17 @@ export function buildAsyncResultTranscriptPage(data: {
 	const allLines = output.split(/\r?\n/);
 	const transcriptLines = allLines.slice(-lineLimit).filter((line) => line.trim());
 	const sessionFile = child?.sessionFile ?? data.sessionFile;
+	const state = data.state ?? (data.success ? "complete" : "failed");
 	return {
 		version: SUBAGENT_STRUCTURED_READ_VERSION,
 		runId,
 		kind: "result",
-		state: data.state ?? (data.success ? "complete" : "failed"),
+		state,
 		...(index !== undefined ? { index } : {}),
 		...(child?.agent ? { agent: child.agent } : {}),
 		source: "Result transcript tail",
 		lines: transcriptLines,
+		...transcriptEvidence(state, transcriptLines, allLines.length > lineLimit),
 		truncated: allLines.length > lineLimit,
 		lineLimit,
 		warnings: [],
