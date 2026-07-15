@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -44,9 +45,17 @@ function once(events: FakeEvents, event: string): Promise<unknown> {
 	});
 }
 
-function ctx() {
+function createGitRepo(root: string): string {
+	const repo = path.join(root, "repo"); fs.mkdirSync(repo);
+	const git = (args: string[]) => { const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf-8" }); if (result.status !== 0) throw new Error(result.stderr.trim() || result.stdout.trim()); };
+	git(["init"]); git(["config", "user.email", "test@example.com"]); git(["config", "user.name", "Test"]);
+	fs.writeFileSync(path.join(repo, "tracked.txt"), "initial\n"); git(["add", "tracked.txt"]); git(["commit", "--no-verify", "-m", "initial"]);
+	return repo;
+}
+
+function ctx(cwd = "/repo") {
 	return {
-		cwd: "/repo",
+		cwd,
 		sessionManager: {
 			getSessionId: () => "session-123",
 			getSessionFile: () => "/sessions/parent.jsonl",
@@ -455,6 +464,51 @@ describe("subagent extension RPC bridge", () => {
 			assert.equal("cursor" in (transcript as any).data, false);
 			assert.equal("nextCursor" in (transcript as any).data, false);
 			bridge.dispose();
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("exercises owner worktree and authenticated checkout lease RPC methods", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-u3-"));
+		try {
+			const repo = createGitRepo(root); const events = new FakeEvents();
+			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(repo), execute: async () => assert.fail("owner operations must not execute a child"), checkoutLeaseRoot: path.join(root, "leases"), worktreeAllocationRoot: path.join(root, "allocations"), worktreeBaseDir: path.join(root, "candidates"), ownerInstance: "owner-u3" });
+			const callerDestination = await request(events, "alloc-caller-dir", "allocateWorktree", { operationId: "candidate-op", ownerId: "workflow", cwd: repo, baseDir: path.join(root, "caller-selected") });
+			assert.equal(callerDestination.success, false); assert.equal((callerDestination as any).error.code, "invalid_params");
+			const allocated = await request(events, "alloc", "allocateWorktree", { operationId: "candidate-op", ownerId: "workflow", cwd: repo });
+			assert.equal((allocated as any).data.state, "allocated");
+			assert.ok((allocated as any).data.worktree.path.startsWith(path.join(root, "candidates")));
+			const replay = await request(events, "alloc-replay", "allocateWorktree", { operationId: "candidate-op", ownerId: "workflow", cwd: repo });
+			assert.equal((replay as any).data.generation, (allocated as any).data.generation);
+			const gotWorktree = await request(events, "get-worktree", "getWorktree", { operationId: "candidate-op", ownerId: "workflow" });
+			assert.equal((gotWorktree as any).data.worktree.path, (allocated as any).data.worktree.path);
+			const acquired = await request(events, "acquire", "acquireCheckoutLease", { operationId: "lease-op", ownerId: "workflow", workflowRunId: "wf", nodeId: "integrate", attempt: 0, cwd: repo });
+			assert.equal(acquired.success, true); const lease = (acquired as any).data;
+			const gotLease = await request(events, "get-lease", "getCheckoutLease", { cwd: repo }); assert.equal((gotLease as any).data.lease.leaseId, lease.leaseId);
+			const credential = { leaseId: lease.leaseId, operationId: lease.operationId, ownerId: lease.ownerId, generation: lease.generation, authToken: lease.authToken };
+			const wrong = await request(events, "wrong-release", "releaseCheckoutLease", { ...credential, generation: "wrong", cwd: repo, terminalEvidence: { kind: "external-terminal", reference: "terminal", observedTerminalAt: Date.now() } });
+			assert.equal(wrong.success, false); assert.equal((wrong as any).error.code, "authentication_failed");
+			const released = await request(events, "release", "releaseCheckoutLease", { ...credential, cwd: repo, terminalEvidence: { kind: "external-terminal", reference: "terminal", observedTerminalAt: Date.now() } });
+			assert.equal((released as any).data.state, "released");
+			const orphan = await request(events, "orphan", "acquireCheckoutLease", { operationId: "orphan-op", ownerId: "workflow", workflowRunId: "wf", nodeId: "integrate", attempt: 1, cwd: repo }); const orphanLease = (orphan as any).data;
+			const blockedRecovery = await request(events, "recover-blocked", "recoverCheckoutLease", { cwd: repo, leaseId: orphanLease.leaseId, generation: orphanLease.generation, humanConfirmed: true, humanActor: "operator", reason: "PID absent", terminalEvidence: { kind: "launch-failed", reference: "missing-pid", observedTerminalAt: Date.now() } });
+			assert.equal((blockedRecovery as any).error.code, "evidence_required");
+			const recovered = await request(events, "recover", "recoverCheckoutLease", { cwd: repo, leaseId: orphanLease.leaseId, generation: orphanLease.generation, humanConfirmed: true, humanActor: "operator", reason: "backend reviewed", terminalEvidence: { kind: "external-terminal", reference: "backend-terminal", observedTerminalAt: Date.now() } });
+			assert.equal((recovered as any).data.state, "recovered");
+			bridge.dispose();
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("enforces ordinary RPC spawn access while preserving explicit read-only coexistence", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-spawn-lease-"));
+		try {
+			const repo = createGitRepo(root); const events = new FakeEvents(); let calls = 0;
+			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(repo), checkoutLeaseRoot: path.join(root, "leases"), ownerInstance: "owner-spawn", execute: async () => { calls++; return { content: [{ type: "text", text: "started" }], details: { mode: "single", results: [], asyncId: `run-${calls}`, asyncDir: path.join(root, `run-${calls}`) } } as any; } });
+			const acquired = await request(events, "spawn-acquire", "acquireCheckoutLease", { operationId: "lease", ownerId: "workflow", workflowRunId: "wf", nodeId: "write", attempt: 0, cwd: repo }); const lease = (acquired as any).data;
+			const unknown = await request(events, "unknown-spawn", "spawn", { agent: "worker", task: "unknown", cwd: repo }); assert.equal((unknown as any).error.code, "checkout_conflict");
+			const write = await request(events, "write-spawn", "spawn", { agent: "worker", task: "write", cwd: repo, accessMode: "write" }); assert.equal((write as any).error.code, "checkout_conflict");
+			const reader = await request(events, "read-spawn", "spawn", { agent: "worker", task: "read", cwd: repo, accessMode: "read" }); assert.equal(reader.success, true);
+			const holder = await request(events, "holder-spawn", "spawn", { agent: "worker", task: "write", cwd: repo, accessMode: "write", checkoutLease: { leaseId: lease.leaseId, operationId: lease.operationId, ownerId: lease.ownerId, generation: lease.generation, authToken: lease.authToken } }); assert.equal(holder.success, true);
+			assert.equal(calls, 2); bridge.dispose();
 		} finally { fs.rmSync(root, { recursive: true, force: true }); }
 	});
 

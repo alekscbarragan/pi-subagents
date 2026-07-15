@@ -26,6 +26,7 @@ import { cleanupOldChainDirs } from "../shared/settings.ts";
 import { clearLegacyResultAnimationTimer, renderWidget, renderSubagentResult } from "../tui/render.ts";
 import { SubagentParams, WaitParams } from "./schemas.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
+import { admitOrdinaryCheckout, CheckoutLeaseError, recordOrdinaryExecutionOutcome, recordOrdinaryResumeOutcome, settleOrdinaryCheckout } from "../runs/shared/checkout-lease.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { createResultWatcher } from "../runs/background/result-watcher.ts";
 import { createScheduledRunManager } from "../runs/background/scheduled-runs.ts";
@@ -332,7 +333,44 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		expandTilde,
 		discoverAgents,
 	});
-	executorExecute = executor.execute;
+	const ownerInstance = randomUUID();
+	const guardedExecute = async (id: string, params: SubagentParamsLike, signal: AbortSignal, onUpdate: ((r: AgentToolResult<Details>) => void) | undefined, ctx: ExtensionContext) => {
+		if (params.action) {
+			const result = await executor.execute(id, params, signal, onUpdate, ctx);
+			const control = result.details?.control;
+			if (params.action === "resume" && control?.action === "resume") {
+				recordOrdinaryResumeOutcome({ runId: control.runId, asyncId: result.details?.asyncId, outcome: control.outcome });
+			}
+			return result;
+		}
+		const operationId = `ordinary:${ownerInstance}:${id}`;
+		const cwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd;
+		let admission;
+		try {
+			admission = admitOrdinaryCheckout({
+				operationId, ownerId: ownerInstance, cwd, access: params.accessMode ?? "unknown",
+				...(params.checkoutLease ? { lease: params.checkoutLease } : {}),
+			});
+		} catch (error) {
+			if (!(error instanceof CheckoutLeaseError) || error.code !== "invalid_state" || params.checkoutLease) throw error;
+			// Ordinary launches outside a git checkout retain their historical behavior.
+		}
+		try {
+			const result = await executor.execute(id, params, signal, onUpdate, ctx);
+			if (admission) recordOrdinaryExecutionOutcome({
+				operationId,
+				runId: result.details?.runId,
+				asyncId: result.details?.asyncId,
+				isError: result.isError,
+				children: result.details?.results ?? [],
+			});
+			return result;
+		} catch (error) {
+			if (admission) settleOrdinaryCheckout(operationId, { kind: "launch-failed", reference: `ordinary:${id}:threw`, observedTerminalAt: Date.now(), details: error instanceof Error ? error.message : String(error) });
+			throw error;
+		}
+	};
+	executorExecute = guardedExecute;
 
 	pi.registerMessageRenderer<SlashMessageDetails>(SLASH_RESULT_TYPE, (message, options, theme) => {
 		const details = resolveSlashMessageDetails(message.details);
@@ -390,7 +428,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	const executeSubagentCollapsed = (id: string, params: SubagentParamsLike, signal: AbortSignal, onUpdate: ((result: AgentToolResult<Details>) => void) | undefined, ctx: ExtensionContext) => {
 		if (ctx.hasUI) ctx.ui.setToolsExpanded(false);
-		return executor.execute(id, params, signal, onUpdate, ctx);
+		return guardedExecute(id, params, signal, onUpdate, ctx);
 	};
 
 	const slashBridge = registerSlashSubagentBridge({
@@ -443,6 +481,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		getContext: () => state.lastUiContext,
 		execute: (id, params, signal, onUpdate, ctx) => executor.execute(id, params, signal, onUpdate, ctx),
 		state,
+		ownerInstance,
+		worktreeSetupHook: config.worktreeSetupHook,
+		worktreeSetupHookTimeoutMs: config.worktreeSetupHookTimeoutMs,
 	});
 
 	function effectiveParallelTaskCount(tasks: Array<{ count?: unknown }> | undefined): number {

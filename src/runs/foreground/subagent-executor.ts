@@ -164,6 +164,14 @@ export interface SubagentParamsLike {
 	acceptance?: AcceptanceInput;
 	schedule?: string;
 	scheduleName?: string;
+	accessMode?: "read" | "write";
+	checkoutLease?: {
+		leaseId: string;
+		operationId: string;
+		ownerId: string;
+		generation: string;
+		authToken: string;
+	};
 }
 
 interface ExecutorDeps {

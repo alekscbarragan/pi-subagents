@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
+	allocateOwnerWorktree,
 	cleanupWorktrees,
 	createWorktrees,
 	diffWorktrees,
@@ -453,6 +455,65 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [] }));
 		} finally {
 			cleanupRepo(repoDir);
 		}
+	});
+
+	it("allocates replay-safe distinct owner worktrees without deleting them", () => {
+		const repoDir = createRepo("pi-owner-worktree-");
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-owner-worktree-store-"));
+		const baseDir = path.join(root, "candidates");
+		try {
+			const allocationOptions = { root: path.join(root, "records"), worktreeBaseDir: baseDir };
+			const first = allocateOwnerWorktree({ operationId: "candidate-a", ownerId: "workflow", cwd: repoDir }, allocationOptions);
+			const replay = allocateOwnerWorktree({ operationId: "candidate-a", ownerId: "workflow", cwd: repoDir }, allocationOptions);
+			const second = allocateOwnerWorktree({ operationId: "candidate-b", ownerId: "workflow", cwd: repoDir }, allocationOptions);
+			assert.equal(first.state, "allocated");
+			assert.equal(replay.generation, first.generation);
+			assert.equal(replay.worktree?.path, first.worktree?.path);
+			assert.equal(second.state, "allocated");
+			assert.notEqual(second.worktree?.path, first.worktree?.path);
+			assert.notEqual(fs.realpathSync(second.worktree!.path), fs.realpathSync(first.worktree!.path));
+			assert.equal(git(repoDir, ["status", "--porcelain"]), "");
+			assert.ok(fs.existsSync(first.worktree!.path), "owner allocation must not auto-delete candidates");
+		} finally {
+			for (const name of fs.existsSync(baseDir) ? fs.readdirSync(baseDir) : []) {
+				try { git(repoDir, ["worktree", "remove", "--force", path.join(baseDir, name)]); } catch {}
+			}
+			cleanupRepo(repoDir); fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("removes reservations after transient dirty and setup failures so replay can succeed", { skip: hookScriptSkip }, () => {
+		const repoDir = createRepo("pi-owner-worktree-retry-"); const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-owner-worktree-retry-store-"));
+		const records = path.join(root, "records"); const candidates = path.join(root, "candidates");
+		try {
+			fs.writeFileSync(path.join(repoDir, "tracked.txt"), "dirty\n");
+			assert.throws(() => allocateOwnerWorktree({ operationId: "dirty-retry", ownerId: "workflow", cwd: repoDir }, { root: records, worktreeBaseDir: candidates }), /clean git working tree/i);
+			assert.deepEqual(fs.existsSync(records) ? fs.readdirSync(records) : [], []);
+			git(repoDir, ["checkout", "--", "tracked.txt"]);
+			assert.equal(allocateOwnerWorktree({ operationId: "dirty-retry", ownerId: "workflow", cwd: repoDir }, { root: records, worktreeBaseDir: candidates }).state, "allocated");
+
+			const hook = createHookScript(repoDir, "owner-fail.mjs", "process.stderr.write('transient setup failure'); process.exit(1);");
+			assert.throws(() => allocateOwnerWorktree({ operationId: "setup-retry", ownerId: "workflow", cwd: repoDir }, { root: records, worktreeBaseDir: candidates, setupHook: { hookPath: hook } }), /transient setup failure/i);
+			assert.equal(fs.readdirSync(records).filter((name) => name.endsWith(".json")).length, 1, "failed setup reservation must be removed");
+			assert.equal(allocateOwnerWorktree({ operationId: "setup-retry", ownerId: "workflow", cwd: repoDir }, { root: records, worktreeBaseDir: candidates }).state, "allocated");
+		} finally {
+			for (const name of fs.existsSync(candidates) ? fs.readdirSync(candidates) : []) { try { git(repoDir, ["worktree", "remove", "--force", path.join(candidates, name)]); } catch {} }
+			cleanupRepo(repoDir); fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("quarantines conflicting partial allocation evidence and secures allocation storage", () => {
+		const repoDir = createRepo("pi-owner-worktree-partial-"); const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-owner-worktree-partial-store-"));
+		const records = path.join(root, "records"); const candidates = path.join(root, "candidates"); const operationId = "partial";
+		const runId = `rpc-${createHash("sha256").update(operationId).digest("hex").slice(0, 20)}`;
+		const conflictingPath = path.join(candidates, `pi-worktree-${runId}-0`);
+		try {
+			fs.mkdirSync(conflictingPath, { recursive: true }); fs.writeFileSync(path.join(conflictingPath, "foreign"), "evidence"); fs.mkdirSync(records, { mode: 0o777 }); fs.chmodSync(records, 0o777);
+			const first = allocateOwnerWorktree({ operationId, ownerId: "workflow", cwd: repoDir }, { root: records, worktreeBaseDir: candidates });
+			assert.equal(first.state, "quarantined"); assert.equal(allocateOwnerWorktree({ operationId, ownerId: "workflow", cwd: repoDir }, { root: records, worktreeBaseDir: candidates }).state, "quarantined");
+			const recordPath = path.join(records, fs.readdirSync(records)[0]!);
+			assert.equal(fs.statSync(records).mode & 0o777, 0o700); assert.equal(fs.statSync(recordPath).mode & 0o777, 0o600);
+		} finally { cleanupRepo(repoDir); fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
 	it("fails when the hook exceeds the configured timeout", { skip: hookScriptSkip }, () => {

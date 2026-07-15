@@ -17,6 +17,19 @@ import {
 import { reconcileAsyncRun } from "../runs/background/stale-run-reconciler.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import {
+	acquireCheckoutLease,
+	admitOrdinaryCheckout,
+	bindOrdinaryCheckoutChild,
+	CheckoutLeaseError,
+	getCheckoutLease,
+	recoverCheckoutLease,
+	releaseCheckoutLease,
+	settleOrdinaryCheckout,
+	settleOrdinaryCheckoutByChild,
+	type CheckoutTerminalEvidenceV1,
+} from "../runs/shared/checkout-lease.ts";
+import { allocateOwnerWorktree, getOwnerWorktree } from "../runs/shared/worktree.ts";
+import {
 	type Details,
 	type SubagentControlOperationV1,
 	type SubagentState,
@@ -30,10 +43,16 @@ import { readStatus } from "../shared/utils.ts";
 import { writeAtomicJson } from "../shared/atomic-json.ts";
 import {
 	SubagentParams,
+	SubagentRpcAcquireCheckoutLeaseV1,
+	SubagentRpcAllocateWorktreeV1,
 	SubagentRpcAwaitRunsV1,
 	SubagentRpcControlV1,
 	SubagentRpcEmptyV1,
+	SubagentRpcGetCheckoutLeaseV1,
+	SubagentRpcGetWorktreeV1,
 	SubagentRpcLegacyControlV1,
+	SubagentRpcRecoverCheckoutLeaseV1,
+	SubagentRpcReleaseCheckoutLeaseV1,
 	SubagentRpcRunTargetV1,
 	SubagentRpcTranscriptV1,
 } from "./schemas.ts";
@@ -57,6 +76,12 @@ export const SUBAGENT_RPC_METHODS = [
 	"getCapabilities",
 	"steer",
 	"resume",
+	"allocateWorktree",
+	"getWorktree",
+	"acquireCheckoutLease",
+	"getCheckoutLease",
+	"releaseCheckoutLease",
+	"recoverCheckoutLease",
 ] as const;
 export type SubagentRpcMethod = typeof SUBAGENT_RPC_METHODS[number];
 
@@ -97,7 +122,10 @@ type SubagentRpcErrorCode =
 	| "execution_failed"
 	| "not_found"
 	| "invalid_state"
-	| "revision_conflict";
+	| "revision_conflict"
+	| "checkout_conflict"
+	| "authentication_failed"
+	| "evidence_required";
 
 interface EventBus {
 	on(event: string, handler: (data: unknown) => void): (() => void) | void;
@@ -122,6 +150,11 @@ interface RegisterSubagentRpcBridgeOptions {
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 	pollIntervalMs?: number;
+	checkoutLeaseRoot?: string;
+	worktreeAllocationRoot?: string;
+	worktreeBaseDir?: string;
+	worktreeSetupHook?: string;
+	worktreeSetupHookTimeoutMs?: number;
 }
 
 class SubagentRpcError extends Error {
@@ -142,6 +175,12 @@ const rpcParamValidators = {
 	control: Compile(SubagentRpcControlV1),
 	awaitRuns: Compile(SubagentRpcAwaitRunsV1),
 	transcript: Compile(SubagentRpcTranscriptV1),
+	allocateWorktree: Compile(SubagentRpcAllocateWorktreeV1),
+	getWorktree: Compile(SubagentRpcGetWorktreeV1),
+	acquireCheckoutLease: Compile(SubagentRpcAcquireCheckoutLeaseV1),
+	getCheckoutLease: Compile(SubagentRpcGetCheckoutLeaseV1),
+	releaseCheckoutLease: Compile(SubagentRpcReleaseCheckoutLeaseV1),
+	recoverCheckoutLease: Compile(SubagentRpcRecoverCheckoutLeaseV1),
 };
 
 export function subagentRpcReplyEvent(requestId: string): string {
@@ -251,6 +290,18 @@ function ownerInstance(options: RegisterSubagentRpcBridgeOptions): string {
 	return options.ownerInstance ?? "pi-subagents";
 }
 
+function leaseOptions(options: RegisterSubagentRpcBridgeOptions) {
+	return { root: options.checkoutLeaseRoot, now: options.now };
+}
+
+function validateTerminalEvidence(evidence: CheckoutTerminalEvidenceV1, options: RegisterSubagentRpcBridgeOptions): void {
+	if (evidence.kind !== "owner-run") return;
+	const run = findRun(options, evidence.reference);
+	if (!run.settlement.terminal || run.settlement.output === "pending" || run.settlement.artifacts === "pending") {
+		throw new SubagentRpcError("evidence_required", `Owner run '${evidence.reference}' has not reached canonical terminal settlement.`);
+	}
+}
+
 function pingData(ctx: ExtensionContext | null, options: RegisterSubagentRpcBridgeOptions) {
 	return {
 		version: SUBAGENT_RPC_PROTOCOL_VERSION,
@@ -293,6 +344,42 @@ function spawnParams(params: unknown): SubagentParamsLike {
 		throw new SubagentRpcError("invalid_params", "RPC spawn cannot open the clarify UI; omit clarify or set clarify: false.");
 	}
 	return { ...(input as SubagentParamsLike), async: true, clarify: false };
+}
+
+async function executeSpawnChecked(
+	options: RegisterSubagentRpcBridgeOptions,
+	ctx: ExtensionContext,
+	requestId: string,
+	params: unknown,
+): Promise<{ text: string; details?: Details; isError?: boolean }> {
+	const spawn = spawnParams(params);
+	assertSubagentParams(spawn, "RPC spawn params");
+	const operationId = `rpc-spawn:${requestId}`;
+	const cwd = spawn.cwd ? path.resolve(ctx.cwd, spawn.cwd) : ctx.cwd;
+	let admission;
+	try {
+		admission = admitOrdinaryCheckout({
+			operationId,
+			ownerId: ownerInstance(options),
+			cwd,
+			access: spawn.accessMode ?? "unknown",
+			...(spawn.checkoutLease ? { lease: spawn.checkoutLease } : {}),
+		}, leaseOptions(options));
+	} catch (error) {
+		if (!(error instanceof CheckoutLeaseError) || error.code !== "invalid_state" || spawn.checkoutLease) throw error;
+		// Ordinary launches outside a git checkout retain their historical behavior.
+	}
+	try {
+		const result = await options.execute(`rpc-spawn-${requestId}`, spawn, new AbortController().signal, undefined, ctx);
+		failIfToolError(result);
+		const data = dataFromToolResult(result);
+		if (admission && data.details?.asyncId) bindOrdinaryCheckoutChild(operationId, data.details.asyncId, leaseOptions(options));
+		else if (admission) settleOrdinaryCheckout(operationId, { kind: "external-terminal", reference: `rpc-spawn:${requestId}:returned`, observedTerminalAt: now(options), details: "Owner executor returned without a detached child reference." }, leaseOptions(options));
+		return data;
+	} catch (error) {
+		if (admission) settleOrdinaryCheckout(operationId, { kind: "launch-failed", reference: `rpc-spawn:${requestId}:failed`, observedTerminalAt: now(options), details: error instanceof Error ? error.message : String(error) }, leaseOptions(options));
+		throw error;
+	}
 }
 
 function snapshots(options: RegisterSubagentRpcBridgeOptions): SubagentRunSnapshot[] {
@@ -625,7 +712,7 @@ async function handleRequest(
 	if (!ctx) throw new SubagentRpcError("no_active_session", "No active extension context for subagent RPC.");
 
 	if (request.method === "spawn") {
-		return executeChecked(options, ctx, request.requestId, request.method, spawnParams(request.params));
+		return executeSpawnChecked(options, ctx, request.requestId, request.params);
 	}
 	if (request.method === "status") {
 		return executeChecked(options, ctx, request.requestId, request.method, {
@@ -663,6 +750,37 @@ async function handleRequest(
 	}
 	if (request.method === "awaitRuns") return awaitRuns(request.params, options);
 	if (request.method === "getTranscript") return transcript(request.params, options);
+	if (request.method === "allocateWorktree") {
+		const input = validateRpcParams(request.params, request.method, rpcParamValidators.allocateWorktree) as any;
+		return allocateOwnerWorktree(input, {
+			root: options.worktreeAllocationRoot, now: options.now, worktreeBaseDir: options.worktreeBaseDir,
+			...(options.worktreeSetupHook ? { setupHook: { hookPath: options.worktreeSetupHook, timeoutMs: options.worktreeSetupHookTimeoutMs } } : {}),
+		});
+	}
+	if (request.method === "getWorktree") {
+		const input = validateRpcParams(request.params, request.method, rpcParamValidators.getWorktree);
+		const allocation = getOwnerWorktree(input.operationId as string, input.ownerId as string, { root: options.worktreeAllocationRoot, now: options.now });
+		if (!allocation) throw new SubagentRpcError("not_found", `Worktree allocation '${String(input.operationId)}' was not found.`);
+		return allocation;
+	}
+	if (request.method === "acquireCheckoutLease") {
+		const input = validateRpcParams(request.params, request.method, rpcParamValidators.acquireCheckoutLease) as any;
+		return acquireCheckoutLease(input, leaseOptions(options));
+	}
+	if (request.method === "getCheckoutLease") {
+		const input = validateRpcParams(request.params, request.method, rpcParamValidators.getCheckoutLease);
+		return getCheckoutLease(input.cwd as string, leaseOptions(options));
+	}
+	if (request.method === "releaseCheckoutLease") {
+		const input = validateRpcParams(request.params, request.method, rpcParamValidators.releaseCheckoutLease) as any;
+		validateTerminalEvidence(input.terminalEvidence, options);
+		return releaseCheckoutLease(input, leaseOptions(options));
+	}
+	if (request.method === "recoverCheckoutLease") {
+		const input = validateRpcParams(request.params, request.method, rpcParamValidators.recoverCheckoutLease) as any;
+		validateTerminalEvidence(input.terminalEvidence, options);
+		return recoverCheckoutLease(input, leaseOptions(options));
+	}
 	throw new SubagentRpcError("unsupported_method", `Unsupported subagent RPC method: ${String(request.method)}`);
 }
 
@@ -699,7 +817,12 @@ function errorReply(raw: unknown, error: unknown): SubagentRpcReplyEnvelope {
 		: undefined;
 	const rpcError = error instanceof SubagentRpcError
 		? error
-		: new SubagentRpcError("execution_failed", error instanceof Error ? error.message : String(error));
+		: error instanceof CheckoutLeaseError
+			? new SubagentRpcError(
+				error.code === "conflict" ? "checkout_conflict" : error.code === "authentication_failed" ? "authentication_failed" : error.code === "evidence_required" ? "evidence_required" : error.code === "not_found" ? "not_found" : "invalid_state",
+				error.message,
+			)
+			: new SubagentRpcError("execution_failed", error instanceof Error ? error.message : String(error));
 	return {
 		version: SUBAGENT_RPC_PROTOCOL_VERSION,
 		requestId,
@@ -752,6 +875,13 @@ export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOpti
 	for (const [source, reason] of lifecycleEvents) {
 		const unsubscribe = options.events.on(source, (payload) => {
 			const runId = lifecycleRunId(payload);
+			if (source === SUBAGENT_ASYNC_COMPLETE_EVENT && runId) {
+				try {
+					settleOrdinaryCheckoutByChild(runId, { kind: "owner-run", reference: runId, observedTerminalAt: now(options) }, leaseOptions(options));
+				} catch {
+					// Preserve the admission when canonical checkout evidence cannot be captured.
+				}
+			}
 			options.events.emit(SUBAGENT_LIFECYCLE_EVENT, {
 				version: 1,
 				owner: "pi-subagents",
