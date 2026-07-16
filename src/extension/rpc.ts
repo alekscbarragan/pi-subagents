@@ -392,7 +392,21 @@ function snapshots(options: RegisterSubagentRpcBridgeOptions): SubagentRunSnapsh
 		ownerInstance: ownerInstance(options),
 	});
 	const operations = readOperationsByRun(options);
-	return runs.map((run) => ({ ...run, operations: operations.get(run.runId) ?? [] }));
+	return runs.map((run) => {
+		const authority = observedOrdinaryAuthority(run, options);
+		return { ...run, ...(authority ? { authority } : {}), operations: operations.get(run.runId) ?? [] };
+	});
+}
+
+function observedOrdinaryAuthority(run: SubagentRunSnapshot, options: RegisterSubagentRpcBridgeOptions): SubagentRunSnapshot["authority"] | undefined {
+	if (!run.cwd) return undefined;
+	try {
+		const admission = getCheckoutLease(run.cwd, leaseOptions(options)).ordinary.find((entry) => entry.childRef === run.runId && (entry.state === "active" || entry.state === "settled"));
+		if (admission?.access === "read" || admission?.access === "write") return { access: admission.access, evidence: "observed" };
+	} catch {
+		// Runs outside a checkout retain unavailable authority evidence.
+	}
+	return undefined;
 }
 
 function targetId(input: Record<string, unknown>): string {
@@ -640,6 +654,21 @@ function stopAsyncRun(
 	};
 }
 
+function awaitRunResults(runs: SubagentRunSnapshot[], options: RegisterSubagentRpcBridgeOptions): Record<string, string> {
+	const results: Record<string, string> = {};
+	for (const run of runs) {
+		if (!run.settlement.terminal) continue;
+		try {
+			const data = JSON.parse(fs.readFileSync(path.join(options.resultsDir ?? RESULTS_DIR, `${run.runId}.json`), "utf-8")) as { results?: unknown[] };
+			if (data.results?.length !== 1 || !isRecord(data.results[0]) || typeof data.results[0].output !== "string") continue;
+			results[run.runId] = data.results[0].output;
+		} catch {
+			// Finality evidence remains authoritative when a result artifact is unavailable.
+		}
+	}
+	return results;
+}
+
 async function awaitRuns(params: unknown, options: RegisterSubagentRpcBridgeOptions) {
 	const input = validateRpcParams(params, "awaitRuns", rpcParamValidators.awaitRuns);
 	const ids = Array.isArray(input.runIds)
@@ -663,6 +692,7 @@ async function awaitRuns(params: unknown, options: RegisterSubagentRpcBridgeOpti
 			return {
 				reason: terminal ? "terminal" : changed ? "changed" : "timeout",
 				runs,
+				results: awaitRunResults(runs, options),
 			};
 		}
 		const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));

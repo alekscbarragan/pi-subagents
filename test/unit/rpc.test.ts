@@ -512,6 +512,49 @@ describe("subagent extension RPC bridge", () => {
 		} finally { fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
+	it("projects durable ordinary read authority onto async runs", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-read-authority-"));
+		try {
+			const repo = createGitRepo(root); const events = new FakeEvents();
+			const asyncRoot = path.join(root, "runs"); const resultsDir = path.join(root, "results"); const runId = "run-read";
+			const bridge = registerSubagentRpcBridge({
+				events,
+				getContext: () => ctx(repo),
+				checkoutLeaseRoot: path.join(root, "leases"),
+				asyncDirRoot: asyncRoot,
+				resultsDir,
+				ownerInstance: "owner-spawn",
+				execute: async () => {
+					const asyncDir = path.join(asyncRoot, runId); fs.mkdirSync(asyncDir, { recursive: true });
+					const timestamp = Date.now();
+					fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId, sessionId: "session-123", mode: "single", state: "running", cwd: repo, pid: process.pid, startedAt: timestamp, lastUpdate: timestamp, steps: [{ agent: "worker", status: "running", startedAt: timestamp }] }));
+					return { content: [{ type: "text", text: "started" }], details: { mode: "single", results: [], asyncId: runId, asyncDir } } as any;
+				},
+			});
+			const spawned = await request(events, "read-spawn", "spawn", { agent: "worker", task: "read", cwd: repo, accessMode: "read" });
+			assert.equal(spawned.success, true);
+			const got = await request(events, "read-get", "getRun", { id: runId });
+			assert.deepEqual((got as any).data.authority, { access: "read", evidence: "observed" });
+			const awaited = await request(events, "read-await", "awaitRuns", { runId, timeoutMs: 0 });
+			assert.deepEqual((awaited as any).data.results, {});
+			bridge.dispose();
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("returns terminal child output from awaitRuns", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-await-result-"));
+		try {
+			const events = new FakeEvents(); const asyncRoot = path.join(root, "runs"); const resultsDir = path.join(root, "results"); const runId = "run-terminal";
+			const asyncDir = path.join(asyncRoot, runId); fs.mkdirSync(asyncDir, { recursive: true }); fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId, sessionId: "session-123", mode: "single", state: "complete", cwd: root, startedAt: 100, lastUpdate: 200, endedAt: 200, steps: [{ agent: "worker", status: "complete", startedAt: 100, endedAt: 200 }] }));
+			fs.writeFileSync(path.join(resultsDir, `${runId}.json`), JSON.stringify({ id: runId, mode: "single", state: "complete", success: true, results: [{ agent: "worker", output: "{\"value\":1}", success: true }] }));
+			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(root), asyncDirRoot: asyncRoot, resultsDir, ownerInstance: "owner-await", execute: async () => assert.fail("await must not execute") });
+			const awaited = await request(events, "terminal-await", "awaitRuns", { runId, timeoutMs: 0 });
+			assert.deepEqual((awaited as any).data.results, { [runId]: "{\"value\":1}" });
+			bridge.dispose();
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
 	it("rejects stop requests for async runs from a different session", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-stop-session-"));
 		try {
