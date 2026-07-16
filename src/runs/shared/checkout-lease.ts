@@ -374,6 +374,21 @@ export function bindOrdinaryCheckoutChild(operationId: string, childRef: string,
 	const updated = { ...record, childRef, updatedAt: options.now?.() ?? Date.now() }; writeSecureJson(file, updated); return updated;
 }
 
+export function findOrdinaryCheckoutAdmissionByChild(childRef: string, options: CheckoutLeaseStoreOptions = {}): OrdinaryCheckoutAdmissionV1 | undefined {
+	const root = storeRoot(options); ensureStore(root);
+	let match: OrdinaryCheckoutAdmissionV1 | undefined;
+	for (const dir of [path.join(root, "ordinary"), path.join(root, "audit", "ordinary")]) {
+		for (const name of fs.readdirSync(dir)) {
+			if (!name.endsWith(".json")) continue;
+			try {
+				const record = JSON.parse(fs.readFileSync(path.join(dir, name), "utf-8")) as OrdinaryCheckoutAdmissionV1;
+				if (record.childRef === childRef && (!match || record.updatedAt > match.updatedAt)) match = record;
+			} catch {}
+		}
+	}
+	return match;
+}
+
 export function quarantineOrdinaryCheckout(operationId: string, reason: string, options: CheckoutLeaseStoreOptions = {}): OrdinaryCheckoutAdmissionV1 {
 	const file = admissionPath(storeRoot(options), operationId); const record = readJson<OrdinaryCheckoutAdmissionV1>(file);
 	if (!record) throw new CheckoutLeaseError("not_found", `Ordinary admission '${operationId}' was not found.`);

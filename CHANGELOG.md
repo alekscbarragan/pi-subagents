@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Preserve ordinary RPC spawn authority evidence across active and settled owner snapshots, and return bounded terminal structured or raw outputs from `awaitRuns`, so workflow runtimes can verify and consume exact child results without weakening fail-closed checks.
+
 ## [0.34.0] - 2026-07-07
 
 ### Added

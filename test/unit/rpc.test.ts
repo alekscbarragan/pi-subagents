@@ -304,6 +304,24 @@ describe("subagent extension RPC bridge", () => {
 		} finally { fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
+	it("returns terminal structured outputs through awaitRuns", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-await-result-"));
+		try {
+			const events = new FakeEvents(); const asyncRoot = path.join(root, "runs"); const resultsDir = path.join(root, "results");
+			const asyncDir = path.join(asyncRoot, "run-result"); fs.mkdirSync(asyncDir, { recursive: true }); fs.mkdirSync(resultsDir);
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "run-result", sessionId: "session-123", mode: "single", state: "complete", cwd: root, startedAt: 100, lastUpdate: 200, steps: [{ agent: "worker", status: "completed", startedAt: 100 }] }));
+			fs.writeFileSync(path.join(resultsDir, "run-result.json"), JSON.stringify({ id: "run-result", success: true, state: "complete", results: [{ agent: "worker", success: true, structuredOutput: { summary: "done" } }] }));
+			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => assert.fail("await must not execute"), asyncDirRoot: asyncRoot, resultsDir });
+			const awaited = await request(events, "await-result", "awaitRuns", { runId: "run-result", timeoutMs: 0 });
+			assert.equal((awaited as any).data.reason, "terminal");
+			assert.deepEqual((awaited as any).data.results, { "run-result": { summary: "done" } });
+			fs.writeFileSync(path.join(resultsDir, "run-result.json"), JSON.stringify({ id: "run-result", success: true, state: "complete", results: [{ agent: "worker", success: true, output: "{\"summary\":\"raw\"}" }] }));
+			const raw = await request(events, "await-raw-result", "awaitRuns", { runId: "run-result", timeoutMs: 0 });
+			assert.deepEqual((raw as any).data.results, { "run-result": "{\"summary\":\"raw\"}" });
+			bridge.dispose();
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
 	it("keeps evidence failures local to the affected run and rejects only its control", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-evidence-"));
 		try {
@@ -498,15 +516,27 @@ describe("subagent extension RPC bridge", () => {
 		} finally { fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
-	it("enforces ordinary RPC spawn access while preserving explicit read-only coexistence", async () => {
+	it("enforces ordinary RPC spawn access and projects durable read authority", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-spawn-lease-"));
 		try {
 			const repo = createGitRepo(root); const events = new FakeEvents(); let calls = 0;
-			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(repo), checkoutLeaseRoot: path.join(root, "leases"), ownerInstance: "owner-spawn", execute: async () => { calls++; return { content: [{ type: "text", text: "started" }], details: { mode: "single", results: [], asyncId: `run-${calls}`, asyncDir: path.join(root, `run-${calls}`) } } as any; } });
+			const asyncRoot = path.join(root, "runs");
+			const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(repo), asyncDirRoot: asyncRoot, checkoutLeaseRoot: path.join(root, "leases"), ownerInstance: "owner-spawn", execute: async () => {
+				calls++;
+				const runId = `run-${calls}`; const asyncDir = path.join(asyncRoot, runId);
+				fs.mkdirSync(asyncDir, { recursive: true });
+				fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId, sessionId: "session-123", mode: "single", state: "running", cwd: repo, startedAt: 100, lastUpdate: 100, steps: [{ agent: "worker", status: "running", startedAt: 100 }] }));
+				return { content: [{ type: "text", text: "started" }], details: { mode: "single", results: [], asyncId: runId, asyncDir } } as any;
+			} });
 			const acquired = await request(events, "spawn-acquire", "acquireCheckoutLease", { operationId: "lease", ownerId: "workflow", workflowRunId: "wf", nodeId: "write", attempt: 0, cwd: repo }); const lease = (acquired as any).data;
 			const unknown = await request(events, "unknown-spawn", "spawn", { agent: "worker", task: "unknown", cwd: repo }); assert.equal((unknown as any).error.code, "checkout_conflict");
 			const write = await request(events, "write-spawn", "spawn", { agent: "worker", task: "write", cwd: repo, accessMode: "write" }); assert.equal((write as any).error.code, "checkout_conflict");
 			const reader = await request(events, "read-spawn", "spawn", { agent: "worker", task: "read", cwd: repo, accessMode: "read" }); assert.equal(reader.success, true);
+			const active = await request(events, "read-active", "getRun", { id: "run-1" });
+			assert.deepEqual((active as any).data.authority, { access: "read", evidence: "observed" });
+			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { runId: "run-1" });
+			const settled = await request(events, "read-settled", "getRun", { id: "run-1" });
+			assert.deepEqual((settled as any).data.authority, { access: "read", evidence: "observed" });
 			const holder = await request(events, "holder-spawn", "spawn", { agent: "worker", task: "write", cwd: repo, accessMode: "write", checkoutLease: { leaseId: lease.leaseId, operationId: lease.operationId, ownerId: lease.ownerId, generation: lease.generation, authToken: lease.authToken } }); assert.equal(holder.success, true);
 			assert.equal(calls, 2); bridge.dispose();
 		} finally { fs.rmSync(root, { recursive: true, force: true }); }

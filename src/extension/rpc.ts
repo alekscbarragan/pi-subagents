@@ -21,6 +21,7 @@ import {
 	admitOrdinaryCheckout,
 	bindOrdinaryCheckoutChild,
 	CheckoutLeaseError,
+	findOrdinaryCheckoutAdmissionByChild,
 	getCheckoutLease,
 	recoverCheckoutLease,
 	releaseCheckoutLease,
@@ -392,7 +393,13 @@ function snapshots(options: RegisterSubagentRpcBridgeOptions): SubagentRunSnapsh
 		ownerInstance: ownerInstance(options),
 	});
 	const operations = readOperationsByRun(options);
-	return runs.map((run) => ({ ...run, operations: operations.get(run.runId) ?? [] }));
+	return runs.map((run) => {
+		const admission = findOrdinaryCheckoutAdmissionByChild(run.runId, leaseOptions(options));
+		const authority = admission && admission.access !== "unknown"
+			? { access: admission.access, evidence: "observed" as const, ...(admission.access === "write" ? { scope: [admission.checkout.canonicalPath] } : {}) }
+			: run.authority;
+		return { ...run, authority, operations: operations.get(run.runId) ?? [] };
+	});
 }
 
 function targetId(input: Record<string, unknown>): string {
@@ -663,11 +670,30 @@ async function awaitRuns(params: unknown, options: RegisterSubagentRpcBridgeOpti
 			return {
 				reason: terminal ? "terminal" : changed ? "changed" : "timeout",
 				runs,
+				results: terminalStructuredResults(runs, options),
 			};
 		}
 		const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 		await sleep(Math.max(10, options.pollIntervalMs ?? 250));
 	}
+}
+
+function terminalStructuredResults(runs: readonly SubagentRunSnapshot[], options: RegisterSubagentRpcBridgeOptions): Record<string, unknown> {
+	const values: Record<string, unknown> = {};
+	for (const run of runs) {
+		if (!run.settlement.terminal) continue;
+		const location = resolveAsyncRunLocation({ id: run.runId }, options.asyncDirRoot ?? ASYNC_DIR, options.resultsDir ?? RESULTS_DIR);
+		if (!location.resultPath) continue;
+		try {
+			if (fs.statSync(location.resultPath).size > 4 * 1024 * 1024) continue;
+			const payload = JSON.parse(fs.readFileSync(location.resultPath, "utf-8")) as { results?: unknown[] };
+			if (!Array.isArray(payload.results) || payload.results.length !== 1 || !isRecord(payload.results[0])) continue;
+			const result = payload.results[0];
+			if ("structuredOutput" in result) values[run.runId] = result.structuredOutput;
+			else if (typeof result.output === "string") values[run.runId] = result.output;
+		} catch {}
+	}
+	return values;
 }
 
 function transcript(params: unknown, options: RegisterSubagentRpcBridgeOptions) {
