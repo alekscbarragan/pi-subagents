@@ -1,7 +1,10 @@
+import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { RESULTS_DIR } from "../../shared/types.ts";
+import { writeAtomicJson } from "../../shared/atomic-json.ts";
 
 export interface WorktreeSetup {
 	cwd: string;
@@ -9,7 +12,7 @@ export interface WorktreeSetup {
 	baseCommit: string;
 }
 
-interface WorktreeInfo {
+export interface WorktreeInfo {
 	path: string;
 	agentCwd: string;
 	branch: string;
@@ -577,6 +580,162 @@ export function cleanupWorktrees(setup: WorktreeSetup): void {
 	try { runGitChecked(setup.cwd, ["worktree", "prune"]); } catch {
 		// Pruning is best-effort cleanup.
 	}
+}
+
+export interface OwnerWorktreeAllocationV1 {
+	version: 1;
+	operationId: string;
+	ownerId: string;
+	generation: string;
+	state: "allocating" | "allocated" | "quarantined";
+	sourceCheckout: { canonicalPath: string; gitCommonDir: string; head: string };
+	worktree?: WorktreeInfo;
+	baseCommit: string;
+	createdAt: number;
+	updatedAt: number;
+	error?: string;
+}
+
+interface AllocateOwnerWorktreeInput {
+	operationId: string;
+	ownerId: string;
+	cwd: string;
+}
+
+interface OwnerWorktreeStoreOptions {
+	root?: string;
+	now?: () => number;
+	randomId?: () => string;
+	worktreeBaseDir?: string;
+	setupHook?: WorktreeSetupHookConfig;
+}
+
+function worktreeDigest(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
+function ownerWorktreeRecordPath(operationId: string, options: OwnerWorktreeStoreOptions): string {
+	return path.join(options.root ?? path.join(RESULTS_DIR, ".worktree-allocations-v1"), `${worktreeDigest(operationId)}.json`);
+}
+
+function readOwnerWorktreeRecord(file: string): OwnerWorktreeAllocationV1 | undefined {
+	try { return JSON.parse(fs.readFileSync(file, "utf-8")) as OwnerWorktreeAllocationV1; }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+}
+
+function writeSecureOwnerWorktreeRecord(file: string, record: OwnerWorktreeAllocationV1): void {
+	fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+	fs.chmodSync(path.dirname(file), 0o700);
+	writeAtomicJson(file, record);
+	fs.chmodSync(file, 0o600);
+}
+
+function createOwnerWorktreeReservation(file: string, record: OwnerWorktreeAllocationV1): boolean {
+	fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+	fs.chmodSync(path.dirname(file), 0o700);
+	try {
+		const fd = fs.openSync(file, "wx", 0o600);
+		try { fs.writeFileSync(fd, JSON.stringify(record, null, 2), "utf-8"); fs.fsyncSync(fd); }
+		finally { fs.closeSync(fd); }
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+		throw error;
+	}
+}
+
+function waitForOwnerWorktreeReplay(file: string): OwnerWorktreeAllocationV1 | undefined {
+	const buffer = new SharedArrayBuffer(4);
+	const view = new Int32Array(buffer);
+	for (let attempt = 0; attempt < 200; attempt++) {
+		Atomics.wait(view, 0, 0, 10);
+		const current = readOwnerWorktreeRecord(file);
+		if (!current || current.state !== "allocating") return current;
+	}
+	return readOwnerWorktreeRecord(file);
+}
+
+function sourceCheckoutIdentity(cwd: string): OwnerWorktreeAllocationV1["sourceCheckout"] {
+	const canonicalPath = fs.realpathSync(runGitChecked(cwd, ["rev-parse", "--show-toplevel"]).trim());
+	const rawCommon = runGitChecked(cwd, ["rev-parse", "--git-common-dir"]).trim();
+	return {
+		canonicalPath,
+		gitCommonDir: fs.realpathSync(path.isAbsolute(rawCommon) ? rawCommon : path.resolve(canonicalPath, rawCommon)),
+		head: runGitChecked(cwd, ["rev-parse", "HEAD"]).trim(),
+	};
+}
+
+export function allocateOwnerWorktree(input: AllocateOwnerWorktreeInput, options: OwnerWorktreeStoreOptions = {}): OwnerWorktreeAllocationV1 {
+	if (!input.operationId.trim() || !input.ownerId.trim()) throw new Error("operationId and ownerId are required for worktree allocation");
+	const file = ownerWorktreeRecordPath(input.operationId, options);
+	const source = sourceCheckoutIdentity(input.cwd);
+	const timestamp = options.now?.() ?? Date.now();
+	const reservation: OwnerWorktreeAllocationV1 = {
+		version: 1, operationId: input.operationId, ownerId: input.ownerId,
+		generation: (options.randomId ?? randomUUID)(), state: "allocating", sourceCheckout: source,
+		baseCommit: source.head, createdAt: timestamp, updatedAt: timestamp,
+	};
+	const createdReservation = createOwnerWorktreeReservation(file, reservation);
+	if (!createdReservation) {
+		const existing = readOwnerWorktreeRecord(file);
+		if (!existing || existing.operationId !== input.operationId || existing.ownerId !== input.ownerId
+			|| existing.sourceCheckout.canonicalPath !== source.canonicalPath) throw new Error("worktree allocation operation is owned by another caller or checkout");
+		if (existing.state !== "allocating") return existing;
+		const replay = waitForOwnerWorktreeReplay(file);
+		if (!replay) return allocateOwnerWorktree(input, options);
+		if (replay.state !== "allocating") return replay;
+	}
+	const current = readOwnerWorktreeRecord(file) ?? reservation;
+	const allocationRunId = `rpc-${worktreeDigest(input.operationId).slice(0, 20)}`;
+	const expectedPath = buildWorktreePath(resolveWorktreeBaseDir(options.worktreeBaseDir, source.canonicalPath), allocationRunId, 0);
+	const expectedBranch = buildWorktreeBranch(allocationRunId, 0);
+	try {
+		let worktree: WorktreeInfo;
+		if (fs.existsSync(expectedPath)) {
+			const observedRoot = fs.realpathSync(runGitChecked(expectedPath, ["rev-parse", "--show-toplevel"]).trim());
+			const observedBranch = runGitChecked(expectedPath, ["branch", "--show-current"]).trim();
+			if (observedRoot !== fs.realpathSync(expectedPath) || observedBranch !== expectedBranch) throw new Error("reserved worktree path contains different git evidence");
+			worktree = { path: expectedPath, agentCwd: expectedPath, branch: expectedBranch, index: 0, nodeModulesLinked: fs.existsSync(path.join(expectedPath, "node_modules")), syntheticPaths: fs.existsSync(path.join(expectedPath, "node_modules")) ? ["node_modules"] : [] };
+		} else {
+			const setup = createWorktrees(source.canonicalPath, allocationRunId, 1, { baseDir: options.worktreeBaseDir, setupHook: options.setupHook });
+			worktree = setup.worktrees[0]!;
+		}
+		const allocated: OwnerWorktreeAllocationV1 = { ...current, state: "allocated", worktree, updatedAt: options.now?.() ?? Date.now() };
+		writeSecureOwnerWorktreeRecord(file, allocated);
+		return allocated;
+	} catch (error) {
+		// A concurrent replay may have completed between the existence check and git add.
+		const replay = readOwnerWorktreeRecord(file);
+		if (replay?.state === "allocated") return replay;
+		if (fs.existsSync(expectedPath)) {
+			try {
+				const observedRoot = fs.realpathSync(runGitChecked(expectedPath, ["rev-parse", "--show-toplevel"]).trim());
+				const observedBranch = runGitChecked(expectedPath, ["branch", "--show-current"]).trim();
+				if (observedRoot === fs.realpathSync(expectedPath) && observedBranch === expectedBranch) {
+					const worktree: WorktreeInfo = { path: expectedPath, agentCwd: expectedPath, branch: expectedBranch, index: 0, nodeModulesLinked: fs.existsSync(path.join(expectedPath, "node_modules")), syntheticPaths: fs.existsSync(path.join(expectedPath, "node_modules")) ? ["node_modules"] : [] };
+					const allocated: OwnerWorktreeAllocationV1 = { ...current, state: "allocated", worktree, updatedAt: options.now?.() ?? Date.now() };
+					writeSecureOwnerWorktreeRecord(file, allocated);
+					return allocated;
+				}
+			} catch {}
+		}
+		const branchExists = runGit(source.canonicalPath, ["branch", "--list", expectedBranch]).stdout.trim().length > 0;
+		if (!fs.existsSync(expectedPath) && !branchExists) {
+			const latest = readOwnerWorktreeRecord(file);
+			if (latest?.state === "allocating" && latest.generation === current.generation) fs.rmSync(file, { force: true });
+			throw error;
+		}
+		const quarantined: OwnerWorktreeAllocationV1 = { ...current, state: "quarantined", error: error instanceof Error ? error.message : String(error), updatedAt: options.now?.() ?? Date.now() };
+		writeSecureOwnerWorktreeRecord(file, quarantined);
+		return quarantined;
+	}
+}
+
+export function getOwnerWorktree(operationId: string, ownerId: string, options: OwnerWorktreeStoreOptions = {}): OwnerWorktreeAllocationV1 | undefined {
+	const record = readOwnerWorktreeRecord(ownerWorktreeRecordPath(operationId, options));
+	if (!record) return undefined;
+	if (record.operationId !== operationId || record.ownerId !== ownerId) throw new Error("worktree allocation owner does not match");
+	return record;
 }
 
 export function formatWorktreeDiffSummary(diffs: WorktreeDiff[]): string {

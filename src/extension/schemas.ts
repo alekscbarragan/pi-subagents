@@ -292,6 +292,11 @@ const SubagentParamsSchema = Type.Object({
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for single agent (e.g. 'anthropic/claude-sonnet-4')" })),
 	acceptance: Type.Optional(AcceptanceOverride),
+	accessMode: Type.Optional(Type.String({ enum: ["read", "write"], description: "Explicit checkout access evidence. Omitted ordinary launches are conservatively treated as unknown around workflow writer leases." })),
+	checkoutLease: Type.Optional(Type.Object({
+		leaseId: Type.String({ minLength: 1 }), operationId: Type.String({ minLength: 1 }), ownerId: Type.String({ minLength: 1 }),
+		generation: Type.String({ minLength: 1 }), authToken: Type.String({ minLength: 1 }),
+	}, { additionalProperties: false })),
 });
 
 export const SubagentParams = keepTopLevelParameterDescriptions(SubagentParamsSchema);
@@ -310,3 +315,66 @@ const SubagentWaitParamsSchema = Type.Object({
 });
 
 export const SubagentWaitParams = keepTopLevelParameterDescriptions(SubagentWaitParamsSchema);
+
+export const SubagentRpcEmptyV1 = Type.Object({}, { additionalProperties: false });
+
+export const SubagentRpcRunTargetV1 = Type.Object({
+	id: Type.Optional(Type.String({ minLength: 1 })),
+	runId: Type.Optional(Type.String({ minLength: 1 })),
+}, { additionalProperties: false });
+
+export const SubagentRpcLegacyControlV1 = Type.Object({
+	id: Type.Optional(Type.String({ minLength: 1 })),
+	runId: Type.Optional(Type.String({ minLength: 1 })),
+	dir: Type.Optional(Type.String({ minLength: 1 })),
+	index: Type.Optional(Type.Integer({ minimum: 0 })),
+}, { additionalProperties: false });
+
+export const SubagentRpcControlV1 = Type.Object({
+	id: Type.Optional(Type.String({ minLength: 1 })),
+	runId: Type.Optional(Type.String({ minLength: 1 })),
+	operationId: Type.String({ minLength: 1 }),
+	expectedRevision: Type.Optional(Type.String({ minLength: 1 })),
+	index: Type.Optional(Type.Integer({ minimum: 0 })),
+	message: Type.Optional(Type.String({ minLength: 1 })),
+}, { additionalProperties: false });
+
+export const SubagentRpcAwaitRunsV1 = Type.Object({
+	id: Type.Optional(Type.String({ minLength: 1 })),
+	runId: Type.Optional(Type.String({ minLength: 1 })),
+	runIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
+	revisions: Type.Optional(Type.Record(Type.String(), Type.String())),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 0 })),
+}, { additionalProperties: false });
+
+export const SubagentRpcTranscriptV1 = Type.Object({
+	id: Type.Optional(Type.String({ minLength: 1 })),
+	runId: Type.Optional(Type.String({ minLength: 1 })),
+	index: Type.Optional(Type.Integer({ minimum: 0 })),
+	lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+}, { additionalProperties: false });
+
+const CheckoutTerminalEvidenceV1 = Type.Object({
+	kind: Type.String({ enum: ["owner-run", "external-terminal", "launch-failed"] }), reference: Type.String({ minLength: 1 }),
+	observedTerminalAt: Type.Number({ minimum: 0 }), details: Type.Optional(Type.String({ minLength: 1 })),
+}, { additionalProperties: false });
+
+export const SubagentRpcAllocateWorktreeV1 = Type.Object({
+	operationId: Type.String({ minLength: 1 }), ownerId: Type.String({ minLength: 1 }), cwd: Type.String({ minLength: 1 }),
+}, { additionalProperties: false });
+export const SubagentRpcGetWorktreeV1 = Type.Object({ operationId: Type.String({ minLength: 1 }), ownerId: Type.String({ minLength: 1 }) }, { additionalProperties: false });
+export const SubagentRpcAcquireCheckoutLeaseV1 = Type.Object({
+	operationId: Type.String({ minLength: 1 }), ownerId: Type.String({ minLength: 1 }), workflowRunId: Type.String({ minLength: 1 }),
+	nodeId: Type.String({ minLength: 1 }), attempt: Type.Integer({ minimum: 0 }), cwd: Type.String({ minLength: 1 }), childRef: Type.Optional(Type.String({ minLength: 1 })),
+}, { additionalProperties: false });
+export const SubagentRpcGetCheckoutLeaseV1 = Type.Object({ cwd: Type.String({ minLength: 1 }) }, { additionalProperties: false });
+export const SubagentRpcReleaseCheckoutLeaseV1 = Type.Object({
+	leaseId: Type.String({ minLength: 1 }), operationId: Type.String({ minLength: 1 }), ownerId: Type.String({ minLength: 1 }),
+	generation: Type.String({ minLength: 1 }), authToken: Type.String({ minLength: 1 }), cwd: Type.String({ minLength: 1 }),
+	terminalEvidence: CheckoutTerminalEvidenceV1,
+}, { additionalProperties: false });
+export const SubagentRpcRecoverCheckoutLeaseV1 = Type.Object({
+	cwd: Type.String({ minLength: 1 }), leaseId: Type.Optional(Type.String({ minLength: 1 })), ordinaryOperationId: Type.Optional(Type.String({ minLength: 1 })),
+	generation: Type.Optional(Type.String({ minLength: 1 })), humanConfirmed: Type.Boolean(), humanActor: Type.String({ minLength: 1 }),
+	reason: Type.String({ minLength: 1 }), terminalEvidence: CheckoutTerminalEvidenceV1,
+}, { additionalProperties: false });

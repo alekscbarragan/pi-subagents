@@ -71,6 +71,55 @@ describe("subagent extension child mode", () => {
 		);
 	});
 
+	it("rejects an ordinary direct-tool writer behind an active workflow lease", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-direct-lease-"));
+		try {
+			const repo = path.join(root, "repo"); fs.mkdirSync(repo);
+			execFileSync("git", ["-C", repo, "init"]); execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]); execFileSync("git", ["-C", repo, "config", "user.name", "Test"]);
+			fs.writeFileSync(path.join(repo, "tracked.txt"), "initial\n"); execFileSync("git", ["-C", repo, "add", "tracked.txt"]); execFileSync("git", ["-C", repo, "commit", "--no-verify", "-m", "initial"]);
+			const script = String.raw`
+				import registerSubagentExtension from "./src/extension/index.ts";
+				import { acquireCheckoutLease } from "./src/runs/shared/checkout-lease.ts";
+				const repo = process.env.TEST_REPO;
+				acquireCheckoutLease({ operationId: "lease", ownerId: "workflow", workflowRunId: "wf", nodeId: "write", attempt: 0, cwd: repo });
+				let tool; const events = { on() { return () => {}; }, emit() {} };
+				registerSubagentExtension(new Proxy({ events, registerTool(value) { if (value.name === "subagent") tool = value; }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {} }, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } }));
+				const ctx = { cwd: repo, hasUI: false, ui: { setWidget() {}, requestRender() {}, theme: { fg(_n,t){return t}, bg(_n,t){return t}, bold(t){return t} } }, sessionManager: { getSessionId(){return "session"}, getSessionFile(){return null} }, modelRegistry: { getAvailable(){return []} } };
+				try { await tool.execute("ordinary-write", { agent: "worker", task: "write" }, new AbortController().signal, undefined, ctx); throw new Error("expected conflict"); }
+				catch (error) { if (error.code !== "conflict") throw error; }
+			`;
+			const env = parentToolEnv(); env.PI_CODING_AGENT_DIR = path.join(root, "agent"); env.TEST_REPO = repo;
+			execFileSync(process.execPath, ["--experimental-transform-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("registered lifecycle settles a revived quarantined foreground admission on async completion", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-foreground-lifecycle-"));
+		try {
+			const repo = path.join(root, "repo"); fs.mkdirSync(repo);
+			execFileSync("git", ["-C", repo, "init"]); execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]); execFileSync("git", ["-C", repo, "config", "user.name", "Test"]);
+			fs.writeFileSync(path.join(repo, "tracked.txt"), "initial\n"); execFileSync("git", ["-C", repo, "add", "tracked.txt"]); execFileSync("git", ["-C", repo, "commit", "--no-verify", "-m", "initial"]);
+			const script = String.raw`
+				import registerSubagentExtension from "./src/extension/index.ts";
+				import { admitOrdinaryCheckout, getCheckoutLease, recordOrdinaryExecutionOutcome, recordOrdinaryResumeOutcome } from "./src/runs/shared/checkout-lease.ts";
+				import { SUBAGENT_ASYNC_COMPLETE_EVENT } from "./src/shared/types.ts";
+				const handlers = new Map(); const events = { on(name, handler) { const list = handlers.get(name) ?? []; list.push(handler); handlers.set(name, list); return () => {}; }, emit(name, payload) { for (const handler of handlers.get(name) ?? []) handler(payload); } };
+				const fakePi = new Proxy({ events, registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {} }, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				registerSubagentExtension(fakePi);
+				const repo = process.env.TEST_REPO;
+				admitOrdinaryCheckout({ operationId: "foreground", ownerId: "ordinary", cwd: repo, access: "unknown" });
+				recordOrdinaryExecutionOutcome({ operationId: "foreground", runId: "old-run", children: [{ interrupted: true }] });
+				if (getCheckoutLease(repo).ordinary[0]?.state !== "quarantined") throw new Error("paused admission was not quarantined");
+				recordOrdinaryResumeOutcome({ runId: "old-run", asyncId: "new-async", outcome: "revived" });
+				if (getCheckoutLease(repo).ordinary[0]?.childRef !== "new-async") throw new Error("admission was not rebound");
+				events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { runId: "new-async" });
+				if (getCheckoutLease(repo).ordinary.length !== 0) throw new Error("completion did not settle admission");
+			`;
+			const env = parentToolEnv(); env.PI_CODING_AGENT_DIR = path.join(root, "agent"); env.TEST_REPO = repo;
+			execFileSync(process.execPath, ["--experimental-transform-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
 	it("does not show async badge for explicit foreground clarify chain calls", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./src/extension/index.ts";
