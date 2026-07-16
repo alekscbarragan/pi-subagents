@@ -26,6 +26,9 @@ import {
 	tryImport,
 } from "../support/helpers.ts";
 import { INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT } from "../../src/shared/types.ts";
+import { CHILD_WATCHDOG_STATUS_EVENT } from "../../src/watchdog/child-status.ts";
+import { MainWatchdogRuntime } from "../../src/watchdog/runtime.ts";
+import { MAX_CHILD_PENDING_LINE_BYTES, MAX_CHILD_STDERR_BYTES } from "../../src/runs/shared/child-protocol.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_PARENT_CHILD_INDEX_ENV,
@@ -67,6 +70,7 @@ interface RunSyncResult {
 	agent: string;
 	messages: unknown[];
 	error?: string;
+	protocolError?: { code?: string; stream?: string; limitBytes?: number; observedBytes?: number };
 	model?: string;
 	skills?: string[];
 	skillsWarning?: string;
@@ -101,6 +105,56 @@ interface RunSyncResult {
 interface MockPiCallRecord {
 	args?: string[];
 	systemPrompts?: Array<{ mode?: string; path?: string; text?: string; error?: string }>;
+}
+
+function writeWatchdogSettings(projectDir: string, tailMs = 120_000): void {
+	const settingsPath = path.join(projectDir, ".pi", "settings.json");
+	fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+	fs.writeFileSync(settingsPath, JSON.stringify({
+		subagents: {
+			watchdog: {
+				enabled: true,
+				children: {
+					enabled: true,
+					watchdogTailTimeoutMs: tailMs,
+				},
+			},
+		},
+	}, null, 2), "utf-8");
+}
+
+async function withIsolatedWatchdogSettings<T>(projectDir: string, run: () => Promise<T>): Promise<T> {
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
+	const isolatedHome = path.join(projectDir, "isolated-home");
+	process.env.PI_CODING_AGENT_DIR = path.join(isolatedHome, ".pi", "agent");
+	process.env.HOME = isolatedHome;
+	process.env.USERPROFILE = isolatedHome;
+	try {
+		return await run();
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+	}
+}
+
+function childWatchdogStatus(phase: "idle" | "reviewing" | "autofollow" | "settling" | "stale" | "failed", seq: number, followUpPending = false) {
+	return {
+		type: CHILD_WATCHDOG_STATUS_EVENT,
+		runId: "watchdog-child-run",
+		agent: "echo",
+		childIndex: 0,
+		stepIndex: 0,
+		seq,
+		phase,
+		ts: Date.now() + seq,
+		followUpPending,
+	};
 }
 
 function mockAssistantMessage(text: string, stopReason: "stop" | "tool_use" = "stop") {
@@ -143,7 +197,9 @@ interface ExecutorToolResult {
 	isError?: boolean;
 	details?: {
 		totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
+		asyncId?: string;
 		timeoutMs?: number;
+		turnBudget?: { maxTurns: number; graceTurns: number };
 	};
 }
 
@@ -218,12 +274,16 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		return readCall().args;
 	}
 
-	function makeExecutor(agents = [makeAgent("echo")], config: Record<string, unknown> = {}) {
+	function makeExecutor(
+		agents = [makeAgent("echo")],
+		config: Record<string, unknown> = {},
+		asyncByDefault = false,
+	) {
 		return createSubagentExecutor!({
 			pi: { events: createEventBus(), getSessionName: () => undefined },
 			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
 			config,
-			asyncByDefault: false,
+			asyncByDefault,
 			tempArtifactsDir: tempDir,
 			getSubagentSessionRoot: () => tempDir,
 			expandTilde: (value: string) => value,
@@ -263,6 +323,22 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.match(result.content[0]?.text ?? "", /single alias finished/);
 	});
 
+	it("rejects string \"none\" acceptance before spawning", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.execute(
+			"string-none-acceptance",
+			{ agent: "echo", task: "Do work", acceptance: "none" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /acceptance level "none" requires a reason/);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
 	it("rejects unknown action strings at runtime", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const executor = makeExecutor([makeAgent("echo")]);
 
@@ -277,6 +353,45 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /Unknown action: not-a-real-action/);
 		assert.match(result.content[0]?.text ?? "", /Valid:/);
+	});
+
+	it("routes watchdog.configure through the management action path", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const gpt = { provider: "openai-codex", id: "gpt-5.5", reasoning: true };
+		const opus = { provider: "anthropic", id: "claude-opus-4-8", reasoning: true };
+		const models = [gpt, opus];
+		const watchdog = new MainWatchdogRuntime({ cwd: tempDir });
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+			config: {},
+			asyncByDefault: false,
+			watchdog,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (value: string) => value,
+			discoverAgents: () => ({ agents: [makeAgent("echo")] }),
+		});
+		const ctx = {
+			...makeMinimalCtx(tempDir),
+			model: gpt,
+			modelRegistry: {
+				getAvailable: () => models,
+				find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
+				hasConfiguredAuth: (model: unknown) => Boolean(model),
+			},
+		};
+
+		const result = await executor.execute(
+			"watchdog-configure",
+			{ action: "watchdog.configure", model: "recommended" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]?.text ?? "", /session model configured: anthropic\/claude-opus-4-8:high/);
+		assert.equal(watchdog.getSnapshot(tempDir).config.main.model, "anthropic/claude-opus-4-8");
 	});
 
 	it("rejects duplicate concurrent subagent execution calls", async () => {
@@ -621,6 +736,59 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.exitCode, 0);
 		assert.equal(result.model, "github-copilot/gpt-5-mini");
 		assert.deepEqual(result.attemptedModels, ["github-copilot/gpt-5-mini"]);
+	});
+
+	it("parses split UTF-8 JSON and a final unterminated protocol line", async () => {
+		const line = Buffer.from(JSON.stringify(events.assistantMessage("你好 from fragmented JSON")));
+		const unicodeStart = line.indexOf(Buffer.from("你"));
+		mockPi.onCall({ stdoutBase64Chunks: [
+			line.subarray(0, unicodeStart + 1).toString("base64"),
+			line.subarray(unicodeStart + 1).toString("base64"),
+		] });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Read fragmented output", { acceptance: false });
+		assert.equal(result.exitCode, 0);
+		assert.equal(getFinalOutput(result.messages), "你好 from fragmented JSON");
+	});
+
+	it("fails with protocol_output_limit when a child emits an oversized stdout line", async () => {
+		mockPi.onCall({ stdoutRaw: "x".repeat(MAX_CHILD_PENDING_LINE_BYTES + 1) });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Emit malformed output", { acceptance: false });
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.protocolError?.code, "protocol_output_limit");
+		assert.equal(result.protocolError?.stream, "stdout");
+		assert.match(result.error ?? "", /protocol_output_limit/);
+	});
+
+	it("keeps only a bounded UTF-8 stderr tail", async () => {
+		mockPi.onCall({ output: "failed", stderr: `${"x".repeat(MAX_CHILD_STDERR_BYTES + 1024)}终`, exitCode: 1 });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Fail noisily", { acceptance: false });
+		assert.equal(result.exitCode, 1);
+		assert.ok(Buffer.byteLength(result.error ?? "") <= MAX_CHILD_STDERR_BYTES);
+		assert.match(result.error ?? "", /终$/);
+	});
+
+	it("cancels final drain while agent_end reports a retry and waits for agent_settled", async () => {
+		mockPi.onCall({ steps: [
+			{ jsonl: [events.assistantMessage("retrying response"), { type: "agent_end", willRetry: true }] },
+			{ delay: 1400, jsonl: [events.assistantMessage("settled response"), { type: "agent_end", willRetry: false }, { type: "agent_settled" }] },
+		] });
+		const startedAt = Date.now();
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Retry once", { acceptance: false });
+		assert.equal(result.exitCode, 0);
+		assert.equal(getFinalOutput(result.messages), "settled response");
+		assert.ok(Date.now() - startedAt >= 1200, "foreground runner must not terminate during the retry delay");
+	});
+
+	it("treats agent_settled as a clean terminal watermark", async () => {
+		const nonTerminalMessage = events.assistantMessage("settled without a terminal assistant stop") as { message: { stopReason: string } };
+		nonTerminalMessage.message.stopReason = "length";
+		mockPi.onCall({ jsonl: [nonTerminalMessage, { type: "agent_settled" }], keepAliveAfterFinalMessageMs: 5000 });
+		const startedAt = Date.now();
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Wait until settled", { acceptance: false });
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.error, undefined);
+		assert.equal(getFinalOutput(result.messages), "settled without a terminal assistant stop");
+		assert.ok(Date.now() - startedAt < 4000, "agent_settled should trigger bounded child cleanup");
 	});
 
 	it("tracks usage from message events", async () => {
@@ -1010,6 +1178,23 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		}
 	});
 
+	it("injects an agent-file-relative local skill into the foreground child prompt", async () => {
+		mockPi.onCall({ output: "Done" });
+		const agentFile = path.join(tempDir, "agents", "nested", "worker.md");
+		const skillFile = path.join(path.dirname(agentFile), "skills", "local", "SKILL.md");
+		fs.mkdirSync(path.dirname(skillFile), { recursive: true });
+		fs.writeFileSync(skillFile, "---\ndescription: local skill description\n---\nLocal skill body\n", "utf-8");
+		const agents = [makeAgent("worker", { filePath: agentFile, skills: ["local"], skillPath: ["./skills"] })];
+
+		const result = await runSync(tempDir, agents, "worker", "Task", {});
+
+		assert.equal(result.exitCode, 0);
+		assert.deepEqual(result.skills, ["local"]);
+		const prompt = readCall().systemPrompts.map((record) => record.text ?? "").join("\n");
+		assert.match(prompt, /local skill description/);
+		assert.match(prompt, new RegExp(escapeRegExp(skillFile)));
+	});
+
 	it("falls back to the runtime cwd when the task cwd lacks a skill", async () => {
 		const taskCwd = path.join(tempDir, "nested");
 		fs.mkdirSync(taskCwd, { recursive: true });
@@ -1201,6 +1386,36 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.match(systemPrompt, /Ignore any other output filename or output path mentioned elsewhere/);
 	});
 
+	it("persists read-only file-only output without requiring a child write tool", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "complete read-only analysis" });
+		const outputPath = path.join(tempDir, "read-only-analysis.md");
+		const executor = makeExecutor([makeAgent("analyst", {
+			tools: ["read", "grep", "find", "ls"],
+			systemPrompt: "Analyze without modifying files.",
+		})]);
+
+		const result = await executor.execute(
+			"single-read-only-output",
+			{ agent: "analyst", task: "Analyze the runtime", output: outputPath, outputMode: "file-only", acceptance: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		const call = readCall();
+		const taskArg = call.args.at(-1) ?? "";
+		const systemPrompt = call.systemPrompts[0]?.text ?? "";
+		assert.equal(result.isError, undefined);
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), "complete read-only analysis");
+		assert.match(result.content[0]?.text ?? "", /Output saved to:/);
+		for (const instruction of [taskArg, systemPrompt]) {
+			assert.match(instruction, /Return the complete artifact in your final response\./);
+			assert.match(instruction, /runtime will persist it to exactly this path:/);
+			assert.match(instruction, /Do not call contact_supervisor merely because no write-capable tool is available\./);
+			assert.doesNotMatch(instruction, /Write your findings to exactly this path/);
+		}
+	});
+
 	it("treats string false as disabled output in foreground single runs", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "inline report" });
 		const executor = makeExecutor([makeAgent("echo", { output: "default-report.md" })]);
@@ -1221,6 +1436,50 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.doesNotMatch(readCallArgs().at(-1) ?? "", /Write your findings to(?: exactly this path)?:/);
 	});
 
+	it("rejects explicit reviewed acceptance at every execution nesting level before spawning", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const cases = [
+			{ agent: "echo", task: "Review", acceptance: "reviewed" },
+			{ agent: "echo", task: "Review", acceptance: { level: "reviewed" } },
+			{ tasks: [{ agent: "echo", task: "Review", acceptance: "reviewed" }] },
+			{ chain: [{ agent: "echo", task: "Review", acceptance: { level: "reviewed" } }] },
+			{ chain: [{ parallel: [{ agent: "echo", task: "Review", acceptance: "reviewed" }] }] },
+			{ chain: [{ expand: { from: { output: "targets", path: "/items" } }, parallel: { agent: "echo", acceptance: { level: "reviewed" } }, collect: { as: "reviews" } }] },
+		];
+		for (const [index, params] of cases.entries()) {
+			const executor = makeExecutor();
+			const result = await executor.execute(
+				`reviewed-acceptance-${index}`,
+				params,
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /cannot be requested explicitly.*independent reviewer result/i);
+		}
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("rejects explicit reviewed acceptance before appending a chain step", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+		const result = await executor.execute(
+			"append-reviewed-acceptance",
+			{
+				action: "append-step",
+				id: "missing-run",
+				chain: [{ agent: "echo", task: "Review the previous work", acceptance: { level: "reviewed" } }],
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /Cannot append step:.*cannot be requested explicitly.*independent reviewer result/i);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
 	it("rejects mismatched foreground timeout aliases before spawning", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const executor = makeExecutor();
 
@@ -1235,6 +1494,109 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /aliases/);
 		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("applies agent frontmatter defaults to single-agent launches", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([
+			makeAgent("echo", {
+				defaultAsync: true,
+				defaultTimeoutMs: 2_000,
+				defaultTurnBudget: { maxTurns: 4, graceTurns: 2 },
+			}),
+		]);
+
+		const result = await executor.execute(
+			"agent-launch-defaults",
+			{ agent: "echo", task: "Task" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]?.text ?? "", /Async:/);
+		assert.equal(typeof result.details?.asyncId, "string");
+		assert.equal(result.details?.timeoutMs, 2_000);
+		assert.deepEqual(result.details?.turnBudget, { maxTurns: 4, graceTurns: 2 });
+	});
+
+	it("applies agent acceptance defaults and lets explicit calls override them", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "default acceptance disabled" });
+		mockPi.onCall({ stdoutRaw: `${JSON.stringify(events.assistantMessage("explicit checked response without a report"))}\n` });
+		const executor = makeExecutor([
+			makeAgent("echo", { defaultAcceptance: { level: "none", reason: "lightweight response" } }),
+		]);
+
+		const defaulted = await executor.execute(
+			"agent-acceptance-default",
+			{ agent: "echo", task: "Return a concise answer" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(defaulted.isError, undefined);
+		assert.equal(defaulted.details?.results?.[0]?.acceptance?.status, "not-required");
+		assert.equal(defaulted.details?.results?.[0]?.acceptance?.effectiveAcceptance.reason, "lightweight response");
+
+		const explicit = await executor.execute(
+			"agent-acceptance-explicit",
+			{ agent: "echo", task: "Return a concise answer", acceptance: "checked" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(explicit.isError, true);
+		assert.equal(explicit.details?.results?.[0]?.acceptance?.status, "rejected");
+	});
+
+	it("lets agent frontmatter override the global async default", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "agent foreground default finished" });
+		const executor = makeExecutor(
+			[makeAgent("echo", { defaultAsync: false })],
+			{},
+			true,
+		);
+
+		const result = await executor.execute(
+			"agent-foreground-default",
+			{ agent: "echo", task: "Task" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]?.text ?? "", /agent foreground default finished/);
+		assert.equal(result.details?.asyncId, undefined);
+	});
+
+	it("lets explicit single-agent launch values override frontmatter defaults", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "explicit foreground finished" });
+		const executor = makeExecutor([
+			makeAgent("echo", {
+				defaultAsync: true,
+				defaultTimeoutMs: 1,
+				defaultTurnBudget: { maxTurns: 1, graceTurns: 0 },
+			}),
+		]);
+
+		const result = await executor.execute(
+			"explicit-launch-values",
+			{
+				agent: "echo",
+				task: "Task",
+				async: false,
+				timeoutMs: 2_000,
+				turnBudget: { maxTurns: 4, graceTurns: 2 },
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]?.text ?? "", /explicit foreground finished/);
+		assert.equal(result.details?.asyncId, undefined);
 	});
 
 	it("allows timeout settings for async runs before spawning", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -1410,6 +1772,19 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		});
 	});
 
+	it("fails with actionable diagnostics when a requested extension tool is not loaded", async () => {
+		mockPi.onCall({ output: "Model incorrectly claimed success", missingTools: ["fixture_search"] });
+		const agents = [makeAgent("extension-worker", { tools: ["read", "fixture_search"], fallbackModels: ["mock/fallback-model"] })];
+
+		const result = await runSync(tempDir, agents, "extension-worker", "Use fixture search", { runId: "missing-extension-tool" });
+
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /requested unavailable child tools: fixture_search/);
+		assert.match(result.error ?? "", /subagentOnlyExtensions/);
+		assert.match(result.error ?? "", /strict allowlist/);
+		assert.equal(result.modelAttempts?.length, 1);
+	});
+
 	it("passes custom tool extensions through even when explicit extensions are allowlisted", { skip: process.platform === "win32" ? "extension path resolution intermittent on Windows CI" : undefined }, async () => {
 		mockPi.onCall({ output: "Done" });
 		const agents = [makeAgent("echo", {
@@ -1445,6 +1820,71 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const extensionArgs = args.filter((arg, index) => args[index - 1] === "--extension");
 		assert.ok(extensionArgs.some((arg) => arg.endsWith(path.join("src", "runs", "shared", "subagent-prompt-runtime.ts"))));
 		assert.ok(extensionArgs.some((arg) => arg.replace(/\\/g, "/").endsWith("child-only-tool.ts")));
+	});
+
+	it("ignores child watchdog status when foreground child watchdogs are not configured", async () => {
+		await withIsolatedWatchdogSettings(tempDir, async () => {
+			mockPi.onCall({
+				jsonl: [events.assistantMessage("done-without-watchdog-config"), childWatchdogStatus("reviewing", 1)],
+				keepAliveAfterFinalMessageMs: 10000,
+			});
+			const agents = makeAgentConfigs(["echo"]);
+
+			const start = Date.now();
+			const result = await runSync(tempDir, agents, "echo", "Task", { runId: "watchdog-child-run" });
+			const elapsed = Date.now() - start;
+
+			assert.ok(elapsed < 5000, `unconfigured watchdog status should not delay final drain, took ${elapsed}ms`);
+			assert.equal(result.exitCode, 0);
+			assert.equal(result.finalOutput, "done-without-watchdog-config");
+			assert.equal((result as RunSyncResult & { watchdog?: unknown }).watchdog, undefined);
+		});
+	});
+
+	it("waits for child watchdog settlement before foreground final-drain cleanup", async () => {
+		await withIsolatedWatchdogSettings(tempDir, async () => {
+			writeWatchdogSettings(tempDir);
+			mockPi.onCall({
+				steps: [
+					{ jsonl: [events.assistantMessage("done-before-watchdog"), childWatchdogStatus("reviewing", 1)] },
+					{ delay: 1400, jsonl: [childWatchdogStatus("idle", 2)] },
+				],
+				keepAliveAfterFinalMessageMs: 10000,
+			});
+			const agents = makeAgentConfigs(["echo"]);
+
+			const start = Date.now();
+			const result = await runSync(tempDir, agents, "echo", "Task", { runId: "watchdog-child-run" });
+			const elapsed = Date.now() - start;
+
+			assert.ok(elapsed >= 1200, `watchdog settlement should delay final drain, took ${elapsed}ms`);
+			assert.ok(elapsed < 6000, `settled watchdog should still allow cleanup, took ${elapsed}ms`);
+			assert.equal(result.exitCode, 0);
+			assert.equal(result.finalOutput, "done-before-watchdog");
+			assert.equal((result as RunSyncResult & { watchdog?: { phase?: string } }).watchdog?.phase, "idle");
+		});
+	});
+
+	it("falls back after child watchdog tail timeout without failing successful foreground output", async () => {
+		await withIsolatedWatchdogSettings(tempDir, async () => {
+			writeWatchdogSettings(tempDir, 150);
+			mockPi.onCall({
+				jsonl: [events.assistantMessage("done-before-watchdog-timeout"), childWatchdogStatus("reviewing", 1)],
+				keepAliveAfterFinalMessageMs: 10000,
+			});
+			const agents = makeAgentConfigs(["echo"]);
+
+			const start = Date.now();
+			const result = await runSync(tempDir, agents, "echo", "Task", { runId: "watchdog-child-run" });
+			const elapsed = Date.now() - start;
+
+			assert.ok(elapsed < 5000, `watchdog tail fallback should not hang, took ${elapsed}ms`);
+			assert.equal(result.exitCode, 0);
+			assert.equal(result.finalOutput, "done-before-watchdog-timeout");
+			const watchdog = (result as RunSyncResult & { watchdog?: { phase?: string; timedOut?: boolean } }).watchdog;
+			assert.equal(watchdog?.phase, "stale");
+			assert.equal(watchdog?.timedOut, true);
+		});
 	});
 
 	it("treats forced drain after final assistant output as cleanup success", async () => {
@@ -1699,25 +2139,166 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 			const result = await runPromise;
 
-			assert.equal(result.exitCode, 0);
+			assert.equal(result.exitCode, -2);
 			assert.equal(result.detached, true);
 			assert.equal(result.detachedReason, "intercom coordination");
-			assert.equal(result.finalOutput, "Detached for intercom coordination.");
+			assert.equal(result.finalOutput, "Detached for intercom coordination before task completion.");
 			assert.equal(result.progress?.status, "detached");
 			assert.equal(accepted, true);
 		});
 	}
+
+	it("enforces the stdout protocol limit after foreground detachment", async () => {
+		const eventBus = createEventBus();
+		mockPi.onCall({ steps: [
+			{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Need a decision" })] },
+			{ delay: 100, stdoutRaw: "x".repeat(MAX_CHILD_PENDING_LINE_BYTES + 1) },
+			{ delay: 5000 },
+		] });
+		let detachEmitted = false;
+		let recoveredResult: RunSyncResult | undefined;
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Detach then emit malformed output", {
+			runId: "detached-protocol-limit",
+			allowIntercomDetach: true,
+			intercomEvents: eventBus,
+			acceptance: false,
+			onUpdate: (update) => {
+				if (detachEmitted) return;
+				const progress = (update as { details?: { progress?: Array<{ currentTool?: string }> } }).details?.progress;
+				if (!Array.isArray(progress) || !progress.some((item) => item.currentTool === "contact_supervisor")) return;
+				detachEmitted = true;
+				eventBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "detached-protocol-request" });
+			},
+			onDetachedExit: (postExit) => { recoveredResult = postExit as RunSyncResult; },
+		});
+		assert.equal(result.exitCode, -2);
+		for (let attempt = 0; attempt < 100 && !recoveredResult; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(recoveredResult?.exitCode, 1);
+		assert.equal(recoveredResult?.protocolError?.code, "protocol_output_limit");
+	});
+
+	it("does not save a detached placeholder to an explicit file-only output", async () => {
+		const eventBus = createEventBus();
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Need a decision" })] },
+				{ delay: 1000, jsonl: [events.assistantMessage("after reply")] },
+			],
+		});
+		const agents = makeAgentConfigs(["echo"]);
+		const outputPath = path.join(tempDir, "detached-output.md");
+		let detachEmitted = false;
+
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "detached-file-only-output",
+			allowIntercomDetach: true,
+			intercomEvents: eventBus,
+			outputPath,
+			outputMode: "file-only",
+			onUpdate: (update) => {
+				if (detachEmitted) return;
+				const progress = (update as { details?: { progress?: Array<{ currentTool?: string }> } }).details?.progress;
+				if (!Array.isArray(progress) || !progress.some((p) => p?.currentTool === "contact_supervisor")) return;
+				detachEmitted = true;
+				eventBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "file-only-detach" });
+			},
+		});
+
+		assert.equal(result.exitCode, -2);
+		assert.equal(result.detached, true);
+		assert.equal(result.savedOutputPath, undefined);
+		assert.equal(fs.existsSync(outputPath), false);
+		assert.match(result.outputSaveError ?? "", /not finalized/);
+	});
+
+	it("finalizes explicit output before reporting detached child post-exit success", async () => {
+		const eventBus = createEventBus();
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Need a decision" })] },
+				{ delay: 100, jsonl: [events.assistantMessage("after reply")] },
+			],
+		});
+		const agents = makeAgentConfigs(["echo"]);
+		const outputPath = path.join(tempDir, "detached-final-output.md");
+		let detachEmitted = false;
+		let recoveredResult: RunSyncResult | undefined;
+
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "detached-file-only-post-exit-output",
+			allowIntercomDetach: true,
+			intercomEvents: eventBus,
+			outputPath,
+			outputMode: "file-only",
+			onUpdate: (update) => {
+				if (detachEmitted) return;
+				const progress = (update as { details?: { progress?: Array<{ currentTool?: string }> } }).details?.progress;
+				if (!Array.isArray(progress) || !progress.some((p) => p?.currentTool === "contact_supervisor")) return;
+				detachEmitted = true;
+				eventBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "file-only-post-exit-detach" });
+			},
+			onDetachedExit: (postExit) => {
+				recoveredResult = postExit as RunSyncResult;
+			},
+		});
+
+		assert.equal(result.exitCode, -2);
+		assert.equal(result.detached, true);
+		assert.equal(fs.existsSync(outputPath), false);
+
+		for (let attempt = 0; attempt < 100 && (!fs.existsSync(outputPath) || !recoveredResult); attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), "after reply");
+		assert.ok(recoveredResult);
+		assert.equal(recoveredResult.exitCode, 0);
+		assert.equal(recoveredResult.progress?.status, "completed");
+		assert.equal(recoveredResult.savedOutputPath, outputPath);
+		assert.equal(recoveredResult.outputSaveError, undefined);
+		assert.match(recoveredResult.finalOutput ?? "", /^Output saved to:/);
+	});
+
+	it("aborts a foreground coordination tool start instead of detaching without a delivered handoff", async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Need a decision" })] },
+				{ delay: 10000, jsonl: [events.assistantMessage("after abort")] },
+			],
+		});
+		const agents = makeAgentConfigs(["echo"]);
+		const controller = new AbortController();
+		let aborted = false;
+
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "contact-supervisor-abort-without-handoff",
+			allowIntercomDetach: true,
+			signal: controller.signal,
+			onUpdate: (update) => {
+				if (aborted) return;
+				const progress = (update as { details?: { progress?: Array<{ currentTool?: string }> } }).details?.progress;
+				if (!Array.isArray(progress) || !progress.some((p) => p?.currentTool === "contact_supervisor")) return;
+				aborted = true;
+				controller.abort();
+			},
+		});
+
+		assert.equal(aborted, true);
+		assert.notEqual(result.exitCode, -2);
+		assert.equal(result.detached, undefined);
+		assert.notEqual(result.progress?.status, "detached");
+	});
 
 	for (const testCase of [
 		{ name: "intercom ask", toolName: "intercom", args: { action: "ask", to: "orchestrator" } },
 		{ name: "contact_supervisor need_decision", toolName: "contact_supervisor", args: { reason: "need_decision", message: "Need a decision" } },
 		{ name: "contact_supervisor interview_request", toolName: "contact_supervisor", args: { reason: "interview_request", message: "Need input", interview: { questions: [] } } },
 	]) {
-		it(`proactively detaches foreground children on blocking ${testCase.name}`, async () => {
+		it(`does not detach foreground children on blocking ${testCase.name} before a delivered handoff`, async () => {
 			mockPi.onCall({
 				steps: [
 					{ jsonl: [events.toolStart(testCase.toolName, testCase.args)] },
-					{ delay: 1000, jsonl: [events.assistantMessage("received pong")] },
+					{ delay: 50, jsonl: [events.assistantMessage("received pong")] },
 				],
 			});
 			const agents = makeAgentConfigs(["echo"]);
@@ -1728,10 +2309,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			});
 
 			assert.equal(result.exitCode, 0);
-			assert.equal(result.detached, true);
-			assert.equal(result.detachedReason, "intercom coordination");
-			assert.equal(result.finalOutput, "Detached for intercom coordination.");
-			assert.equal(result.progress?.status, "detached");
+			assert.equal(result.detached, undefined);
+			assert.equal(result.finalOutput, "received pong");
+			assert.equal(result.progress?.status, "completed");
 		});
 	}
 
@@ -1807,7 +2387,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 		assert.equal(quietResult.exitCode, 0);
 		assert.equal(quietResult.detached, undefined);
-		assert.equal(intercomResult.exitCode, 0);
+		assert.equal(intercomResult.exitCode, -2);
 		assert.equal(intercomResult.detached, true);
 		assert.equal(firstDetachResponse, true);
 	});

@@ -170,6 +170,61 @@ That reports the live runtime mapping, which can differ from settings on disk un
 
 You do not have to spell a model exactly. Model ids are matched fuzzily against the registry, so provider separator variations (`anthropic/claude-sonnet-4`, `anthropic:claude-sonnet-4`, or `anthropic.claude-sonnet-4`), id separator variations (`claude-haiku-4.5` vs `claude-haiku-4-5`), case differences (`Claude-Sonnet-4` vs `claude-sonnet-4`), and optional trailing date stamps (`claude-haiku-4-5-20251001` or `claude-haiku-4-5-2025-10-01` vs `claude-haiku-4-5`) all resolve to the same model. Exact `provider/id` matches still win, and a qualified provider query never silently switches providers — it only matches within the named provider. Ambiguous bare ids that exist under multiple providers still require a provider prefix or the current session's provider to disambiguate.
 
+### Choosing a watchdog model
+
+The subagent watchdog is not the `reviewer` subagent. `subagents.defaultModel` and `subagents.agentOverrides.reviewer` do not configure it. The watchdog is an opt-in adversarial change reviewer, so it should usually use a strong complementary model rather than a cheap/light model.
+
+The watchdog reviews repo edits, not ordinary conversation. It runs at the safe `agent_end` boundary only when the current agent or child writer changed the final repo state since the start of that turn. Multiple edits in one turn are coalesced into one review of the final changed state, unchanged/reverted diffs are skipped, and generated `.pi-subagents/` or `tmp/` artifacts do not trigger review. In orchestrated runs, each writing child can review its own edited worktree, and the parent can still review the aggregate repo diff after child changes are applied.
+
+When the watchdog is enabled, it also checks changed TypeScript and JavaScript files for fresh language-server diagnostics before the model review. It auto-detects `typescript-language-server` from the project `node_modules/.bin` or `PATH`; it never installs tools or scans the whole workspace. LSP errors surface as watchdog blockers, warnings as concerns, and info/hints stay in status details. Slow or missing servers are reported in `/subagents-watchdog status` without blocking the turn or emitting late mid-turn warnings. Configure the bounds with `subagents.watchdog.lsp.enabled`, `timeoutMs`, `maxFiles`, and `maxDiagnostics`.
+
+Use `/subagents-watchdog recommend-model` to ask pi-subagents for the current strong pairing. The current recommendation policy is Opus 4.8 with thinking high or GPT 5.5 with thinking high. If your main session is using one, the watchdog should use the other when that model is authenticated.
+
+```text
+/subagents-watchdog recommend-model
+/subagents-watchdog session model recommended
+/subagents-watchdog model recommended
+```
+
+`session model recommended` changes only the current Pi session. `model recommended` saves the recommendation to `~/.pi/agent/settings.json`; it does not turn the watchdog on. Enable it separately with `/subagents-watchdog on` when you want the extra review pass.
+
+You can also set the model explicitly:
+
+```text
+/subagents-watchdog model anthropic/claude-opus-4-8:high
+/subagents-watchdog model openai-codex/gpt-5.5:high
+/subagents-watchdog model inherit
+/subagents-watchdog check
+```
+
+For settings files, use `subagents.watchdog.main.model` and `subagents.watchdog.main.thinking` for the main watchdog. If `main.model` is omitted, the main watchdog uses the current session model and thinking level. If `main.model` is set without a thinking suffix or `main.thinking`, it runs with thinking off, so prefer `:high` or `"thinking": "high"` for the strong-watchdog pairing.
+
+```json
+{
+  "subagents": {
+    "watchdog": {
+      "enabled": true,
+      "main": {
+        "model": "anthropic/claude-opus-4-8",
+        "thinking": "high"
+      }
+    }
+  }
+}
+```
+
+For child subagent watchdogs, use `subagents.watchdog.children.model` as the default child watchdog model, or `subagents.watchdog.children.overrides.<agent>.model` for a specific child role. Child watchdogs are still opt-in and follow the same edit-gated rule: read-only children do not trigger watchdog reviews, while writer children are reviewed at their own `agent_end` if their worktree changed.
+
+Agents can configure the same values through the tool when you ask them to set up the watchdog:
+
+```ts
+subagent({ action: "watchdog.recommend-model" })
+subagent({ action: "watchdog.configure", model: "recommended", scope: "session" })
+subagent({ action: "watchdog.configure", model: "recommended", scope: "project" })
+```
+
+Persistent scopes (`user` or `project`) should only be used when you ask for a lasting default. Otherwise the agent should use `scope: "session"`.
+
 To keep subagents inside a budget or compliance profile, enforce a model scope. Put `subagents.modelScope` in user or project settings (project overrides user):
 
 ```json
@@ -189,7 +244,7 @@ To keep subagents inside a budget or compliance profile, enforce a model scope. 
 
 Foreground runs stream progress in the conversation while they run.
 
-Background runs keep working after control returns to you. Inspect active runs with `subagent({ action: "status" })`, or a specific run with `subagent({ action: "status", id: "..." })`. For a read-only fleet view across active foreground and background work, use `/subagents-fleet` or `subagent({ action: "status", view: "fleet" })`. To inspect what a background child is saying without hunting through artifact directories, tail its live transcript with `subagent({ action: "status", id: "...", view: "transcript" })`; add `index` for a specific child in a parallel or chain run.
+Background runs keep working after control returns to you. Inspect active runs with `subagent({ action: "status" })`, or a specific run with `subagent({ action: "status", id: "..." })`. `/subagents-fleet` opens a live, inspection-only fleet with current-session foreground work, recent async children, transcript tails, and completed output/session paths. Use `↑`/`↓` or `j`/`k` to select a child, `PgUp`/`PgDn` to scroll its transcript, `r` to refresh immediately, and `Esc` to close. `Ctrl+Alt+F` opens the same inspector even while a foreground turn is active and slash input is queued. Without a TUI, `/subagents-fleet` retains the textual `subagent({ action: "status", view: "fleet" })` fallback. Mutations stay in explicit commands: run `/subagents-stop` and pick from the selector, or use `/subagents-stop <run-id>` / `subagent({ action: "stop", id: "..." })` when you already know the id. To inspect one background child in text, use `subagent({ action: "status", id: "...", view: "transcript" })`; add `index` for a specific child in a parallel or chain run.
 
 They also show a compact async widget and send completion notifications. Parallel background runs show per-agent progress instead of fake chain steps. Chains with parallel groups keep their grouped shape in progress and results, so failed or paused agents stay visible next to completed ones. When a child is explicitly allowed to fan out with `tools: subagent`, its nested runs appear under that parent child in the main status tree instead of being hidden inside the child process.
 
@@ -201,7 +256,9 @@ Show me the current async runs.
 
 Async runs also write machine-readable lifecycle artifacts for observability and workflow gates. For a top-level async run, `details.asyncDir` points at a directory containing `status.json`, `events.jsonl`, `output-<index>.log`, and `subagent-log-<runId>.md`; the final summary is written to Pi's subagent results directory as `<runId>.json`. Nested async runs use the same shape under the nested async root and are discoverable through status projections that read the nested-run registry. These files are append/update artifacts only; interactive foreground behavior is unchanged.
 
-The stable v1 status/result fields are `lifecycleArtifactVersion`, `runId`/`id`, `sessionId`, `mode`, `state`, `startedAt`, `lastUpdate`, `endedAt`, `durationMs`, `cwd`, `asyncDir`, `sessionFile`, `outputFile`, `workflowGraph`, `steps`, `results`, `totalTokens`, `totalCost`, `model`/`attemptedModels`/`modelAttempts`, `toolCount`, `turnCount`, and nested `children` when a child is allowed to launch subagents. `events.jsonl` records lifecycle transitions such as `subagent.run.started`, `subagent.step.started`, `subagent.step.completed`/`failed`/`paused`, control attention events, nested interrupt failures, and `subagent.run.completed`; run boundary events include the lifecycle artifact version. Consumers should read these JSON files instead of scraping terminal output; unknown fields and event types should be ignored for forward compatibility.
+Foreground and async runners share bounded child-protocol handling. A child JSONL line above 4 MiB fails with structured `protocolError` code `protocol_output_limit`, stderr retains only its latest 128 KiB, split UTF-8 and final unterminated JSON events remain valid, and `agent_end.willRetry` defers completion until the child settles. Current Pi builds use `agent_settled` as the terminal watermark; older builds retain the bounded terminal-message fallback.
+
+The stable v1 status/result fields are `lifecycleArtifactVersion`, `runId`/`id`, `sessionId`, `mode`, `state`, `startedAt`, `lastUpdate`, `endedAt`, `durationMs`, `cwd`, `asyncDir`, `sessionFile`, `outputFile`, `workflowGraph`, `steps`, `results`, `totalTokens`, `totalCost`, `model`/`attemptedModels`/`modelAttempts`, `toolCount`, `turnCount`, and nested `children` when a child is allowed to launch subagents. `events.jsonl` records lifecycle transitions such as `subagent.run.started`, `subagent.step.started`, `subagent.step.completed`/`failed`/`paused`/`stopped`, control attention events, nested interrupt failures, and `subagent.run.completed`/`stopped`; run boundary events include the lifecycle artifact version. Consumers should read these JSON files instead of scraping terminal output; unknown fields and event types should be ignored for forward compatibility.
 
 Other Pi extensions can use the versioned in-process event-bus RPC instead of scraping slash output or calling internal modules. Listen for `subagents:rpc:v1:ready`, send requests on `subagents:rpc:v1:request`, and read replies from `subagents:rpc:v1:reply:<requestId>`.
 
@@ -219,7 +276,7 @@ pi.events.emit("subagents:rpc:v1:request", {
 });
 ```
 
-The v1 methods are `ping`, `status`, `spawn`, `interrupt`, and `stop`. `status` and `interrupt` reuse the normal control actions. `spawn` is async-only: omit `async` or set `async: true`, omit `clarify` or set `clarify: false`, and do not pass management `action` values. It goes through the same executor as the `subagent` tool, so agent discovery, validation, session attribution, spawn limits, child-safety depth, artifacts, and async status all behave the same. `stop` targets running async runs through the existing timeout control channel.
+The v1 methods are `ping`, `status`, `spawn`, `interrupt`, and `stop`. `status` and `interrupt` reuse the normal control actions. `spawn` is async-only: omit `async` or set `async: true`, omit `clarify` or set `clarify: false`, and do not pass management `action` values. It goes through the same executor as the `subagent` tool, so agent discovery, validation, session attribution, spawn limits, child-safety depth, artifacts, and async status all behave the same. `stop` targets current-session top-level async runs through the stop control channel and records a `stopped` lifecycle instead of reporting a timeout.
 
 `pi.events` is in-process only. It does not reach separate Pi processes or child subagents; use the file lifecycle artifacts or `pi-intercom` for cross-process coordination.
 
@@ -384,6 +441,7 @@ Skip this section until you want exact syntax.
 | `/subagent-cost` | Show parent plus child subagent token usage and cost for this session |
 | `/subagents-doctor` | Show read-only setup diagnostics |
 | `/subagents-models [agent]` | Show the runtime-loaded builtin model mapping, optionally filtered to one builtin |
+| `/subagents-watchdog [status|on|off|recommend-model|model ...|session model ...|check]` | Show or configure the opt-in watchdog; use a strong complementary model such as Opus 4.8 high or GPT 5.5 high |
 | `/subagents-profiles` | List saved subagent profiles from `~/.pi/agent/profiles/pi-subagents/` |
 | `/subagents-load-profile <name>` | Replace only `settings.subagents` with a saved profile and optionally switch this session to the profile worker model |
 | `/subagents-refresh-provider-models <provider> [--force]` | Create or refresh the cached provider model catalog |
@@ -502,7 +560,7 @@ Append `[key=value,...]` to an agent name to override defaults. `/chain` applies
 | `cwd` | `cwd=packages/api` | Run the step in a subdirectory. |
 | `count` | `count=3` | Fan a group task into N copies (only inside a `( ... )` group). |
 | `outputSchema` | `outputSchema=schema.json` | Validate structured output against a JSON Schema file (path resolved against the session cwd, not an inline step `cwd`). |
-| `acceptance` | `acceptance=checked` | Inline acceptance level: `auto`, `attested`, or `checked`. Use the tool API or saved `.chain.json` for object contracts such as `none`, `verified`, or `reviewed`. |
+| `acceptance` | `acceptance=checked` | Inline acceptance level: `auto`, `attested`, or `checked`. Use the tool API or saved `.chain.json` for object contracts such as `none` or `verified`; `reviewed` is inferred-only. |
 
 Set `output=false`, `reads=false`, or `skills=false` to disable that behavior explicitly. Do not use `output=false` for file-only returns; use `outputMode=file-only` with an `output` path.
 
@@ -533,9 +591,11 @@ You can combine them in either order:
 /run reviewer "review this diff" --bg --fork
 ```
 
-Background runs are detached. If the parent agent has other independent work, it should keep working. When it has nothing useful to do until a background result arrives, it should call the `wait` tool instead of running sleep or status-polling loops. `wait()` returns when the next active run finishes or needs attention and keeps the turn alive for normal notification delivery; use `wait({ all: true })` to drain every active run, `wait({ id })` for one run, and `wait({ timeoutMs })` to cap the block.
+Background runs are detached. If the parent agent has other independent work, it should keep working. When it has nothing useful to do until a background result arrives, it should call `subagent_wait` instead of running sleep or status-polling loops. `subagent_wait()` returns when the next active run finishes or needs attention and keeps the turn alive for normal notification delivery; use `subagent_wait({ all: true })` to drain every active async run, `subagent_wait({ id })` for one async run or remembered detached foreground run, and `subagent_wait({ timeoutMs })` to cap the block.
 
-`wait` is what lets a background-launching skill keep moving in a single turn, including non-interactive `pi -p` invocations where there is no subsequent turn to receive a completion notification. Ending the turn to wait for a completion only works in an interactive session where the user will prompt the agent again; in a run-to-completion skill or a non-interactive run, use `wait` so the still-running children are not abandoned.
+A foreground child can detach while it waits for a supervisor reply. Reply first, then call `subagent_wait({ id: runId })`. The remembered run stays pending until the child exits, then emits a session-scoped completion notification with recovered output and remains inspectable through `subagent({ action: "status", id: runId })`. Do not call `resume` or launch a replacement while the child remains detached.
+
+`subagent_wait` is what lets a background-launching skill keep moving in a single turn, including non-interactive `pi -p` invocations where there is no subsequent turn to receive a completion notification. Ending the turn to wait for a completion only works in an interactive session where the user will prompt the agent again; in a run-to-completion skill or a non-interactive run, use `subagent_wait` so the still-running children are not abandoned.
 
 The `oracle` and `worker` builtins are designed for an explicit decision loop. A typical pattern is to ask `oracle` for diagnosis and a recommended execution prompt, then only run `worker` after the main agent approves that direction.
 
@@ -644,10 +704,15 @@ thinking: high
 systemPromptMode: replace
 inheritProjectContext: false
 inheritSkills: false
-skills: safe-bash, chrome-devtools
+skills: safe-bash, review-checklist
+skillPath: ./skills, ../shared-skills
 output: context.md
 defaultReads: context.md
 defaultProgress: true
+async: true
+timeoutMs: 900000
+turnBudget: {"maxTurns":20,"graceTurns":2}
+acceptance: {"level":"none","reason":"lightweight lookup"}
 completionGuard: false
 interactive: true
 maxSubagentDepth: 1
@@ -661,7 +726,7 @@ Important fields:
 | Field | Notes |
 |-------|-------|
 | `package` | Optional package identifier. A file with `name: scout` and `package: code-analysis` registers as `code-analysis.scout`; serialization keeps `name` and `package` separate. |
-| `tools` | Builtin tool allowlist. `mcp:` entries select direct MCP tools when `pi-mcp-adapter` is installed. |
+| `tools` | Strict child tool allowlist. Named extension tools must also have their provider loaded. `mcp:` entries select direct MCP tools when `pi-mcp-adapter` is installed. |
 | `extensions` | Omitted means normal extensions; empty means no extensions; comma-separated values allowlist specific extensions. |
 | `subagentOnlyExtensions` | Comma-separated extension paths loaded only in spawned child sessions for this agent. Tools registered there are unavailable to the main agent unless also installed through normal Pi extension configuration. |
 | `model` | Default model. Bare ids prefer the current provider when possible, then unique registry matches. |
@@ -671,14 +736,21 @@ Important fields:
 | `inheritProjectContext` | Keeps or strips inherited project instruction blocks. |
 | `inheritSkills` | Keeps or strips Pi’s discovered skills catalog. |
 | `defaultContext` | Optional `fresh` or `fork` launch context default for this agent. |
-| `skills` | Adds specific skills to the child’s available skill list, regardless of `inheritSkills`. |
+| `skills` | Selects specific skills for the child, regardless of `inheritSkills`. |
+| `skillPath` | Comma-separated invocation-private skill files or discovery directories. Relative paths resolve from the agent definition file. Local matches take precedence, while unresolved or unreadable matches fall back to normal skill discovery. This field discovers candidates only; `skills` still selects what the child receives. |
 | `output` | Default single-agent output file. |
 | `defaultReads` | Files to read before running in chain/parallel behavior. |
 | `defaultProgress` | Maintain `progress.md`. |
+| `async` | Default a single-agent launch to background (`true`) or foreground (`false`) when the call omits `async`. Explicit call values and `forceTopLevelAsync` win. |
+| `timeoutMs` | Positive integer default runtime deadline in milliseconds for single-agent launches. An explicit `timeoutMs` or `maxRuntimeMs` wins. |
+| `turnBudget` | JSON object default such as `{"maxTurns":20,"graceTurns":2}` for single-agent launches. An explicit call value wins, followed by this agent default, then global `turnBudget` config. |
+| `acceptance` | Acceptance default for single-agent launches. Use a scalar level such as `checked` or an inline/block YAML map such as `{ level: "none", reason: "lightweight lookup" }`. Explicit call values win; chain and parallel acceptance remains task/step configuration. |
 | `completionGuard` | Set `false` only for non-implementation agents that may mention implementation words while using mutation-capable tools such as `bash`. |
 | `interactive` | Parsed for compatibility but not enforced in v1. |
 | `maxSubagentDepth` | Tightens nested delegation for this agent's children. |
 | `memory` | Opt-in role-specific persistent memory. `memory: { scope: "project" \| "user", path: "<name>" }` injects the first lines of a `MEMORY.md` from a dedicated `agent-memory/` directory into the child system prompt. Agents with write tools (`edit`/`write`/`bash`) get a read-write block; read-only agents get a read-only fallback. Project scope resolves under `<project>/.pi/agent-memory/`, user scope under `~/.pi/agent/agent-memory/`. Paths are validated against traversal and symlink escape. |
+
+Agent-local `skillPath` candidates never enter Pi's parent/global skills catalog. Pair `inheritSkills: false` with explicit `skills` and `skillPath` when a child should receive only its selected private skills.
 
 ### Per-agent persistent memory
 
@@ -696,7 +768,7 @@ Project-scoped memory resolves under `<project>/.pi/agent-memory/<path>` and tra
 
 ### Tool and extension selection
 
-If `tools` is omitted, `pi-subagents` does not pass `--tools`, so the child gets Pi’s normal builtin tools. If `tools` is present, regular tool names become an explicit allowlist. `mcp:` entries are split out and forwarded as direct MCP selections. Path-like `tools` entries, such as extension paths or `.ts`/`.js` files, are treated as tool-extension paths rather than builtin tool names. Agents that declare only known read-only builtin tools skip the implementation completion guard, but `bash`, unknown tools, and MCP tools stay mutation-capable. Use `completionGuard: false` for bash-enabled validators or advisors that should never be judged as implementation agents.
+If `tools` is omitted, `pi-subagents` does not pass `--tools`, so the child gets Pi’s normal builtin tools. If `tools` is present, regular tool names become an explicit allowlist. An allowlisted name does not load the extension that registers it: load that provider through normal Pi extension discovery, `extensions`, `subagentOnlyExtensions`, or a path-like `tools` entry. `mcp:` entries are split out and forwarded as direct MCP selections. Path-like `tools` entries, such as extension paths or `.ts`/`.js` files, are treated as tool-extension paths rather than tool names. Internal runtime tools such as `structured_output` are added to an explicit allowlist only when their contract is active. Agents that declare only known read-only builtin tools skip the implementation completion guard, but `bash`, unknown tools, and MCP tools stay mutation-capable. Use `completionGuard: false` for bash-enabled validators or advisors that should never be judged as implementation agents.
 
 Examples:
 
@@ -704,6 +776,7 @@ Examples:
 - `tools: mcp:chrome-devtools`: normal builtins plus direct Chrome DevTools MCP tools.
 - `tools: read, bash, mcp:chrome-devtools`: only `read` and `bash` as builtins, plus direct Chrome DevTools MCP tools.
 - `tools: subagent, read`: a child-safe `subagent` tool is available inside that child so it can run explicitly assigned nested fanout.
+- `tools: read, fixture_search` plus `subagentOnlyExtensions: ./tools/fixture-search.ts`: the provider loads only in this agent's child process, and the registered `fixture_search` name survives the strict allowlist.
 
 Direct MCP tools require [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter). Subagents only receive direct MCP tools when `mcp:` entries are listed in their frontmatter; global `directTools: true` in `mcp.json` is not enough by itself. The generic `mcp` proxy tool can still be used for discovery when available. The adapter caches tool metadata at startup, so after connecting a new MCP server for the first time, restart Pi before relying on direct tools. An `mcp:` entry named `subagent` does not authorize nested fanout; only the builtin `subagent` tool name does.
 
@@ -719,9 +792,11 @@ extensions:
 extensions: /abs/path/to/ext-a.ts, /abs/path/to/ext-b.ts
 ```
 
-When `extensions` is present, it takes precedence over extension paths implied by `tools` entries.
+When `extensions` is present, normal discovered extensions are disabled; the listed extensions, path-like `tools` entries, required pi-subagents runtime extensions, and `subagentOnlyExtensions` still load.
 
 Use `subagentOnlyExtensions` when a custom extension tool should exist only inside child sessions. It is scoped by agent config: every run of that agent receives those extension paths, while other agents do not unless they declare the same field. The current model does not have a separate named-subagent audience inside one agent definition.
+
+Before the first model turn, the child runtime compares every explicit tool name with Pi's final filtered registry. A missing provider now fails the run with the unavailable names and concrete `subagentOnlyExtensions`/`extensions` guidance instead of letting a direct or chained child silently continue without its requested tools.
 
 ## Chain files
 
@@ -1001,6 +1076,7 @@ Agent definitions are not loaded into context by default. Management actions let
   extensions: "",
   skills: "parallel-scout",
   thinking: "high",
+  acceptance: { level: "none", reason: "lightweight lookup" },
   output: "context.md",
   reads: "shared-context.md",
   progress: true
@@ -1017,6 +1093,7 @@ Agent definitions are not loaded into context by default. Management actions let
 }}
 
 { action: "update", agent: "code-analysis.scout", config: { model: "openai/gpt-4o" } }
+{ action: "update", agent: "code-analysis.scout", config: { acceptance: "" } } // clear the frontmatter default
 { action: "update", chainName: "review-pipeline", config: { steps: [...] } }
 { action: "delete", agent: "scout" }
 { action: "delete", chainName: "review-pipeline" }
@@ -1038,7 +1115,7 @@ Agent definitions are not loaded into context by default. Management actions let
 |-------|------|---------|-------------|
 | `agent` | string | - | Agent name for single mode, or target for management actions. |
 | `task` | string | - | Task string for single mode. |
-| `action` | string | - | `list`, `get`, `create`, `update`, `delete`, `status`, `interrupt`, `resume`, `steer`, `append-step`, or `doctor`. |
+| `action` | string | - | `list`, `get`, `create`, `update`, `delete`, `status`, `interrupt`, `stop`, `resume`, `steer`, `append-step`, or `doctor`. |
 | `chainName` | string | - | Chain name for management actions. |
 | `config` | object/string | - | Agent or chain config for create/update. |
 | `output` | `string \| false` | agent default | Override single-agent output file. |
@@ -1065,11 +1142,11 @@ Agent definitions are not loaded into context by default. Management actions let
 | `includeProgress` | boolean | false | Include full progress in result. |
 | `share` | boolean | false | Upload session export to GitHub Gist. |
 | `sessionDir` | string | derived | Override session log directory. |
-| `acceptance` | string/object/false | inferred | Override the run's inferred acceptance gates. Use `"auto"`, `"attested"`, `"checked"`, `"verified"`, `"reviewed"`, or `{ level: "none", reason: "..." }`. |
+| `acceptance` | string/object/false | inferred | Override inferred gates with `"auto"`, `"attested"`, `"checked"`, `"verified"`, or `{ level: "none", reason: "..." }`. `reviewed` is inferred-only; explicit requests fail preflight. `false` is a deprecated shorthand for disabling gates. |
 
 `context: "fork"` fails fast when the parent session is not persisted, the current leaf is missing, or the branched child session cannot be created. When the inherited transcript contains signed Anthropic `thinking` / `redacted_thinking` blocks, `pi-subagents` strips those provider-private blocks from the forked child session and forces the child run's thinking level to `off` so Anthropic does not reject modified signatures after branching or compaction. Forking never silently downgrades to `fresh`. In multi-agent runs that omit `context`, each agent/task/step follows its own `defaultContext`, so a fresh-default scout can run fresh beside a fork-default worker. Pass explicit `context: "fork"` or `context: "fresh"` when you intentionally want one context for every child.
 
-Use `outputMode: "file-only"` when a saved output may be large and the parent only needs a pointer. The returned text is a compact reference like `Output saved to: /abs/report.md (48.2 KB, 2847 lines). Read this file if needed.` Failed runs and save errors still return normal inline output for debugging. In chains, later `{previous}` steps receive the same compact reference when the prior step used file-only mode.
+Use `outputMode: "file-only"` when a saved output may be large and the parent only needs a pointer. The returned text is a compact reference like `Output saved to: /abs/report.md (48.2 KB, 2847 lines). Read this file if needed.` Failed runs and save errors still return normal inline output for debugging. In chains, later `{previous}` steps receive the same compact reference when the prior step used file-only mode. A child with only read-only tools does not need direct filesystem access for `output`: it returns the complete artifact in its final response and the runtime persists it. Children with mutation-capable tools retain the direct-write instruction.
 
 Sequential and parallel chain tasks accept `agent`, `task`, `phase`, `label`, `as`, `outputSchema`, `cwd`, `output`, `outputMode`, `reads`, `progress`, `skill`, `model`, and `toolBudget`. Parallel tasks also accept `count`. Parallel step groups accept `parallel`, `concurrency`, `failFast`, and `worktree`. If `outputSchema` is present, the child must call `structured_output` with schema-valid JSON; prose-only completion or invalid JSON fails the step. Validated structured values are preserved on the step result, and `as` also exposes a compact text representation through `{outputs.name}`.
 
@@ -1083,6 +1160,7 @@ subagent({ action: "status", id: "<run-id>", view: "transcript", index: 0, lines
 subagent({ action: "status", id: "<nested-run-id>" })
 subagent({ action: "interrupt", id: "<run-id>" })
 subagent({ action: "interrupt", id: "<nested-run-id>" })
+subagent({ action: "stop", id: "<run-id>" })
 subagent({ action: "resume", id: "<run-id>", message: "follow-up question" })
 subagent({ action: "resume", id: "<run-id>", index: 1, message: "follow-up for child 2" })
 subagent({ action: "resume", id: "<nested-run-id>", message: "follow-up for a nested child" })
@@ -1094,7 +1172,9 @@ subagent({ action: "doctor" })
 
 `status` resolves exact foreground ids, top-level async ids, and nested run ids before falling back to prefix matching. `view: "fleet"` is an optional read-only active-run surface with transcript commands; it does not add steering or stop controls. `view: "transcript"` tails the selected run's live `output-<index>.log` or persisted session transcript, with `lines` capped at 500. Nested status shows the root/parent path, nested children, session/artifact paths when known, and nested control commands. Inside child-safe fanout mode, bare `status` requires an id when no local foreground run is active, so children cannot enumerate unrelated top-level async runs. Bare `interrupt` still targets only the visible top-level run; interrupting a nested run requires its explicit nested id.
 
-`resume` sends the follow-up directly when an async child is still reachable over intercom. After completion, it revives the child by starting a new async child from the stored child session file. Multi-child async runs and remembered foreground single, parallel, or chain runs can be revived by passing `index` to choose the child. Nested runs can be resumed by nested id when their live route or persisted session metadata is available. Revive starts a new child process from the old session context; it does not restart the same OS process, and it requires the chosen child to have a persisted `.jsonl` session file.
+`resume` sends the follow-up directly when an async child is still reachable over intercom. After completion, it revives the child by starting a new async child from the stored child session file. Multi-child async runs and remembered foreground single, parallel, or chain runs can be revived by passing `index` to choose the child. Nested runs can be resumed by nested id when their live route or persisted session metadata is available. Revive starts a new child process from the old session context; it does not restart the same OS process, and it requires the chosen child to have a persisted `.jsonl` session file. Direct revival takes an exclusive cross-process lease on the canonical session file until the new child finishes. A concurrent attempt fails before Pi is spawned and identifies the owning revived run; dead-owner leases are reclaimed only when staleness can be proved.
+
+`stop` ends a current-session top-level async run. It is deliberately stronger than `interrupt`: it is not a resumable pause, stopped runs should be restarted as new runs, foreground and nested targets are rejected, direct id calls execute immediately, and `/subagents-stop` without an id opens a selector with confirmation when a TUI is available. In non-TUI contexts the slash command prints exact `subagent({ action: "stop", id })` and `/subagents-stop <id>` commands. Scheduled jobs can appear in the selector, but they are labeled as scheduled cancellations and route through `schedule-cancel`, not `stop`.
 
 `steer` queues non-terminal guidance for a running async Pi child, or for a pending indexed child that will start later in the same async run. It does not interrupt, pause, or revive a child. Delivery requires the spawned Pi session to support mid-run `sendUserMessage(..., { deliverAs: "steer" })`; unsupported runtimes keep the request visible in control artifacts but cannot receive it live. Use `index` for multi-child runs when you want to steer one child; without `index`, steering targets the currently running child or children.
 
@@ -1142,7 +1222,7 @@ After a worktree parallel step completes, per-agent diff stats are appended to t
 { "toolDescriptionMode": "compact" }
 ```
 
-Controls the parent-facing `subagent` tool description registered at startup. `full` is the default. `compact` keeps the execution modes, async/wait guidance, child-safety boundary, management/action split, one-writer review guidance, and artifact/status essentials with less prompt bloat.
+Controls the parent-facing `subagent` tool description registered at startup. `full` is the default. `compact` keeps the execution modes, async/`subagent_wait` guidance, child-safety boundary, management/action split, one-writer review guidance, and artifact/status essentials with less prompt bloat.
 
 `custom` reads `subagent-tool-description.md` from the project config directory, then from `~/.pi/agent/subagent-tool-description.md`. Missing, empty, unreadable, or oversized custom files fall back to the full description. Custom templates may use `{{fullDescription}}`, `{{compactDescription}}`, `{{safetyGuidance}}`, `{{agentDir}}`, and `{{projectConfigDir}}`; the safety guidance is always present so custom prose cannot remove the runtime guardrails. Restart Pi after changing the mode or custom file.
 
@@ -1154,13 +1234,21 @@ Controls the parent-facing `subagent` tool description registered at startup. `f
 
 Makes top-level calls use background execution when the request does not explicitly set `async`. Callers can still force foreground with `async: false` unless `forceTopLevelAsync` is enabled.
 
+### `asyncWidget`
+
+```json
+{ "asyncWidget": false }
+```
+
+Controls the above-editor widget for background runs. The default is `true`. Set it to `false` when another extension renders async lifecycle data in a custom footer, status line, or dashboard; status tracking, completion notifications, `/subagents-fleet`, and lifecycle events continue to work.
+
 ### `waitTool`
 
 ```json
 { "waitTool": { "enabled": false } }
 ```
 
-Keeps the `wait` tool registered but makes it return immediately instead of blocking on active async runs. Use this in interactive sessions where background completions should arrive as notifications while the main conversation stays steerable. The default is enabled. You can also set `"waitTool": false`; set `PI_SUBAGENT_WAIT_TOOL_ENABLED=false` (or `0`, `off`, `disabled`) to override config for one process. Invalid `waitTool` config or env values fail instead of being coerced.
+Keeps the `subagent_wait` tool registered but makes it return immediately instead of blocking on active async runs. Use this in interactive sessions where background completions should arrive as notifications while the main conversation stays steerable. The default is enabled. You can also set `"waitTool": false`; set `PI_SUBAGENT_WAIT_TOOL_ENABLED=false` (or `0`, `off`, `disabled`) to override config for one process. Invalid `waitTool` config or env values fail instead of being coerced.
 
 ### `forceTopLevelAsync`
 
@@ -1192,7 +1280,7 @@ Caps the total number of child subagent launches allowed during one parent sessi
 { "scheduledRuns": { "enabled": true, "maxPending": 20, "maxLatenessMs": 300000 } }
 ```
 
-Enables optional one-shot scheduled subagent runs. When enabled, `subagent({ action: "schedule", agent, task?, schedule: "+10m" | "2030-01-01T09:00:00Z", scheduleName? })` defers a subagent launch until a future time. Absolute ISO timestamps must include a timezone (`Z` or an offset such as `+05:30`). The scheduled run launches as a normal tracked async run with fresh context once it fires, and joins the existing async widget, status, `wait`, and completion-notification paths. `schedule-list`, `schedule-status`, and `schedule-cancel` manage pending jobs. Schedules are persisted per session and restored after a Pi restart; a job missed by more than `maxLatenessMs` while Pi is unavailable is marked `missed` instead of firing late. `maxPending` caps the number of pending or running scheduled jobs per session (default `20`). The feature is opt-in: leave `enabled` unset to keep scheduling out of the tool surface and prompt. Only schedule explicit delayed runs the user asked for.
+Enables optional one-shot scheduled subagent runs. When enabled, `subagent({ action: "schedule", agent, task?, schedule: "+10m" | "2030-01-01T09:00:00Z", scheduleName? })` defers a subagent launch until a future time. Absolute ISO timestamps must include a timezone (`Z` or an offset such as `+05:30`). The scheduled run launches as a normal tracked async run with fresh context once it fires, and joins the existing async widget, status, `subagent_wait`, and completion-notification paths. `schedule-list`, `schedule-status`, and `schedule-cancel` manage pending jobs. Schedules are persisted per session and restored after a Pi restart; a job missed by more than `maxLatenessMs` while Pi is unavailable is marked `missed` instead of firing late. `maxPending` caps the number of pending or running scheduled jobs per session (default `20`). The feature is opt-in: leave `enabled` unset to keep scheduling out of the tool surface and prompt. Only schedule explicit delayed runs the user asked for.
 
 ### `parallel`
 
@@ -1324,7 +1412,7 @@ Debug artifacts live under `{sessionDir}/subagent-artifacts/`, `.pi-subagents/ar
 - `{runId}_{agent}.jsonl`
 - `{runId}_{agent}_meta.json`
 
-Metadata records timing, usage, exit code, final model, attempted models, and fallback attempt outcomes.
+Metadata records timing, usage, exit code, final model, attempted models, fallback attempt outcomes, and the resolved acceptance ledger with its parsed child report.
 
 Session files are stored under a per-run session directory. With `context: "fork"`, each child starts with `--session <branched-session-file>` produced from the parent’s current leaf. That is a real session fork, not an injected summary.
 
@@ -1359,7 +1447,7 @@ Every run resolves an effective acceptance policy. Callers may omit `acceptance`
 }
 ```
 
-Accepted levels are `auto`, `none`, `attested`, `checked`, `verified`, and `reviewed`. `acceptance: "auto"` is the default. Read-only reviewer/scout tasks infer lightweight attestation, normal writer tasks infer checked evidence, and async/risky/dynamic writer contexts infer a reviewed gate. To disable gates, prefer `{ level: "none", reason: "..." }`.
+Acceptance policies use the levels `auto`, `none`, `attested`, `checked`, `verified`, and `reviewed`. `acceptance: "auto"` is the default. Callers may explicitly request levels through `verified`; `reviewed` is reserved for inferred policy because the current execution path cannot supply an independent reviewer result. Explicit `reviewed` fails preflight instead of spawning a child that is guaranteed to be rejected. Read-only reviewer/scout tasks infer lightweight attestation, normal writer tasks infer checked evidence, and async/risky/dynamic writer contexts infer a reviewed gate. The bare string `"none"` is rejected; use `{ level: "none", reason: "..." }` instead. `false` is accepted only as a deprecated shorthand for disabling gates.
 
 Acceptance provenance is stored separately from child prose:
 
@@ -1370,7 +1458,9 @@ Acceptance provenance is stored separately from child prose:
 - `reviewed`: an independent reviewer result is present.
 - `rejected`: attestation, structural checks, verification, or review failed.
 
-For `attested` or stricter levels, the child prompt includes a standardized acceptance section and asks for a fenced `acceptance-report` JSON block. Explicit failed gates fail the run. Inferred gates are persisted for observability without breaking older calls that omit `acceptance`.
+For `attested` or stricter levels, the child prompt includes a standardized acceptance section and asks for a fenced `acceptance-report` JSON block. The parser canonicalizes known enum synonyms, snake_case report keys and wrappers, underscore fence tags, unambiguous scalar arrays, string booleans, and criterion-id separators. Unknown or ambiguous keys and enum values fail with field-level diagnostics. Explicit empty `changedFiles` and `testsAddedOrUpdated` arrays are recorded as not applicable; missing fields and empty required command or validation evidence still fail.
+
+Acceptance fences are removed from normal output artifacts, while the raw child transcript remains intact and per-child metadata stores the complete acceptance ledger and parsed report. Explicit failed gates fail the run. Inferred gates remain observable without failing the run.
 
 ## Live progress
 
@@ -1416,6 +1506,8 @@ Async events:
 
 - `subagent:async-started`
 - `subagent:async-complete`
+
+The `subagent:async-started` payload includes `task`, the backwards-compatible first child task truncated to 50 characters, and `goal`, the workflow-level caller task truncated to 120 characters (falling back to the first child task). Companion UI extensions can combine `goal`, `workflowGraph`, and the live lifecycle artifacts under `asyncDir` without scraping terminal output.
 
 Intercom delivery events:
 

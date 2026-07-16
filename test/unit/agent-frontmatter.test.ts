@@ -55,6 +55,23 @@ afterEach(() => {
 	}
 });
 
+describe("agent skillPath frontmatter", () => {
+	it("parses and serializes comma-separated paths", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-skill-path-agent-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Worker
+skillPath: ./skills, ../shared-skills
+---
+body`);
+
+		const worker = discoverAgents(project, "both").agents.find((agent) => agent.name === "worker")!;
+		assert.deepEqual(worker.skillPath, ["./skills", "../shared-skills"]);
+		assert.match(serializeAgent(worker), /^skillPath: \.\/skills, \.\.\/shared-skills$/m);
+	}));
+});
+
 describe("agent permission frontmatter", () => {
 	it("preserves nested permission YAML blocks through discovery and serialization", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-permission-frontmatter-"));
@@ -135,6 +152,100 @@ Do work
 			const agent = agents.find((candidate) => candidate.name === name);
 			assert.equal(agent?.defaultContext, "fork", `${name} should default to fork context`);
 		}
+	});
+});
+
+describe("agent frontmatter launch defaults", () => {
+	it("serializes and discovers single-agent launch defaults", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-launch-defaults-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, ".pi", "agents", "worker.md");
+		const agent: AgentConfig = {
+			name: "worker",
+			description: "Worker",
+			systemPrompt: "Do work",
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritSkills: false,
+			source: "project",
+			filePath,
+			defaultAsync: false,
+			defaultTimeoutMs: 90_000,
+			defaultTurnBudget: { maxTurns: 12, graceTurns: 2 },
+			defaultAcceptance: { level: "none", reason: "lightweight lookup" },
+		};
+
+		const serialized = serializeAgent(agent);
+		assert.match(serialized, /^async: false$/m);
+		assert.match(serialized, /^timeoutMs: 90000$/m);
+		assert.match(serialized, /^turnBudget: \{"maxTurns":12,"graceTurns":2\}$/m);
+		assert.match(serialized, /^acceptance: \{"level":"none","reason":"lightweight lookup"\}$/m);
+		writeAgent(filePath, serialized);
+
+		const worker = discoverAgents(dir, "project").agents.find((candidate) => candidate.name === "worker");
+		assert.equal(worker?.defaultAsync, false);
+		assert.equal(worker?.defaultTimeoutMs, 90_000);
+		assert.deepEqual(worker?.defaultTurnBudget, { maxTurns: 12, graceTurns: 2 });
+		assert.deepEqual(worker?.defaultAcceptance, { level: "none", reason: "lightweight lookup" });
+	});
+
+	it("parses scalar acceptance defaults and rejects invalid policies", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-acceptance-defaults-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, ".pi", "agents", "worker.md");
+		writeAgent(filePath, `---
+name: worker
+description: Worker
+acceptance: checked
+---
+
+Do work
+`);
+		assert.equal(discoverAgents(dir, "project").agents.find((agent) => agent.name === "worker")?.defaultAcceptance, "checked");
+
+		writeAgent(filePath, `---
+name: worker
+description: Worker
+acceptance: { level: "none", reason: "NA" }
+---
+
+Do work
+`);
+		assert.deepEqual(
+			discoverAgents(dir, "project").agents.find((agent) => agent.name === "worker")?.defaultAcceptance,
+			{ level: "none", reason: "NA" },
+		);
+
+		writeAgent(filePath, `---
+name: worker
+description: Worker
+acceptance: none
+---
+
+Do work
+`);
+		assert.throws(
+			() => discoverAgents(dir, "project"),
+			/Agent 'worker' acceptance frontmatter level "none" requires a reason/,
+		);
+	});
+
+	it("rejects invalid launch defaults instead of silently ignoring them", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-invalid-launch-defaults-"));
+		tempDirs.push(dir);
+		writeAgent(path.join(dir, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Worker
+async: sometimes
+---
+
+Do work
+`);
+
+		assert.throws(
+			() => discoverAgents(dir, "project"),
+			/Agent 'worker' has invalid async frontmatter; expected true or false/,
+		);
 	});
 });
 

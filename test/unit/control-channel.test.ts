@@ -6,11 +6,14 @@ import { describe, it } from "node:test";
 import {
 	consumeInterruptRequest,
 	consumeSteerRequests,
+	consumeStopRequest,
 	deliverInterruptRequest,
 	enqueueStepSteer,
 	interruptRequestPath,
 	requestAsyncInterrupt,
 	requestAsyncSteer,
+	requestAsyncStop,
+	stopRequestPath,
 	steerRequestsDir,
 	stepSteerInboxDir,
 	watchAsyncControlInbox,
@@ -35,6 +38,23 @@ describe("control channel: request file", () => {
 			assert.equal(data.type, "interrupt");
 			assert.equal(data.ts, 999);
 			assert.equal(data.source, "test");
+		} finally {
+			cleanup(asyncDir);
+		}
+	});
+
+	it("writes and consumes a stop request", () => {
+		const asyncDir = tmpAsyncDir("pi-control-stop-");
+		try {
+			const requestPath = requestAsyncStop(asyncDir, { source: "test" }, { now: () => 1234 });
+			assert.equal(requestPath, stopRequestPath(asyncDir));
+			const data = JSON.parse(fs.readFileSync(requestPath, "utf-8"));
+			assert.equal(data.type, "stop");
+			assert.equal(data.ts, 1234);
+			assert.equal(data.source, "test");
+			assert.equal(consumeStopRequest(asyncDir), true);
+			assert.equal(fs.existsSync(stopRequestPath(asyncDir)), false);
+			assert.equal(consumeStopRequest(asyncDir), false);
 		} finally {
 			cleanup(asyncDir);
 		}
@@ -234,18 +254,24 @@ describe("control channel: watchAsyncControlInbox", () => {
 		timers: import("../../src/runs/background/control-channel.ts").ControlChannelTimers;
 		trigger: () => void;
 		closed: () => boolean;
+		watchedDir: () => string | undefined;
 	};
 
-	function harness(): WatchHarness {
+	function harness(nativeDir?: string): WatchHarness {
 		let listener: (() => void) | undefined;
 		let closed = false;
+		let watchedDir: string | undefined;
+		const realpathSync = ((target: fs.PathLike, options?: unknown) => fs.realpathSync(target, options as BufferEncoding)) as typeof fs.realpathSync;
+		realpathSync.native = ((target: fs.PathLike) => nativeDir ?? fs.realpathSync.native(target)) as typeof fs.realpathSync.native;
 		const fsImpl = {
 			mkdirSync: fs.mkdirSync,
 			existsSync: fs.existsSync,
 			rmSync: fs.rmSync,
 			readdirSync: fs.readdirSync,
 			readFileSync: fs.readFileSync,
-			watch: ((_dir: string, cb: () => void) => {
+			realpathSync,
+			watch: ((dir: string, cb: () => void) => {
+				watchedDir = dir;
 				listener = cb;
 				return { close: () => { closed = true; }, on: () => {} };
 			}),
@@ -254,8 +280,21 @@ describe("control channel: watchAsyncControlInbox", () => {
 			setInterval: (() => ({ unref() {} })) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as unknown as typeof clearInterval,
 		};
-		return { fsImpl, timers, trigger: () => listener?.(), closed: () => closed };
+		return { fsImpl, timers, trigger: () => listener?.(), closed: () => closed, watchedDir: () => watchedDir };
 	}
+
+	it("registers the native canonical control inbox path", () => {
+		const asyncDir = tmpAsyncDir("pi-control-watch-native-");
+		try {
+			const nativeDir = path.join(path.dirname(asyncDir), "native-control-path");
+			const h = harness(nativeDir);
+			const dispose = watchAsyncControlInbox(asyncDir, { onInterrupt() {}, fs: h.fsImpl, timers: h.timers });
+			assert.equal(h.watchedDir(), nativeDir);
+			dispose();
+		} finally {
+			cleanup(asyncDir);
+		}
+	});
 
 	it("fires on a request that arrived before the watcher started", () => {
 		const asyncDir = tmpAsyncDir("pi-control-watch-early-");
@@ -296,6 +335,27 @@ describe("control channel: watchAsyncControlInbox", () => {
 			requestAsyncInterrupt(asyncDir);
 			h.trigger();
 			assert.equal(fired, 1);
+		} finally {
+			cleanup(asyncDir);
+		}
+	});
+
+	it("delivers stop requests before interrupt requests", () => {
+		const asyncDir = tmpAsyncDir("pi-control-watch-stop-early-");
+		try {
+			requestAsyncStop(asyncDir);
+			requestAsyncInterrupt(asyncDir);
+			const events: string[] = [];
+			const h = harness();
+			const dispose = watchAsyncControlInbox(asyncDir, {
+				onInterrupt: () => events.push("interrupt"),
+				onStop: () => events.push("stop"),
+				fs: h.fsImpl,
+				timers: h.timers,
+			});
+
+			assert.deepEqual(events, ["stop", "interrupt"]);
+			dispose();
 		} finally {
 			cleanup(asyncDir);
 		}

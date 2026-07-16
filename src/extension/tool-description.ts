@@ -8,8 +8,8 @@ const CUSTOM_TOOL_DESCRIPTION_MAX_BYTES = 50 * 1024;
 
 export const SUBAGENT_SAFETY_GUIDANCE = `SAFETY-CRITICAL SUBAGENT GUIDANCE:
 • Use { action: "list" } before execution and only run executable/non-disabled agents or chains.
-• Keep execution and management separate: omit action for SINGLE/PARALLEL/CHAIN execution; use action only for list/get/models/create/update/delete/status/interrupt/resume/append-step/doctor.
-• Async/background runs: launch with async:true only when work can proceed independently. Do not sleep or poll status just to wait; if this turn must block, use the wait tool. Otherwise continue useful work or respond and let completion notifications arrive.
+• Keep execution and management separate: omit action for SINGLE/PARALLEL/CHAIN execution; use action only for list/get/models/create/update/delete/status/interrupt/stop/resume/append-step/doctor.
+• Async/background runs: launch with async:true only when work can proceed independently. Do not sleep or poll status just to wait; if this turn must block, use subagent_wait. Otherwise continue useful work or respond and let completion notifications arrive.
 • Child-safety boundary: ordinary child subagents are not orchestrators and must not run subagents. Only explicitly configured fanout children may use the child-safe subagent tool, still bounded by depth/session limits.
 • Writing/review safety: keep one writer for the same cwd/worktree. Use fresh-context read-only reviewers/validators for independent review, then have the parent synthesize and apply fixes as the sole writer unless an isolated worktree was intentionally requested.
 • Artifacts/status essentials: chain outputs live under {chain_dir}; async runs expose asyncId/asyncDir with status.json, events.jsonl, output logs, and status via { action: "status", id }. Include output paths and residual risks when reporting results.`;
@@ -30,13 +30,18 @@ CHAIN TEMPLATE VARIABLES (use in task strings):
 • {previous} - Text response from the previous step (empty for first step)
 • {chain_dir} - Shared directory for chain files (e.g., <tmpdir>/pi-subagents-<scope>/chain-runs/abc123/)
 
-Example: { chain: [{agent:"agent-a", task:"Analyze {task}"}, {agent:"agent-b", task:"Plan based on {previous}"}] }
+CHAIN EXAMPLES (quick reference for the nested schema):
+• Sequential: { chain: [{agent:"agent-a", task:"Analyze {task}"}, {agent:"agent-b", task:"Plan based on {previous}"}] }
+• Parallel fan-out: { chain: [{parallel: [{agent:"agent-a", task:"Check part of {task}", count: 3}]}] }
+• Mixed: { chain: [{agent:"agent-a", task:"Research {task}"}, {parallel: [{agent:"agent-b", task:"Review {previous}", count: 2}]}, {agent:"agent-c", task:"Summarize {previous}"}] }
 
 MANAGEMENT (use action field, omit agent/task/chain/tasks):
 • { action: "list" } - discover executable agents/chains
 • { action: "get", agent: "name" } - full detail; packaged agents use dotted runtime names like "package.agent"
 • { action: "models", agent?: "name" } - show the runtime-loaded builtin subagent model mapping, optionally filtered to one builtin
-• { action: "create", config: { name: "custom-agent", package: "code-analysis", systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext, ... } }
+• { action: "watchdog.status" | "watchdog.check" | "watchdog.recommend-model" } - inspect the opt-in subagent watchdog and its strong complementary model recommendation
+• { action: "watchdog.configure", model: "recommended" | "inherit" | "provider/model[:thinking]", scope?: "session" | "user" | "project", target?: "main" | "children" | "child", agent?: "name", thinking?: "inherit" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" } - configure watchdog model selection; default scope is session, use persistent scopes only when the user asks
+• { action: "create", config: { name: "custom-agent", package: "code-analysis", systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext, acceptance, ... } }
 • { action: "update", agent: "code-analysis.custom-agent", config: { package: "analysis", ... } } - merge
 • { action: "delete", agent: "code-analysis.custom-agent" }
 • { action: "eject", agent: "reviewer", agentScope?: "user" | "project" } - copy a bundled/package agent to user/project scope as an editable custom file that shadows the original (default scope: user)
@@ -50,6 +55,7 @@ CONTROL:
 • { action: "status", view: "fleet" } - read-only active foreground/async fleet view with transcript commands
 • { action: "status", id: "...", view: "transcript", index?: 0, lines?: 80 } - tail a run or child output/session transcript
 • { action: "interrupt", id?: "..." } - soft-interrupt the current child turn and leave the run paused
+• { action: "stop", id: "..." } - stop a current-session top-level async run; stopped runs finish with state "stopped"
 • { action: "resume", id: "...", message: "...", index?: 0 } - interrupt then follow up with a live async child, or revive a completed async/foreground child from its session
 • { action: "steer", id: "...", message: "...", index?: 0 } - queue non-terminal guidance for a live/queued async Pi child when supported
 • { action: "append-step", id: "...", chain: [{agent:"agent-c", task:"Use {previous}"}] } - append one step to the tail of a running async chain
@@ -72,15 +78,16 @@ EXECUTE:
 • SINGLE {agent, task?}; PARALLEL {tasks:[{agent,task,count?,output?,reads?,progress?}], concurrency?, worktree?}; CHAIN {chain:[{agent,task?},{parallel:[...]}]}.
 • context can be "fresh" or "fork"; omitted uses each agent defaultContext, otherwise fresh. timeoutMs/maxRuntimeMs apply to foreground and async/background runs.
 • Chain templates may use {task}, {previous}, {chain_dir}, and named outputs. Parallel worktree isolation requires a clean git repo.
+• Chain example: { chain: [{agent:"agent-a", task:"Analyze {task}"}, {parallel: [{agent:"agent-b", task:"Check {previous}", count: 3}]}] }
 • If list shows proactive skill subagent suggestions, use a small fresh-context fanout only when the task is broad enough.
 
 MANAGE / CONTROL:
-• Use action without execution fields: list, get, models, create, update, delete, eject, disable, enable, reset, doctor.
-• Async control actions: status, interrupt, resume, steer, append-step. Use status view:"fleet" for active-run overview, view:"transcript" to tail child output, and steer for non-terminal live guidance. Use id/runId prefixes carefully; use index for a specific child.
+• Use action without execution fields: list, get, models, create, update, delete, eject, disable, enable, reset, doctor, watchdog.status, watchdog.check, watchdog.recommend-model, watchdog.configure.
+• Async control actions: status, interrupt, stop, resume, steer, append-step. Use stop with an id for current-session top-level async runs. Use status view:"fleet" for active-run overview, view:"transcript" to tail child output, and steer for non-terminal live guidance. Use id/runId prefixes carefully; use index for a specific child.
 • Opt-in schedule actions: schedule, schedule-list, schedule-status, schedule-cancel. Schedule only explicit delayed runs the user asked for.
 
 ASYNC / WAIT:
-• async:true detaches background work. Do not sleep or poll just to wait; use the wait tool only when this turn must block. Otherwise continue useful work or respond and let completion notifications arrive.
+• async:true detaches background work. Do not sleep or poll just to wait; use subagent_wait only when this turn must block. Otherwise continue useful work or respond and let completion notifications arrive.
 • Status and artifacts live under asyncId/asyncDir with status.json, events.jsonl, output logs, session files, and { action:"status", id:"..." }.
 
 SAFETY:

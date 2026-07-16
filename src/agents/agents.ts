@@ -4,10 +4,11 @@
 
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
+import { parse as parseYaml } from "yaml";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AcceptanceInput, OutputMode, ToolBudgetConfig } from "../shared/types.ts";
+import type { AcceptanceInput, OutputMode, ToolBudgetConfig, TurnBudgetConfig } from "../shared/types.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
 import { KNOWN_FIELDS } from "./agent-serializer.ts";
 import { parseChain, parseJsonChain } from "./chain-serializer.ts";
@@ -17,6 +18,8 @@ import { buildRuntimeName, parsePackageName } from "./identity.ts";
 import { parseModelScopeConfig, type ModelScopeConfig } from "../runs/shared/model-scope.ts";
 export { buildRuntimeName, frontmatterNameForConfig, parsePackageName } from "./identity.ts";
 import { parseMemoryFrontmatter } from "./agent-memory.ts";
+import { resolveTurnBudgetConfig } from "../runs/shared/turn-budget.ts";
+import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -65,6 +68,7 @@ export interface BuiltinAgentOverrideBase {
 	disabled?: boolean;
 	systemPrompt: string;
 	skills?: string[];
+	skillPath?: string[];
 	tools?: string[];
 	mcpDirectTools?: string[];
 	subagentOnlyExtensions?: string[];
@@ -116,10 +120,15 @@ export interface AgentConfig {
 	inheritProjectContext: boolean;
 	inheritSkills: boolean;
 	defaultContext?: AgentDefaultContext;
+	defaultAsync?: boolean;
+	defaultTimeoutMs?: number;
+	defaultTurnBudget?: TurnBudgetConfig;
+	defaultAcceptance?: AcceptanceInput;
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
 	skills?: string[];
+	skillPath?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
 	output?: string;
@@ -497,6 +506,7 @@ function cloneOverrideBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 		disabled: agent.disabled,
 		systemPrompt: agent.systemPrompt,
 		skills: agent.skills ? [...agent.skills] : undefined,
+		skillPath: agent.skillPath ? [...agent.skillPath] : undefined,
 		tools: agent.tools ? [...agent.tools] : undefined,
 		mcpDirectTools: agent.mcpDirectTools ? [...agent.mcpDirectTools] : undefined,
 		subagentOnlyExtensions: agent.subagentOnlyExtensions ? [...agent.subagentOnlyExtensions] : undefined,
@@ -1160,6 +1170,19 @@ function isLegacyAgentSkillPath(rootDir: string, filePath: string): boolean {
 	return parts.some((part, index) => part === ".agents" && parts[index + 1] === "skills");
 }
 
+function parseAgentAcceptanceFrontmatter(raw: string | undefined, agentName: string): AcceptanceInput | undefined {
+	if (raw === undefined || !raw.trim()) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = parseYaml(raw);
+	} catch (error) {
+		throw new Error(`Agent '${agentName}' has invalid acceptance frontmatter: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+	}
+	const errors = validateAcceptanceInput(parsed, `Agent '${agentName}' acceptance frontmatter`);
+	if (errors.length > 0) throw new Error(errors.join(" "));
+	return parsed as AcceptanceInput;
+}
+
 function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
@@ -1214,6 +1237,10 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			?.split(",")
 			.map((s) => s.trim())
 			.filter(Boolean);
+		const skillPath = frontmatter.skillPath
+			?.split(",")
+			.map((entry) => entry.trim())
+			.filter(Boolean);
 		const fallbackModels = frontmatter.fallbackModels
 			?.split(",")
 			.map((model) => model.trim())
@@ -1238,6 +1265,28 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			: frontmatter.defaultContext === "fresh"
 				? "fresh" as const
 				: undefined;
+		let defaultAsync: boolean | undefined;
+		if (frontmatter.async !== undefined) {
+			if (frontmatter.async === "true") defaultAsync = true;
+			else if (frontmatter.async === "false") defaultAsync = false;
+			else throw new Error(`Agent '${localName}' has invalid async frontmatter; expected true or false.`);
+		}
+		let defaultTimeoutMs: number | undefined;
+		if (frontmatter.timeoutMs !== undefined) {
+			const parsed = Number(frontmatter.timeoutMs);
+			if (!Number.isInteger(parsed) || parsed <= 0) {
+				throw new Error(`Agent '${localName}' has invalid timeoutMs frontmatter; expected a positive integer.`);
+			}
+			defaultTimeoutMs = parsed;
+		}
+		let defaultTurnBudget: TurnBudgetConfig | undefined;
+		if (frontmatter.turnBudget !== undefined && frontmatter.turnBudget.trim()) {
+			const parsed = JSON.parse(frontmatter.turnBudget) as unknown;
+			const resolved = resolveTurnBudgetConfig(parsed, `Agent '${localName}' turnBudget frontmatter`);
+			if (resolved.error) throw new Error(resolved.error);
+			defaultTurnBudget = resolved.turnBudget;
+		}
+		const defaultAcceptance = parseAgentAcceptanceFrontmatter(frontmatter.acceptance, localName);
 
 		let extensions: string[] | undefined;
 		if (frontmatter.extensions !== undefined) {
@@ -1288,10 +1337,15 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			inheritProjectContext,
 			inheritSkills,
 			defaultContext,
+			defaultAsync,
+			defaultTimeoutMs,
+			defaultTurnBudget,
+			defaultAcceptance,
 			systemPrompt: body,
 			source,
 			filePath,
 			skills: skills && skills.length > 0 ? skills : undefined,
+			skillPath: skillPath && skillPath.length > 0 ? skillPath : undefined,
 			extensions,
 			subagentOnlyExtensions,
 			output: frontmatter.output,

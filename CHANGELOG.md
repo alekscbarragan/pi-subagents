@@ -2,16 +2,56 @@
 
 ## [Unreleased]
 
+### Added
+- Added a native, live-refreshing, inspection-only fleet opened by `/subagents-fleet` or `Ctrl+Alt+F`, with current-session foreground and recent async child navigation, transcript detail, and completed output/session paths. The textual status view remains available without a TUI, while stop, steer, and resume stay in explicit commands. Thanks to Jakub Neumann (@neumie) for #454 and Manfred Liiv (@manfredlift) for #412.
+- Added `asyncWidget: false` to disable the above-editor background-run widget for companion footer/dashboard extensions, and exposed the workflow-level `goal` on `subagent:async-started` lifecycle events.
+- Added agent-local `skillPath` discovery so custom agents can select private skills without publishing them to Pi's parent/global catalog. Relative paths resolve from the defining agent file, local matches take precedence, and missing or unreadable candidates fall back to normal discovery. Thanks to Kylegl (@kylegl) for #428.
+- Added strict `acceptance` defaults in agent frontmatter and agent management. The default applies only to single-agent launches, explicit call values win, and chain/parallel acceptance remains task or step configuration. Thanks to ConjugativeIndicator (@CovetingEpiphany2152) for #453.
+- Added canonical-session leases for direct child revival so independent parent processes cannot write the same persisted session concurrently. Lease ownership includes the revived/source run, parent session, runner and writer process identities, and host; a two-phase startup handshake rejects contention before Pi starts, and stale recovery remains conservative. Thanks to Luke Parke (@LukasParke) for #446.
+- Added single-agent launch defaults for `async`, `timeoutMs`, and `turnBudget` in agent frontmatter, with explicit tool-call values taking precedence. Thanks to ConjugativeIndicator (@CovetingEpiphany2152) for #410.
+- Added `/subagents-stop` and `subagent({ action: "stop", id })` for current-session top-level async runs. The slash command opens a confirmation selector when no id is provided, falls back to exact commands without a TUI, routes scheduled jobs through `schedule-cancel`, and records manual stops as `stopped`/cancelled lifecycle events instead of timeouts. Thanks to Sean Seaman (@seans-leadsonline) for #407 and #408.
+- Added an opt-in read-only subagent watchdog that reviews actual repo edits at safe agent-end boundaries, with visible warnings, main and child watchdog coordination, strong complementary model recommendations, changed-file TypeScript/JavaScript LSP diagnostics, `/subagents-watchdog` status/model commands, and agent-facing watchdog configuration actions. Thanks to can1357/oh-my-pi for the advisor/watchdog concept, and to apmantza/pi-lens, gjczone/pi-shazam, and can1357/oh-my-pi for LSP diagnostics patterns.
+- Added a chain quick-reference (sequential, parallel fan-out, and mixed examples) to the `subagent` tool description in both full and compact modes so agents have the correct nested schema format up front. Thanks to Nicolas Marchildon (@elecnix) for #417 and #424.
+
+### Changed
+- Updated the bundled `pi-subagents` skill so Fable mode is the default orchestration posture for complex work, and refreshed recent command/config guidance.
+- Documented `contact_supervisor` structured interview requests in the default child bridge instructions.
+
+### Fixed
+- Kept explicit child tool allowlists strict while surfacing actionable errors when named extension tools are requested without a loaded provider. Internal `structured_output` is now admitted automatically when an output schema is active, and direct and chained children share the same registry check. Thanks to DesertThief (@DesertThief) for #429 and Chris-Kode (@Chris-Kode) for confirming the structured-output case.
+- Prevented model fallback retries for trailing child tool failures even when their details resemble provider outages, and retried provider streams that end without `finish_reason`. Thanks to 虚妄IlluDelu (@XWIlluDelu) for #436.
+- Recognized Pi's `max` thinking level in child model suffixes, Clarify selection, watchdog settings, and status formatting, while exposing it only when model metadata explicitly supports it. Thanks to mapleluv (@mapleluvr) for #423.
+- Labeled every chain-clarification shortcut with its action, made the background state explicit, and kept primary actions in a separate footer without widening the fixed 84-column overlay. Thanks to GonzaloRocca (@gonzalonicolasr) for #430.
+- Hardened acceptance reports so explicit empty changed-file and test arrays are treated as not applicable, required criteria are reflected in examples, known model-output variants normalize to one strict canonical shape, unknown or ambiguous values fail with exact diagnostics, and parsed reports plus ledgers persist in child metadata while normal output stays clean. Thanks to Nick Tripp (@nicholastripp) for #442, maxsturmb (@maxsturmb) for #452, and techmodv90 (@techmodv90) for #449 and #450.
+- Shared task-intent classification between acceptance inference and the completion guard so read-only tasks with explicit no-edit wording do not receive impossible write-evidence gates, while scoped prohibitions still preserve later implementation clauses. Thanks to 虚妄IlluDelu (@XWIlluDelu) for #433.
+- Rejected explicit `acceptance: "reviewed"` and `{ level: "reviewed" }` before launch because the current run cannot supply the required independent reviewer result; inferred and `auto` review policies remain non-blocking. Thanks to Theodor Hillmann (@t0dorakis) for #440 and #441.
+- Rejected bare `acceptance: "none"` before spawning because disabling inferred gates requires the reason-bearing `{ level: "none", reason: "..." }` form; retained `false` only as a deprecated shorthand. Thanks to 虚妄IlluDelu (@XWIlluDelu) for #435.
+- Canonicalized native `fs.watch` registration paths for async results, control inboxes, and child steering inboxes so Windows 8.3 short paths do not conflict with long-form libuv event paths. Thanks to NahidaChan (@KawaiiNahida) for #455.
+- Made configured output instructions capability-aware: read-only children now return the complete artifact for runtime persistence instead of treating an unavailable write tool as a supervisor blocker. Thanks to Alexander Gerdes (@Avg8888) for #426.
+- Bounded live child JSONL lines and stderr tails in foreground and async runners, preserving split UTF-8 and final unterminated events while returning structured `protocol_output_limit` failures for oversized lines. Completion now honors `agent_end.willRetry` and prefers `agent_settled` without removing the legacy terminal-message fallback. Thanks to Luke Parke (@LukasParke) for #444 and #445.
+- Made `subagent_wait({ id })` track remembered detached foreground runs, defer acceptance until the child exits, and wake the originating session with recovered output so parents do not launch duplicate replacements after supervisor coordination. Thanks to Ramin Hazegh (@rhazegh) for #456.
+- Renamed the parent blocking tool from `wait` to `subagent_wait` with no legacy alias, avoiding startup conflicts with unrelated extension wait tools. Thanks to DesZhang (@DesZhang) for #437 and Nate Rutman (@nrutman) for confirming the conflict and clarifying the incompatible semantics.
+- Reused the verified current or installed Pi CLI on POSIX instead of resolving a potentially missing or different `pi` from `PATH`. Thanks to Luke Parke (@LukasParke) for #443.
+- Preserved `{outputs.name}` as literal task text in async single runs while keeping named-output interpolation for real chains. Thanks to Tristan Storch (@tstorch) for #427.
+- Recovered acceptance reports from child-written configured outputs, honoring file-only source precedence and surfacing malformed primary reports. Thanks to 虚妄IlluDelu (@XWIlluDelu) for #434.
+- Isolated inherited output files for async parallel siblings and rejected duplicate resolved output paths before launch, preventing silent report loss. Thanks to basher83 (@basher83) for #420.
+- Replaced raw chain-schema failures with actionable errors that name invalid properties, list allowed fields, and show valid examples. Thanks to Nicolas Marchildon (@elecnix) for #416 and #425.
+- Hide lower-priority agent definitions from `subagent({ action: "list" })` when a higher-priority project or user agent shadows them. Thanks to Kylegl (@kylegl) for #415.
+- Resolve the real Pi CLI on Windows when pi-subagents runs inside an embedded SDK host instead of relaunching the host application's entry point. Thanks to Marc Kassubeck (@CompN3rd) for #413.
+- Avoid rendering active subagent activity as `now ago`. Thanks to Viktor Chernodub (@chernodub) for #414.
+- Preserve async resume model/thinking metadata for live, completed, and result-only child runs, and repair stale status metadata from final results. Thanks to BoxChen (@nishuzumi) for #403.
+- Gate foreground `contact_supervisor`/intercom detaches on delivered supervisor handoff events, keep detached foreground runs visible through status/fleet, and mark detached placeholders as non-successful so missing explicit outputs are not mistaken for completed work.
+
 ## [0.34.0] - 2026-07-07
 
 ### Added
-- Added `waitTool` config and `PI_SUBAGENT_WAIT_TOOL_ENABLED` so interactive users can keep the `wait` tool registered while making it return immediately instead of blocking on background subagents.
+- Added `waitTool` config and `PI_SUBAGENT_WAIT_TOOL_ENABLED` so interactive users can keep the `wait` tool registered while making it return immediately instead of blocking on background subagents. Thanks to Rebecca Dessonville (@TwistedTabby) for #394.
 
 ### Fixed
-- Coerce agent frontmatter `thinking: false` to disabled thinking so child model IDs do not gain invalid `:false` suffixes.
-- Suppress stale native supervisor-channel asks after replies, expiry, or inactive child runs, and clean cancelled child requests so `subagent_supervisor` and visible intercom notices stay aligned.
-- Avoid completion-guard failures for read-only issue-drafting tasks that mention suggested fixes while preserving mutation expectations for real implementation tasks.
-- Prune stale empty native supervisor-channel directories before polling while preserving fresh or non-empty channels.
+- Coerce agent frontmatter `thinking: false` to disabled thinking so child model IDs do not gain invalid `:false` suffixes. Thanks to Alberto Vasquez (@albertovasquez) for #399.
+- Suppress stale native supervisor-channel asks after replies, expiry, or inactive child runs, and clean cancelled child requests so `subagent_supervisor` and visible intercom notices stay aligned. Thanks to Artem Timofeev (@atimofeev) for #393.
+- Avoid completion-guard failures for read-only issue-drafting tasks that mention suggested fixes while preserving mutation expectations for real implementation tasks. Thanks to Artem Timofeev (@atimofeev) for #395.
+- Prune stale empty native supervisor-channel directories before polling while preserving fresh or non-empty channels. Thanks to Koen Van Geert (@koenvg) for #400.
 
 ## [0.33.1] - 2026-07-03
 
@@ -21,7 +61,7 @@
 ## [0.33.0] - 2026-07-03
 
 ### Added
-- Added optional `toolBudget` limits for child subagent tool calls. Runs, steps, and agents can set `{ soft?, hard, block? }`; the child runtime nudges at the soft limit and blocks configured tools after the hard limit so runaway browsing can still finish with final text.
+- Added optional `toolBudget` limits for child subagent tool calls. Runs, steps, and agents can set `{ soft?, hard, block? }`; the child runtime nudges at the soft limit and blocks configured tools after the hard limit so runaway browsing can still finish with final text. Thanks to Jürgen Schmied (@jschmied) for #379.
 - Added a stable v1 in-process event-bus RPC for other Pi extensions, with `ping`, `status`, async-only `spawn`, `interrupt`, and async `stop` over versioned request/reply envelopes.
 - Added `toolDescriptionMode` with `full`, `compact`, and `custom` modes for the parent-facing `subagent` tool description. Compact mode reduces prompt bloat while keeping safety-critical orchestration guidance, and invalid custom descriptions fall back to full mode.
 - Added an optional read-only subagent fleet/status view with `/subagents-fleet` and `subagent({ action: "status", view: "fleet" })`, plus `view: "transcript"` to tail active async child output/session artifacts.
@@ -40,9 +80,10 @@
 - Added native prompt workflow commands: `/prompt-workflow` runs a prompt template through a subagent, and `/chain-prompts` turns prompt templates into native subagent chain steps.
 
 ### Fixed
-- Let foreground sequential chain tool calls launch directly when `clarify` is omitted; use `clarify: true` to opt into the clarify UI. Addresses #385.
-- Tolerate execution-mode action aliases such as `single`, `parallel`, `PARALLEL`, and `tasks` when the matching execution fields are present, while preserving clear runtime errors for unknown management actions, addressing #382.
-- Removed companion-package recommendation messages from session start, `subagent({ action: "list" })`, and `/subagents-doctor`, addressing #381.
+- Let foreground sequential chain tool calls launch directly when `clarify` is omitted; use `clarify: true` to opt into the clarify UI. Thanks to neander-squirrel (@neander-squirrel) for #385.
+- Tolerate execution-mode action aliases such as `single`, `parallel`, `PARALLEL`, and `tasks` when the matching execution fields are present, while preserving clear runtime errors for unknown management actions. Thanks to Artem Timofeev (@atimofeev) for #382.
+- Removed companion-package recommendation messages from session start, `subagent({ action: "list" })`, and `/subagents-doctor`. Thanks to Mark Gaiser (@markg85) for #381.
+- Recover detached foreground subagent results after intercom handoff so completed detached runs remain visible to status and resume paths. Thanks to Artem Timofeev (@atimofeev) for #384.
 - Scope async subagent completion notifications to the exact owning Pi session so another session in the same repo no longer receives result notices.
 - Harden scheduled-run timestamp parsing and persisted store validation so ambiguous absolute times and corrupted job records fail clearly instead of being normalized or dropped.
 - Derive live-detail and full-notification hints from Pi's configured expand key instead of hard-coding `Ctrl+O`. Thanks to Kylegl (@kylegl) for #364.

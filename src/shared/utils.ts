@@ -17,6 +17,18 @@ const DEFAULT_CONFIG_DIR_NAME = ".pi";
 const PI_CODING_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 export const PI_CODING_AGENT_PACKAGE_ROOT_ENV = "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT";
 
+export function resolveWatchPath(
+	watchPath: string,
+	nativeRealpath: (filePath: string) => string = fs.realpathSync.native,
+): string {
+	// libuv's Windows watcher cannot mix 8.3 registration paths with long event paths.
+	try {
+		return nativeRealpath(watchPath);
+	} catch {
+		return watchPath;
+	}
+}
+
 function validConfigDirName(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value : undefined;
 }
@@ -249,18 +261,22 @@ export function getFinalOutput(messages: Message[]): string {
 		const hasAssistantError = ("errorMessage" in msg && typeof msg.errorMessage === "string" && msg.errorMessage.length > 0)
 			|| ("stopReason" in msg && msg.stopReason === "error");
 		if (hasAssistantError) continue;
+		const messageText = msg.content
+			.filter((part) => part.type === "text" && part.text.trim().length > 0)
+			.map((part) => part.type === "text" ? part.text : "")
+			.join("\n");
 		for (let j = msg.content.length - 1; j >= 0; j--) {
 			const part = msg.content[j];
 			if (part.type !== "text" || part.text.trim().length === 0) continue;
 			validTextParts.push(part.text);
-			if (/```acceptance-report\s*\n[\s\S]*?```/i.test(part.text)) return part.text;
+			if (/```acceptance[-_]report\s*\n[\s\S]*?```/i.test(part.text)) return messageText;
 			for (const match of part.text.matchAll(/```(?:json|jsonc|json5)\s*\n([\s\S]*?)```/gi)) {
 				const body = match[1] ?? "";
-				if (/"criteriaSatisfied"/.test(body) && /"(?:changedFiles|testsAddedOrUpdated|commandsRun|validationOutput|residualRisks|noStagedFiles|diffSummary|reviewFindings|manualNotes)"/.test(body)) {
-					return part.text;
+				if (/"(?:criteriaSatisfied|criteria_satisfied)"/.test(body) && /"(?:changedFiles|changed_files|testsAddedOrUpdated|tests_added_or_updated|commandsRun|commands_run|validationOutput|validation_output|residualRisks|residual_risks|noStagedFiles|no_staged_files|diffSummary|diff_summary|reviewFindings|review_findings|manualNotes|manual_notes)"/.test(body)) {
+					return messageText;
 				}
 			}
-			if (/ACCEPTANCE_REPORT\s*:/i.test(part.text)) return part.text;
+			if (/ACCEPTANCE_REPORT\s*:/i.test(part.text)) return messageText;
 		}
 	}
 	return validTextParts[0] ?? "";

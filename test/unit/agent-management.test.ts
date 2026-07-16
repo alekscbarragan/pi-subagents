@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { handleCreate, handleManagementAction, handleUpdate } from "../../src/agents/agent-management.ts";
+import { handleCreate, handleList, handleManagementAction, handleUpdate } from "../../src/agents/agent-management.ts";
 import { clearSkillCache } from "../../src/agents/skills.ts";
 
 let tempDir = "";
@@ -40,6 +40,21 @@ describe("agent management config parsing", () => {
 
 		assert.equal(result.isError, true);
 		assert.match(readText(result), /config must be valid JSON:/);
+	});
+
+	it("hides lower-priority agents shadowed by project agents in list output", () => {
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "scout.md"), "---\nname: scout\ndescription: Project scout override\n---\n\nProject scout agent.\n");
+
+		const result = handleList(
+			{ agentScope: "project" },
+			{ cwd: tempDir, modelRegistry: { getAvailable: () => [] } },
+		);
+
+		assert.equal(result.isError, false);
+		assert.match(readText(result), /- scout \(project\): Project scout override/);
+		assert.doesNotMatch(readText(result), /- scout \(builtin/);
 	});
 
 	it("surfaces JSON parse errors for update config strings", () => {
@@ -90,6 +105,39 @@ describe("agent management config parsing", () => {
 		assert.equal(fs.existsSync(updatedPath), false);
 	});
 
+	it("creates, reports, and clears agent-local skill paths", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const skillFile = path.join(tempDir, ".pi", "agents", "skills", "private", "SKILL.md");
+		fs.mkdirSync(path.dirname(skillFile), { recursive: true });
+		fs.writeFileSync(skillFile, "---\ndescription: Private skill\n---\nbody\n", "utf-8");
+
+		const created = handleCreate({ config: {
+			name: "Local",
+			description: "Local skills",
+			scope: "project",
+			skills: "private",
+			skillPath: ["./skills", "./skills"],
+		} }, ctx);
+		assert.equal(created.isError, false);
+		assert.doesNotMatch(readText(created), /skills not found/);
+		const filePath = path.join(tempDir, ".pi", "agents", "local.md");
+		let content = fs.readFileSync(filePath, "utf-8");
+		assert.match(content, /^skillPath: \.\/skills$/m);
+
+		const got = handleManagementAction("get", { agent: "local" }, ctx);
+		assert.match(readText(got), /^Skill paths: \.\/skills$/m);
+
+		const updated = handleUpdate({ agent: "local", config: { skills: false, skillPath: false } }, ctx);
+		assert.equal(updated.isError, false);
+		content = fs.readFileSync(filePath, "utf-8");
+		assert.doesNotMatch(content, /^skills?:/m);
+		assert.doesNotMatch(content, /^skillPath:/m);
+
+		const invalid = handleUpdate({ agent: "local", config: { skillPath: ["./skills", 1] } }, ctx);
+		assert.equal(invalid.isError, true);
+		assert.match(readText(invalid), /config\.skillPath must be/);
+	});
+
 	it("rejects package values that cannot be normalized", () => {
 		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 		const created = handleCreate(
@@ -136,6 +184,89 @@ Inspect
 		content = fs.readFileSync(updatedPath, "utf-8");
 		assert.match(content, /^name: review-flow$/m);
 		assert.doesNotMatch(content, /^package:/m);
+	});
+
+	it("creates and updates agents with single-agent launch defaults", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const result = handleCreate(
+			{
+				config: {
+					name: "background-reviewer",
+					description: "Review in the background",
+					scope: "project",
+					async: false,
+					timeoutMs: 120_000,
+					turnBudget: { maxTurns: 8, graceTurns: 2 },
+					acceptance: { level: "none", reason: "lightweight reviewer" },
+				},
+			},
+			ctx,
+		);
+
+		assert.equal(result.isError, false);
+		const filePath = path.join(tempDir, ".pi", "agents", "background-reviewer.md");
+		let content = fs.readFileSync(filePath, "utf-8");
+		assert.match(content, /^async: false$/m);
+		assert.match(content, /^timeoutMs: 120000$/m);
+		assert.match(content, /^turnBudget: \{"maxTurns":8,"graceTurns":2\}$/m);
+		assert.match(content, /^acceptance: \{"level":"none","reason":"lightweight reviewer"\}$/m);
+
+		const got = handleManagementAction("get", { agent: "background-reviewer" }, ctx);
+		assert.equal(got.isError, false);
+		assert.match(readText(got), /Async: false/);
+		assert.match(readText(got), /Timeout: 120000ms/);
+		assert.match(readText(got), /Turn budget: \{"maxTurns":8,"graceTurns":2\}/);
+		assert.match(readText(got), /Acceptance: \{"level":"none","reason":"lightweight reviewer"\}/);
+
+		const updated = handleUpdate(
+			{ agent: "background-reviewer", config: { async: true, timeoutMs: false, turnBudget: false, acceptance: "" } },
+			ctx,
+		);
+		assert.equal(updated.isError, false);
+		content = fs.readFileSync(filePath, "utf-8");
+		assert.match(content, /^async: true$/m);
+		assert.doesNotMatch(content, /^timeoutMs:/m);
+		assert.doesNotMatch(content, /^turnBudget:/m);
+		assert.doesNotMatch(content, /^acceptance:/m);
+
+		const deprecatedFalse = handleUpdate(
+			{ agent: "background-reviewer", config: { acceptance: false } },
+			ctx,
+		);
+		assert.equal(deprecatedFalse.isError, false);
+		content = fs.readFileSync(filePath, "utf-8");
+		assert.match(content, /^acceptance: false$/m);
+	});
+
+	it("rejects invalid single-agent launch defaults", () => {
+		const result = handleCreate(
+			{
+				config: {
+					name: "bad-launch-defaults",
+					description: "Bad defaults",
+					scope: "project",
+					timeoutMs: 0,
+				},
+			},
+			{ cwd: tempDir, modelRegistry: { getAvailable: () => [] } },
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(readText(result), /config\.timeoutMs must be a positive integer/);
+
+		const invalidAcceptance = handleCreate(
+			{
+				config: {
+					name: "bad-acceptance-default",
+					description: "Bad acceptance",
+					scope: "project",
+					acceptance: "none",
+				},
+			},
+			{ cwd: tempDir, modelRegistry: { getAvailable: () => [] } },
+		);
+		assert.equal(invalidAcceptance.isError, true);
+		assert.match(readText(invalidAcceptance), /config\.acceptance level "none" requires a reason/);
 	});
 
 	it("creates and updates agents with tool budgets", () => {

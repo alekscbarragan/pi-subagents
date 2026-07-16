@@ -38,7 +38,8 @@ function hasExistingSessionFile(value: unknown): value is string {
 	return typeof value === "string" && fs.existsSync(value);
 }
 
-function formatResumeGuidance(runId: string | undefined, children: Array<{ agent?: unknown; sessionFile?: unknown }>, fallbackSessionFile?: unknown): string {
+function formatResumeGuidance(runId: string | undefined, children: Array<{ agent?: unknown; sessionFile?: unknown }>, fallbackSessionFile?: unknown, options: { stopped?: boolean } = {}): string {
+	if (options.stopped) return "Resume: unavailable; stopped runs are not resumable. Start a new run instead.";
 	const knownChildren = children
 		.map((child, index) => ({ child, index }))
 		.filter(({ child }) => typeof child.agent === "string");
@@ -81,7 +82,7 @@ function formatSteeringSummary(input: { steerCount?: number; lastSteerAt?: numbe
 }
 
 function rememberedForegroundChildOutput(child: ForegroundResumeRun["children"][number]): string {
-	const outputPath = child.artifactPaths?.outputPath;
+	const outputPath = child.artifactPaths?.outputPath ?? child.savedOutputPath;
 	if (outputPath && fs.existsSync(outputPath)) {
 		try {
 			const artifactOutput = fs.readFileSync(outputPath, "utf-8").trim();
@@ -107,24 +108,29 @@ function formatRememberedForegroundStatus(run: ForegroundResumeRun): string {
 			`${child.index + 1}. ${child.agent} ${child.status}`,
 			child.exitCode !== undefined ? `exit ${child.exitCode}` : undefined,
 			child.detachedReason ? `detached: ${child.detachedReason}` : undefined,
+			child.acceptance ? `acceptance: ${child.acceptance.status}` : undefined,
+			child.error ? `error: ${child.error}` : undefined,
 			output ? `output: ${output.slice(0, 160)}` : undefined,
 		].filter(Boolean);
 		lines.push(parts.join(", "));
 		if (child.sessionFile) lines.push(`  Session: ${child.sessionFile}`);
 		if (child.transcriptPath) lines.push(`  Transcript: ${child.transcriptPath}`);
 		if (child.artifactPaths?.outputPath) lines.push(`  Output: ${child.artifactPaths.outputPath}`);
+		if (child.savedOutputPath && child.savedOutputPath !== child.artifactPaths?.outputPath) lines.push(`  Saved output: ${child.savedOutputPath}`);
+		if (child.outputSaveError) lines.push(`  Output warning: ${child.outputSaveError}`);
 		if (child.transcriptError) lines.push(`  Transcript warning: ${child.transcriptError}`);
 	}
 	lines.push("", `Status: subagent({ action: "status", id: "${run.runId}" })`);
 	if (run.children.length === 1) lines.push(`Transcript: subagent({ action: "status", id: "${run.runId}", view: "transcript" })`);
 	else lines.push(`Transcript: subagent({ action: "status", id: "${run.runId}", index: 0, view: "transcript" })`);
-	const resumable = run.children.find((child) => child.status !== "detached" && hasExistingSessionFile(child.sessionFile));
-	if (resumable) {
+	const detached = run.children.some((child) => child.status === "detached");
+	const resumable = run.children.find((child) => hasExistingSessionFile(child.sessionFile));
+	if (detached) {
+		lines.push(`Recovery: reply to the supervisor request first, then wait with subagent_wait({ id: "${run.runId}" }); do not resume or launch a replacement while any child remains detached.`);
+	} else if (resumable) {
 		lines.push(run.children.length === 1
 			? `Revive: subagent({ action: "resume", id: "${run.runId}", message: "..." })`
 			: `Revive child: subagent({ action: "resume", id: "${run.runId}", index: ${resumable.index}, message: "..." })`);
-	} else if (run.children.some((child) => child.status === "detached")) {
-		lines.push("Recovery: child detached for intercom coordination; status will show recovered output after the child exits when Pi can observe it.");
 	} else {
 		lines.push("Resume: unavailable; no child session file was persisted.");
 	}
@@ -147,6 +153,8 @@ function formatRememberedForegroundTranscript(run: ForegroundResumeRun, options:
 		child.sessionFile ? `Session: ${child.sessionFile}` : undefined,
 		child.transcriptPath ? `Transcript: ${child.transcriptPath}` : undefined,
 		child.artifactPaths?.outputPath ? `Output: ${child.artifactPaths.outputPath}` : undefined,
+		child.savedOutputPath && child.savedOutputPath !== child.artifactPaths?.outputPath ? `Saved output: ${child.savedOutputPath}` : undefined,
+		child.outputSaveError ? `Output warning: ${child.outputSaveError}` : undefined,
 	].filter((line): line is string => Boolean(line));
 	lines.push("Result transcript tail:");
 	if (outputLines.length === 0) lines.push("  (no recovered final output available yet)");
@@ -388,7 +396,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			if (status.sessionFile) lines.push(`Session: ${status.sessionFile}`);
 			if (status.state === "running") lines.push(`Steer running child: subagent({ action: "steer", id: "${status.runId}", message: "..." })`);
 			if (status.state !== "running") {
-				lines.push(formatResumeGuidance(status.runId, status.steps ?? [], status.sessionFile));
+				lines.push(formatResumeGuidance(status.runId, status.steps ?? [], status.sessionFile, { stopped: status.state === "stopped" || status.stopped === true }));
 			}
 			if (fs.existsSync(logPath)) lines.push(`Log: ${logPath}`);
 			if (fs.existsSync(eventsPath)) lines.push(`Events: ${eventsPath}`);
@@ -409,11 +417,11 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 					return { content: [{ type: "text", text: message }], isError: true, details: { mode: "single", results: [] } };
 				}
 			}
-			const status = data.success ? "complete" : data.state === "paused" || data.exitCode === 0 ? "paused" : "failed";
+			const status = data.state === "stopped" ? "stopped" : data.success ? "complete" : data.state === "paused" || data.exitCode === 0 ? "paused" : "failed";
 			const runId = data.runId ?? data.id ?? resolvedId;
 			const lines = [`Run: ${runId}`, `State: ${status}`, `Result: ${resultPath}`];
 			const children = Array.isArray(data.results) ? data.results : data.agent ? [{ agent: data.agent, sessionFile: data.sessionFile }] : [];
-			lines.push(formatResumeGuidance(runId, children, data.sessionFile));
+			lines.push(formatResumeGuidance(runId, children, data.sessionFile, { stopped: status === "stopped" }));
 			if (data.summary) lines.push("", data.summary);
 			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [] } };
 		} catch (error) {

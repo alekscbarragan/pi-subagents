@@ -4,7 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, it } from "node:test";
 
+import { scheduledRunStorePath } from "../../src/runs/background/scheduled-runs.ts";
+import { SUBAGENT_FANOUT_CHILD_ENV } from "../../src/runs/shared/pi-args.ts";
 import { ASYNC_DIR } from "../../src/shared/types.ts";
+import type { WatchdogReviewFunction } from "../../src/watchdog/runtime.ts";
 
 const SLASH_RESULT_TYPE = "subagent-slash-result";
 const SLASH_SUBAGENT_REQUEST_EVENT = "subagent:slash:request";
@@ -51,13 +54,19 @@ interface SlashLiveStateModule {
 	resolveSlashMessageDetails?: typeof import("../../src/slash/slash-live-state.ts").resolveSlashMessageDetails;
 }
 
+interface WatchdogRegisterModule {
+	registerMainWatchdog?: typeof import("../../src/watchdog/register-main.ts").registerMainWatchdog;
+}
+
 let registerSlashCommands: RegisterSlashCommandsModule["registerSlashCommands"];
+let registerMainWatchdog: WatchdogRegisterModule["registerMainWatchdog"];
 let clearSlashSnapshots: SlashLiveStateModule["clearSlashSnapshots"];
 let getSlashRenderableSnapshot: SlashLiveStateModule["getSlashRenderableSnapshot"];
 let resolveSlashMessageDetails: SlashLiveStateModule["resolveSlashMessageDetails"];
 let available = true;
 try {
 	({ registerSlashCommands } = await import("../../src/slash/slash-commands.ts") as RegisterSlashCommandsModule);
+	({ registerMainWatchdog } = await import("../../src/watchdog/register-main.ts") as WatchdogRegisterModule);
 	({ clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails } = await import("../../src/slash/slash-live-state.ts") as SlashLiveStateModule);
 } catch {
 	available = false;
@@ -88,6 +97,9 @@ function createState(cwd: string) {
 		baseCwd: cwd,
 		currentSessionId: null,
 		asyncJobs: new Map(),
+		foregroundRuns: new Map(),
+		foregroundControls: new Map(),
+		lastForegroundControlId: null,
 		cleanupTimers: new Map(),
 		lastUiContext: null,
 		poller: null,
@@ -103,13 +115,17 @@ function createState(cwd: string) {
 
 async function withIsolatedHome<T>(fn: () => Promise<T>): Promise<T> {
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-slash-home-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const previousHome = process.env.HOME;
 	const previousUserProfile = process.env.USERPROFILE;
+	process.env.PI_CODING_AGENT_DIR = path.join(home, ".pi", "agent");
 	process.env.HOME = home;
 	process.env.USERPROFILE = home;
 	try {
 		return await fn();
 	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		if (previousHome === undefined) delete process.env.HOME;
 		else process.env.HOME = previousHome;
 		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
@@ -129,7 +145,9 @@ function createCommandContext(
 		setStatus: (key: string, text: string | undefined) => void;
 		setToolsExpanded: (expanded: boolean) => void;
 		sessionManager: unknown;
-		modelRegistry: { getAvailable: () => Array<{ provider: string; id: string }>; find?: (provider: string, id: string) => unknown };
+		modelRegistry: { getAvailable: () => Array<{ provider: string; id: string }>; find?: (provider: string, id: string) => unknown; hasConfiguredAuth?: (model: unknown) => boolean };
+		model: { provider: string; id: string };
+		thinkingLevel: string;
 	}> = {},
 ) {
 	return {
@@ -143,7 +161,9 @@ function createCommandContext(
 			onTerminalInput: () => () => {},
 			custom: overrides.custom ?? (async () => undefined),
 		},
-		modelRegistry: overrides.modelRegistry ?? { getAvailable: () => [], find: () => undefined },
+		model: overrides.model,
+		thinkingLevel: overrides.thinkingLevel,
+		modelRegistry: overrides.modelRegistry ?? { getAvailable: () => [], find: () => undefined, hasConfiguredAuth: () => true },
 		sessionManager: overrides.sessionManager ?? {
 			getSessionFile: () => null,
 			getSessionId: () => "session-test",
@@ -164,6 +184,25 @@ async function withTempProject<T>(prefix: string, fn: (root: string) => Promise<
 
 function writeProjectChain(root: string, fileName: string, content: string): void {
 	fs.writeFileSync(path.join(root, ".pi", "chains", fileName), content, "utf-8");
+}
+
+function createWatchdogHarness(review?: WatchdogReviewFunction) {
+	const commands = new Map<string, RegisteredSlashCommand>();
+	const renderers = new Map<string, (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined>();
+	const sent: unknown[] = [];
+	const pi = {
+		events: createEventBus(),
+		on() {},
+		registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+		registerShortcut() {},
+		registerMessageRenderer(type: string, renderer: (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined) {
+			renderers.set(type, renderer);
+		},
+		getThinkingLevel() { return "medium" as const; },
+		sendMessage(message: unknown) { sent.push(message); },
+	};
+	const runtime = registerMainWatchdog!(pi as never, review ? { review } : undefined);
+	return { commands, renderers, runtime, sent };
 }
 
 async function captureSlashCommandParams(
@@ -211,6 +250,219 @@ async function captureSlashCommandParams(
 		return { params: requestedParams, notifications };
 	});
 }
+
+describe("subagents watchdog slash command", { skip: !available ? "watchdog command not importable" : undefined }, () => {
+	it("shows default-off status with runtime state, sources, and review seam", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-status-", async (root) => {
+				const { commands, sent } = createWatchdogHarness();
+				await commands.get("subagents-watchdog")!.handler("", createCommandContext({ cwd: root }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /Subagent watchdog/);
+				assert.match(content, /Main: off \(default off\)/);
+				assert.match(content, /Runtime: idle/);
+				assert.match(content, /Review model call: real model review/);
+				assert.match(content, /Sources:/);
+			});
+		});
+	});
+
+	it("recommends and saves a strong complementary watchdog model", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-model-", async (root) => {
+				const gpt = { provider: "openai-codex", id: "gpt-5.5", reasoning: true };
+				const opus = { provider: "anthropic", id: "claude-opus-4-8", reasoning: true };
+				const models = [gpt, opus];
+				const modelRegistry = {
+					getAvailable: () => models,
+					find: (provider: string, id: string) => models.find((entry) => entry.provider === provider && entry.id === id),
+					hasConfiguredAuth: (model: unknown) => Boolean(model),
+				};
+				const ctx = createCommandContext({ cwd: root, model: gpt, modelRegistry });
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("recommend-model", ctx);
+				await commands.get("subagents-watchdog")!.handler("model recommended", ctx);
+
+				const recommendation = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(recommendation, /Recommended: anthropic\/claude-opus-4-8:high/);
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+				assert.equal(settings.subagents.watchdog.main.model, "anthropic/claude-opus-4-8");
+				assert.equal(settings.subagents.watchdog.main.thinking, "high");
+				assert.equal(settings.subagents.watchdog.enabled, undefined);
+				assert.match(String((sent[1] as { content?: unknown }).content ?? ""), /Run \/subagents-watchdog on if the watchdog is still off/);
+			});
+		});
+	});
+
+	it("supports session-scoped recommended watchdog models without writing settings", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-session-model-", async (root) => {
+				const opus = { provider: "anthropic", id: "claude-opus-4-8", reasoning: true };
+				const gpt = { provider: "openai-codex", id: "gpt-5.5", reasoning: true };
+				const models = [opus, gpt];
+				const modelRegistry = {
+					getAvailable: () => models,
+					find: (provider: string, id: string) => models.find((entry) => entry.provider === provider && entry.id === id),
+					hasConfiguredAuth: (model: unknown) => Boolean(model),
+				};
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("session model recommended", createCommandContext({ cwd: root, model: opus, modelRegistry }));
+
+				assert.equal(fs.existsSync(path.join(process.env.HOME!, ".pi", "agent", "settings.json")), false);
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /session model: openai-codex\/gpt-5\.5:high/);
+				assert.match(content, /Main model: openai-codex\/gpt-5\.5 \(session override\)/);
+				assert.match(content, /Main thinking: high/);
+			});
+		});
+	});
+
+	it("shows explicit watchdog model thinking accurately when no thinking is configured", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-status-model-", async (root) => {
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+				fs.writeFileSync(settingsPath, JSON.stringify({ subagents: { watchdog: { enabled: true, main: { model: "openai-codex/gpt-5.5" } } } }, null, 2), "utf-8");
+				const gpt = { provider: "openai-codex", id: "gpt-5.5", reasoning: true };
+				const opus = { provider: "anthropic", id: "claude-opus-4-8", reasoning: true };
+				const models = [gpt, opus];
+				const modelRegistry = {
+					getAvailable: () => models,
+					find: (provider: string, id: string) => models.find((entry) => entry.provider === provider && entry.id === id),
+					hasConfiguredAuth: (model: unknown) => Boolean(model),
+				};
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("status", createCommandContext({ cwd: root, model: gpt, modelRegistry }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /Main model: openai-codex\/gpt-5\.5 \(configured\)/);
+				assert.match(content, /Main thinking: off \(default for explicit watchdog model\)/);
+			});
+		});
+	});
+
+	it("writes only user watchdog enabled settings and preserves existing settings", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-toggle-", async (root) => {
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				const projectSettingsPath = path.join(root, ".pi", "settings.json");
+				fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+				fs.writeFileSync(settingsPath, JSON.stringify({
+					other: true,
+					subagents: {
+						agentOverrides: { scout: { model: "openai/test" } },
+						watchdog: { agentEndTimeoutMs: 1234, main: { enabled: false, model: "openai/watchdog" } },
+					},
+				}, null, 2), "utf-8");
+				fs.writeFileSync(projectSettingsPath, JSON.stringify({ subagents: { defaultModel: "anthropic/project" } }, null, 2), "utf-8");
+				const projectBefore = fs.readFileSync(projectSettingsPath, "utf-8");
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("on", createCommandContext({ cwd: root }));
+				let settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+				assert.equal(settings.other, true);
+				assert.equal(settings.subagents.agentOverrides.scout.model, "openai/test");
+				assert.equal(settings.subagents.watchdog.agentEndTimeoutMs, 1234);
+				assert.equal(settings.subagents.watchdog.enabled, true);
+				assert.equal(settings.subagents.watchdog.main.enabled, true);
+				assert.equal(settings.subagents.watchdog.main.model, "openai/watchdog");
+				assert.equal(fs.readFileSync(projectSettingsPath, "utf-8"), projectBefore);
+
+				await commands.get("subagents-watchdog")!.handler("off", createCommandContext({ cwd: root }));
+				settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+				assert.equal(settings.subagents.watchdog.enabled, false);
+				assert.equal(settings.subagents.watchdog.main.enabled, false);
+				assert.match(String((sent[0] as { content?: unknown }).content ?? ""), /saved to user settings/);
+			});
+		});
+	});
+
+	it("uses session on/off overrides without writing settings files", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-session-", async (root) => {
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				const projectSettingsPath = path.join(root, ".pi", "settings.json");
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("session on", createCommandContext({ cwd: root }));
+				await commands.get("subagents-watchdog")!.handler("session off", createCommandContext({ cwd: root }));
+
+				assert.equal(fs.existsSync(settingsPath), false);
+				assert.equal(fs.existsSync(projectSettingsPath), false);
+				assert.match(String((sent[0] as { content?: unknown }).content ?? ""), /session override: on/i);
+				assert.match(String((sent[1] as { content?: unknown }).content ?? ""), /session override: off/i);
+			});
+		});
+	});
+
+	it("sends deterministic concern and blocker warning messages through the renderer path", async () => {
+		await withIsolatedHome(async () => {
+			const { commands, renderers, sent } = createWatchdogHarness();
+			await commands.get("subagents-watchdog")!.handler("test concern check the concern", createCommandContext());
+			await commands.get("subagents-watchdog")!.handler("test blocker check the blocker", createCommandContext());
+
+			const concern = sent[0] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
+			const blocker = sent[1] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
+			assert.equal(concern.customType, "subagent_watchdog_warning");
+			assert.equal(concern.display, true);
+			assert.equal(concern.details?.severity, "concern");
+			assert.equal(concern.details?.source, "main");
+			assert.equal(concern.details?.state, "displayed");
+			assert.match(concern.content ?? "", /source="main"/);
+			assert.match(concern.content ?? "", /<state>displayed<\/state>/);
+			assert.match(concern.content ?? "", /<recommended_action>/);
+			assert.equal(blocker.details?.severity, "blocker");
+			assert.match(blocker.content ?? "", /<blocker_guidance>/);
+
+			const renderer = renderers.get("subagent_watchdog_warning")!;
+			const rendered = renderer(blocker as never, { expanded: true }, { fg: (_name, value) => value, bold: (value) => value })!.render(100).join("\n");
+			assert.match(rendered, /Subagent watchdog Blocker \(displayed\): check the blocker/);
+			assert.match(rendered, /Manual \/subagents-watchdog test blocker message/);
+		});
+	});
+
+	it("sends accepted review warnings as visible custom watchdog messages", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-review-warning-", async (root) => {
+				const review: WatchdogReviewFunction = (request) => {
+					assert.equal(request.emitWarning({
+						severity: "concern",
+						category: "test-gap",
+						confidence: "high",
+						source: "main",
+						summary: "Focused validation is missing",
+						evidence: "The reviewed turn delta says changes were made but contains no test command.",
+						recommendedAction: "Run the focused watchdog tests before accepting the turn.",
+					}), true);
+					return { stopReason: "stop" };
+				};
+				const { runtime, sent } = createWatchdogHarness(review);
+
+				runtime.setSessionEnabled(true, root);
+				runtime.handleBeforeAgentStart({ prompt: "Patch watchdog runtime." }, { cwd: root });
+				runtime.handleTurnEnd({
+					type: "turn_end",
+					message: { role: "assistant", content: "Changed watchdog runtime without running tests." },
+					toolResults: [{ role: "toolResult", toolName: "edit", content: "Edited src/watchdog/runtime.ts", isError: false }],
+				}, { cwd: root });
+				await runtime.handleAgentEnd({ type: "agent_end", messages: [] }, { cwd: root });
+
+				const message = sent[0] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
+				assert.equal(message.customType, "subagent_watchdog_warning");
+				assert.equal(message.display, true);
+				assert.equal(message.details?.state, "displayed");
+				assert.equal(message.details?.summary, "Focused validation is missing");
+				assert.match(message.content ?? "", /<subagent_watchdog/);
+				assert.match(message.content ?? "", /<recommended_action>/);
+			});
+		});
+	});
+});
 
 describe("slash command custom message delivery", { skip: !available ? "slash-commands.ts not importable" : undefined }, () => {
 	beforeEach(() => {
@@ -1259,9 +1511,235 @@ describe("subagents-doctor slash command", { skip: !available ? "slash-commands.
 		assert.deepEqual(params, { action: "doctor" });
 	});
 
-	it("routes fleet to the read-only status view", async () => {
+	it("keeps the textual fleet status fallback when no UI is available", async () => {
 		const { params } = await captureSlashCommandParams("subagents-fleet", "", process.cwd());
 		assert.deepEqual(params, { action: "status", view: "fleet" });
+	});
+
+	it("opens the native fleet from both the slash command and direct shortcut", async () => {
+		const commands = new Map<string, RegisteredSlashCommand>();
+		const shortcuts = new Map<string, { description: string; handler(ctx: unknown): Promise<void> }>();
+		let opened = 0;
+		let rendered = "";
+		const custom = async (factory: unknown, options: unknown) => {
+			opened++;
+			const component = (factory as (tui: unknown, theme: unknown, keybindings: unknown, done: (value: undefined) => void) => { render(width: number): string[]; dispose(): void })(
+				{ terminal: { rows: 30, columns: 100 }, requestRender() {} },
+				{ fg: (_name: string, text: string) => text, bold: (text: string) => text },
+				undefined,
+				() => {},
+			);
+			rendered = component.render(100).join("\n");
+			component.dispose();
+			assert.deepEqual(options, { overlay: true, overlayOptions: { anchor: "center", width: "95%", minWidth: 60, maxHeight: "85%", margin: 1 } });
+			return undefined;
+		};
+		const pi = {
+			events: createEventBus(),
+			registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+			registerShortcut(key: string, spec: { description: string; handler(ctx: unknown): Promise<void> }) { shortcuts.set(key, spec); },
+			sendMessage(_message: unknown) {},
+		};
+		const state = createState(process.cwd());
+		const ctx = createCommandContext({ hasUI: true, custom });
+		registerSlashCommands!(pi, state);
+
+		await commands.get("subagents-fleet")!.handler("", ctx);
+		assert.equal(shortcuts.size, 1);
+		const shortcut = [...shortcuts.values()][0]!;
+		assert.equal(shortcut.description, "Open subagent fleet inspector");
+		await shortcut.handler(ctx);
+
+		assert.equal(opened, 2);
+		assert.match(rendered, /Subagent fleet/);
+		assert.match(rendered, /inspection only/);
+	});
+
+	it("routes subagents-stop with an id directly to the stop action", async () => {
+		const { params } = await captureSlashCommandParams("subagents-stop", "run-123", process.cwd());
+		assert.deepEqual(params, { action: "stop", id: "run-123" });
+	});
+
+	it("prints exact stop commands when subagents-stop has no UI", async () => {
+		await withIsolatedHome(async () => {
+			const runId = `slash-stop-${Date.now().toString(36)}`;
+			const asyncDir = path.join(ASYNC_DIR, runId);
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId,
+				sessionId: "session-test",
+				mode: "single",
+				state: "running",
+				pid: process.pid,
+				startedAt: Date.now(),
+				lastUpdate: Date.now(),
+				steps: [{ agent: "worker", status: "running", startedAt: Date.now() }],
+			}, null, 2));
+			try {
+				const sent: unknown[] = [];
+				const commands = new Map<string, RegisteredSlashCommand>();
+				const pi = {
+					events: createEventBus(),
+					registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+					registerShortcut() {},
+					sendMessage(message: unknown) { sent.push(message); },
+				};
+				const state = createState(process.cwd());
+				state.currentSessionId = "session-test";
+				registerSlashCommands!(pi, state);
+				await commands.get("subagents-stop")!.handler("", createCommandContext({ hasUI: false }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, new RegExp(`subagent\\({ action: "stop", id: "${runId}" }\\)`));
+				assert.match(content, new RegExp(`/subagents-stop ${runId}`));
+			} finally {
+				fs.rmSync(asyncDir, { recursive: true, force: true });
+			}
+		});
+	});
+
+	it("prints cancel commands for scheduled subagent runs when subagents-stop has no UI", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-slash-stop-scheduled-", async (root) => {
+				const storePath = scheduledRunStorePath(root, "session-test");
+				fs.mkdirSync(path.dirname(storePath), { recursive: true });
+				fs.writeFileSync(storePath, JSON.stringify({
+					version: 1,
+					cwd: root,
+					sessionId: "session-test",
+					jobs: [{
+						id: "job-1",
+						name: "nightly scout",
+						schedule: "+10m",
+						runAt: Date.now() + 600_000,
+						state: "scheduled",
+						createdAt: Date.now(),
+						updatedAt: Date.now(),
+						cwd: root,
+						sessionId: "session-test",
+						params: { agent: "scout", task: "later", async: true },
+					}],
+				}, null, 2));
+				const sent: unknown[] = [];
+				const commands = new Map<string, RegisteredSlashCommand>();
+				const state = createState(root);
+				state.currentSessionId = "session-test";
+				const pi = {
+					events: createEventBus(),
+					registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+					registerShortcut() {},
+					sendMessage(message: unknown) { sent.push(message); },
+				};
+				registerSlashCommands!(pi, state);
+				await commands.get("subagents-stop")!.handler("", createCommandContext({ cwd: root, hasUI: false }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /job-1 · nightly scout/);
+				assert.match(content, /cancel scheduled run: subagent\({ action: "schedule-cancel", id: "job-1" }\)/);
+				assert.doesNotMatch(content, /\/subagents-stop job-1/);
+			});
+		});
+	});
+
+	it("routes selected scheduled subagents-stop targets through schedule-cancel", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-slash-stop-selected-scheduled-", async (root) => {
+				const storePath = scheduledRunStorePath(root, "session-test");
+				fs.mkdirSync(path.dirname(storePath), { recursive: true });
+				fs.writeFileSync(storePath, JSON.stringify({
+					version: 1,
+					cwd: root,
+					sessionId: "session-test",
+					jobs: [{
+						id: "job-2",
+						name: "delayed worker",
+						schedule: "+10m",
+						runAt: Date.now() + 600_000,
+						state: "scheduled",
+						createdAt: Date.now(),
+						updatedAt: Date.now(),
+						cwd: root,
+						sessionId: "session-test",
+						params: { agent: "worker", task: "later", async: true },
+					}],
+				}, null, 2));
+
+				const commands = new Map<string, RegisteredSlashCommand>();
+				const events = createEventBus();
+				let requestedParams: unknown;
+				events.on(SLASH_SUBAGENT_REQUEST_EVENT, (data) => {
+					const payload = data as { requestId: string; params?: unknown };
+					requestedParams = payload.params;
+					events.emit(SLASH_SUBAGENT_STARTED_EVENT, { requestId: payload.requestId });
+					events.emit(SLASH_SUBAGENT_RESPONSE_EVENT, {
+						requestId: payload.requestId,
+						result: { content: [{ type: "text", text: "cancelled" }], details: { mode: "management", results: [] } },
+						isError: false,
+					});
+				});
+				const state = createState(root);
+				state.currentSessionId = "session-test";
+				const pi = {
+					events,
+					registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+					registerShortcut() {},
+					sendMessage(_message: unknown) {},
+				};
+				registerSlashCommands!(pi, state);
+				await commands.get("subagents-stop")!.handler("", createCommandContext({
+					cwd: root,
+					hasUI: true,
+					custom: async () => ({
+						confirmed: true,
+						target: { kind: "scheduled", id: "job-2", label: "job-2", detail: "scheduled", actionLabel: "cancel scheduled run" },
+					}),
+				}));
+
+				assert.deepEqual(requestedParams, { action: "schedule-cancel", id: "job-2" });
+			});
+		});
+	});
+
+	it("prints fallback text instead of opening or enumerating the selector in child-safe fanout mode", async () => {
+		await withIsolatedHome(async () => {
+			const previous = process.env[SUBAGENT_FANOUT_CHILD_ENV];
+			const runId = `slash-stop-child-safe-${Date.now().toString(36)}`;
+			const asyncDir = path.join(ASYNC_DIR, runId);
+			process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId,
+				sessionId: "session-test",
+				mode: "single",
+				state: "running",
+				pid: process.pid,
+				startedAt: Date.now(),
+				lastUpdate: Date.now(),
+				steps: [{ agent: "worker", status: "running", startedAt: Date.now() }],
+			}, null, 2));
+			try {
+				const sent: unknown[] = [];
+				const commands = new Map<string, RegisteredSlashCommand>();
+				const pi = {
+					events: createEventBus(),
+					registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+					registerShortcut() {},
+					sendMessage(message: unknown) { sent.push(message); },
+				};
+				const state = createState(process.cwd());
+				state.currentSessionId = "session-test";
+				registerSlashCommands!(pi, state);
+				await commands.get("subagents-stop")!.handler("", createCommandContext({ hasUI: true }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /Selector unavailable in child-safe fanout mode\./);
+				assert.doesNotMatch(content, new RegExp(runId));
+			} finally {
+				fs.rmSync(asyncDir, { recursive: true, force: true });
+				if (previous === undefined) delete process.env[SUBAGENT_FANOUT_CHILD_ENV];
+				else process.env[SUBAGENT_FANOUT_CHILD_ENV] = previous;
+			}
+		});
 	});
 
 	it("does not register the removed subagents-status overlay command", async () => {

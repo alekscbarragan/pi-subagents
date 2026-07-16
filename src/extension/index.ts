@@ -23,8 +23,9 @@ import { discoverAgents } from "../agents/agents.ts";
 import { cleanupAllArtifactDirs, cleanupOldArtifacts, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import { cleanupOldChainDirs } from "../shared/settings.ts";
-import { clearLegacyResultAnimationTimer, renderWidget, renderSubagentResult } from "../tui/render.ts";
-import { SubagentParams, WaitParams } from "./schemas.ts";
+import { clearLegacyResultAnimationTimer, renderSubagentResult } from "../tui/render.ts";
+import { SubagentParams, SubagentWaitParams } from "./schemas.ts";
+import { validateChainInput } from "./chain-validation.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { admitOrdinaryCheckout, CheckoutLeaseError, recordOrdinaryExecutionOutcome, recordOrdinaryResumeOutcome, settleOrdinaryCheckout } from "../runs/shared/checkout-lease.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
@@ -32,13 +33,14 @@ import { createResultWatcher } from "../runs/background/result-watcher.ts";
 import { createScheduledRunManager } from "../runs/background/scheduled-runs.ts";
 import { registerSlashCommands } from "../slash/slash-commands.ts";
 import { registerPromptTemplateDelegationBridge } from "../slash/prompt-template-bridge.ts";
+import { registerMainWatchdog } from "../watchdog/register-main.ts";
 import { registerSlashSubagentBridge } from "../slash/slash-bridge.ts";
 import { createNativeSupervisorChannel } from "../intercom/native-supervisor-channel.ts";
 import { registerSubagentRpcBridge } from "./rpc.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
 import { inspectSubagentStatus } from "../runs/background/run-status.ts";
-import { resolveWaitToolConfig, waitForSubagents } from "../runs/background/wait.ts";
-import registerSubagentNotify, { type SubagentNotifyDetails } from "../runs/background/notify.ts";
+import { resolveWaitToolConfig, waitForSubagents } from "../runs/background/subagent-wait.ts";
+import registerSubagentNotify, { parseSubagentNotifyContent, type SubagentNotifyDetails } from "../runs/background/notify.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/pi-args.ts";
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
 import { loadConfig } from "./config.ts";
@@ -178,38 +180,6 @@ function createSlashResultComponent(
 	return container;
 }
 
-function parseSubagentNotifyContent(content: string): SubagentNotifyDetails | undefined {
-	const lines = content.split("\n");
-	const header = lines[0] ?? "";
-	const match = header.match(/^Background task (completed|failed|paused): \*\*(.+?)\*\*(?:\s+(\([^)]*\)))?$/);
-	if (!match) return undefined;
-	const body = lines.slice(2);
-	let sessionIndex = -1;
-	for (let i = body.length - 1; i >= 1; i--) {
-		if (body[i - 1]?.trim() === "" && /^(Session|Session file|Session share error):\s+/.test(body[i]!)) {
-			sessionIndex = i;
-			break;
-		}
-	}
-	const sessionLine = sessionIndex >= 0 ? body[sessionIndex] : undefined;
-	const resultLines = sessionIndex >= 0 ? body.slice(0, sessionIndex) : body;
-	const resultPreview = resultLines.join("\n").trim() || "(no output)";
-	let sessionLabel: string | undefined;
-	let sessionValue: string | undefined;
-	if (sessionLine) {
-		const separator = sessionLine.indexOf(":");
-		sessionLabel = sessionLine.slice(0, separator).toLowerCase();
-		sessionValue = sessionLine.slice(separator + 1).trim();
-	}
-	return {
-		agent: match[2]!,
-		status: match[1] as SubagentNotifyDetails["status"],
-		...(match[3] ? { taskInfo: match[3] } : {}),
-		resultPreview,
-		...(sessionLabel && sessionValue ? { sessionLabel, sessionValue } : {}),
-	};
-}
-
 class SubagentControlNoticeComponent implements Component {
 	constructor(
 		private readonly details: SubagentControlMessageDetails,
@@ -269,6 +239,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		subagentInProgress: false,
 		subagentSpawns: { sessionId: null, count: 0 },
 		asyncJobs: new Map(),
+		fleetJobs: new Map(),
 		foregroundRuns: new Map(),
 		foregroundControls: new Map(),
 		lastForegroundControlId: null,
@@ -286,6 +257,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 
 	const supervisorChannel = createNativeSupervisorChannel(pi, state);
+	const mainWatchdog = registerMainWatchdog(pi);
 	const { startResultWatcher, primeExistingResults, stopResultWatcher } = createResultWatcher(
 		pi,
 		state,
@@ -296,6 +268,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	primeExistingResults();
 
 	const runtimeCleanup = () => {
+		mainWatchdog.dispose();
 		stopResultWatcher();
 		scheduledRunManager.stop();
 		supervisorChannel.dispose();
@@ -307,7 +280,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 	globalStore[runtimeCleanupStoreKey] = runtimeCleanup;
 
-	const { ensurePoller, handleStarted, handleComplete, resetJobs, restoreActiveJobs } = createAsyncJobTracker(pi, state, ASYNC_DIR);
+	const { ensurePoller, refreshWidget, handleStarted, handleComplete, resetJobs, restoreActiveJobs } = createAsyncJobTracker(pi, state, ASYNC_DIR, {
+		widgetEnabled: config.asyncWidget !== false,
+	});
 	let executorExecute: ((id: string, params: SubagentParamsLike, signal: AbortSignal, onUpdate: ((r: AgentToolResult<Details>) => void) | undefined, ctx: ExtensionContext) => Promise<AgentToolResult<Details>>) | undefined;
 	const scheduledRunManager = createScheduledRunManager({
 		config,
@@ -328,6 +303,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		config,
 		asyncByDefault,
 		handleScheduledRunAction: (params, ctx) => scheduledRunManager.handleToolCall(params, ctx),
+		watchdog: mainWatchdog,
 		tempArtifactsDir,
 		getSubagentSessionRoot,
 		expandTilde,
@@ -500,6 +476,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		description: buildSubagentToolDescription(config),
 		parameters: SubagentParams,
 
+		prepareArguments(args) {
+			// Run friendly chain validation before pi-ai's raw TypeBox schema check
+			// so the model sees which property is disallowed, what is allowed, and a
+			// valid example instead of `chain.N: must not have additional properties`.
+			validateChainInput(args);
+			return args as never;
+		},
+
 		execute(id, params, signal, onUpdate, ctx) {
 			return executeSubagentCollapsed(id, params, signal, onUpdate, ctx);
 		},
@@ -548,25 +532,25 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool(tool);
 
-	const waitTool: ToolDefinition<typeof WaitParams, Details> = {
-		name: "wait",
-		label: "Wait",
+	const subagentWaitTool: ToolDefinition<typeof SubagentWaitParams, Details> = {
+		name: "subagent_wait",
+		label: "Subagent Wait",
 		description: `Block until background (async) subagent runs started in this session finish, then return.
 
 Use this after launching async subagents when you have no independent work left and must not end your turn — for example inside a skill that has to run to completion, or any non-interactive run (\`pi -p ...\`) where the whole task is a single turn and ending it would abandon the still-running children.
 
-• { } — return as soon as the FIRST active run finishes (default). Ideal for a rolling fleet: launch N, wait, spawn a replacement for the one that finished, wait again — keeping N in flight.
+• { } — return as soon as the FIRST active run finishes (default). Ideal for a rolling fleet: launch N, wait, spawn a replacement for the one that finished, then call subagent_wait again — keeping N in flight.
 • { all: true } — block until EVERY active run in this session is finished.
-• { id: "..." } — wait for one specific run (id or prefix) to finish.
+• { id: "..." } — wait for one specific async run or remembered detached foreground run (id or prefix) to finish.
 • { timeoutMs: 600000 } — stop waiting after N ms (the runs keep going regardless; default 30 min)
 
-wait also returns when a run needs attention (a child that went idle or blocked for a decision), not only on completion — so a stuck child never stalls the loop; the summary names the run(s) to inspect/nudge/resume/interrupt. It wakes the instant a completion or control event arrives (subscribed to Pi's event bus, with a poll fallback that reconciles crashed runners), keeps the turn alive for normal notification delivery, and resolves early if the turn is aborted.${waitToolConfig.enabled ? "" : "\n\nConfigured behavior: wait is disabled by config.waitTool or PI_SUBAGENT_WAIT_TOOL_ENABLED and returns immediately without blocking."}`,
-		parameters: WaitParams,
+subagent_wait also returns when a run needs attention (a child that went idle or blocked for a decision), not only on completion — so a stuck child never stalls the loop; the summary names the run(s) to inspect/nudge/resume/interrupt. It wakes the instant a completion or control event arrives (subscribed to Pi's event bus, with a poll fallback that reconciles crashed runners), keeps the turn alive for normal notification delivery, and resolves early if the turn is aborted.${waitToolConfig.enabled ? "" : "\n\nConfigured behavior: subagent_wait is disabled by config.waitTool or PI_SUBAGENT_WAIT_TOOL_ENABLED and returns immediately without blocking."}`,
+		parameters: SubagentWaitParams,
 		execute(_id, params, signal, _onUpdate, _ctx) {
 			return waitForSubagents(params, signal, { state, events: pi.events, enabled: waitToolConfig.enabled });
 		},
 	};
-	pi.registerTool(waitTool);
+	pi.registerTool(subagentWaitTool);
 
 	registerSlashCommands(pi, state);
 
@@ -609,8 +593,7 @@ wait also returns when a run needs attention (a child that went idle or blocked 
 		if (!ctx.hasUI) return;
 		state.lastUiContext = ctx;
 		if (state.asyncJobs.size > 0) {
-			renderWidget(ctx, Array.from(state.asyncJobs.values()));
-			ctx.ui.requestRender?.();
+			refreshWidget(ctx);
 			ensurePoller();
 		}
 	});

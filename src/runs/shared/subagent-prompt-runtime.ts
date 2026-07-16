@@ -3,10 +3,20 @@ import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerNativeSupervisorClient } from "../../intercom/native-supervisor-channel.ts";
 import { consumeSteerRequestsFromDir, writeSteerRequestToDir, type SteerRequest } from "../background/control-channel.ts";
-import { SUBAGENT_FANOUT_CHILD_ENV, SUBAGENT_STEER_INBOX_ENV } from "./pi-args.ts";
+import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_FANOUT_CHILD_ENV, SUBAGENT_STEER_INBOX_ENV } from "./pi-args.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV, validateStructuredOutputValue } from "./structured-output.ts";
+import {
+	CHILD_TOOL_DIAGNOSTIC_PATH_ENV,
+	formatChildToolDiagnostic,
+	REQUIRED_CHILD_TOOLS_ENV,
+	writeChildToolDiagnostic,
+	type ChildToolDiagnostic,
+} from "./tool-availability.ts";
 import { TOOL_BUDGET_ENV, decodeToolBudgetEnv, shouldBlockToolForBudget, toolBudgetBlockedMessage, toolBudgetSoftNudge } from "./tool-budget.ts";
 import type { JsonSchemaObject, ResolvedToolBudget } from "../../shared/types.ts";
+import { resolveWatchPath } from "../../shared/utils.ts";
+import { registerChildWatchdog } from "../../watchdog/register-child.ts";
+import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../watchdog/types.ts";
 
 const SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV = "PI_SUBAGENT_INHERIT_PROJECT_CONTEXT";
 const SUBAGENT_INHERIT_SKILLS_ENV = "PI_SUBAGENT_INHERIT_SKILLS";
@@ -53,6 +63,18 @@ function readBooleanEnv(name: string): boolean | undefined {
 	const value = process.env[name];
 	if (value === undefined) return undefined;
 	return value !== "0";
+}
+
+function refreshChildToolDiagnostic(pi: ExtensionAPI): ChildToolDiagnostic | undefined {
+	const filePath = process.env[CHILD_TOOL_DIAGNOSTIC_PATH_ENV]?.trim();
+	const encoded = process.env[REQUIRED_CHILD_TOOLS_ENV]?.trim();
+	if (!filePath || !encoded) return undefined;
+	const required = JSON.parse(encoded) as unknown;
+	if (!Array.isArray(required) || required.some((name) => typeof name !== "string" || !name)) {
+		throw new Error(`Invalid ${REQUIRED_CHILD_TOOLS_ENV} payload.`);
+	}
+	const available = pi.getAllTools().map((tool) => tool.name);
+	return writeChildToolDiagnostic(filePath, required, available, process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim());
 }
 
 function findSectionEnd(prompt: string, startIndex: number, nextHeaders: string[]): number {
@@ -114,9 +136,9 @@ export function rewriteSubagentPrompt(
 
 function isParentOnlySubagentMessage(message: unknown): boolean {
 	const m = message as { role?: string; customType?: string };
-	return m?.role === "custom"
-		&& typeof m.customType === "string"
-		&& PARENT_ONLY_CUSTOM_MESSAGE_TYPES.has(m.customType);
+	if (m?.role !== "custom" || typeof m.customType !== "string") return false;
+	if (m.customType === SUBAGENT_WATCHDOG_WARNING_TYPE) return true;
+	return PARENT_ONLY_CUSTOM_MESSAGE_TYPES.has(m.customType);
 }
 
 function isSubagentToolResultMessage(message: unknown): boolean {
@@ -190,7 +212,10 @@ function registerToolBudget(pi: ExtensionAPI, budget: ResolvedToolBudget | undef
 	});
 }
 
-function registerSteeringInbox(pi: ExtensionAPI): void {
+export function registerSteeringInbox(
+	pi: ExtensionAPI,
+	deps: { watch?: typeof fs.watch; nativeRealpath?: (filePath: string) => string } = {},
+): void {
 	const steerInbox = process.env[SUBAGENT_STEER_INBOX_ENV]?.trim();
 	if (!steerInbox) return;
 	const sendUserMessage = (pi as { sendUserMessage?: (content: string, options: { deliverAs: "steer" }) => unknown }).sendUserMessage;
@@ -229,7 +254,7 @@ function registerSteeringInbox(pi: ExtensionAPI): void {
 		}
 		started = true;
 		try {
-			watcher = fs.watch(steerInbox, () => flush());
+			watcher = (deps.watch ?? fs.watch)(resolveWatchPath(steerInbox, deps.nativeRealpath), () => flush());
 			watcher.on("error", () => {});
 		} catch {
 			watcher = undefined;
@@ -261,6 +286,7 @@ function registerSteeringInbox(pi: ExtensionAPI): void {
 export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	registerSteeringInbox(pi);
 	registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV]));
+	registerChildWatchdog(pi);
 	let nativeSupervisorClientRegistered = false;
 	let nativeSupervisorFallbackRegistered = false;
 	const registerNativeSupervisorClientOnce = (): void => {
@@ -275,7 +301,10 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 		registerNativeSupervisorClient(pi);
 	};
 	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: unknown) => unknown) => void;
-	onRuntimeEvent("session_start", registerNativeSupervisorClientOnce);
+	onRuntimeEvent("session_start", () => {
+		registerNativeSupervisorClientOnce();
+		refreshChildToolDiagnostic(pi);
+	});
 	const structuredOutputPath = process.env[STRUCTURED_OUTPUT_CAPTURE_ENV];
 	const structuredSchemaPath = process.env[STRUCTURED_OUTPUT_SCHEMA_ENV];
 	if (structuredOutputPath && structuredSchemaPath) {
@@ -322,6 +351,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 
 	onRuntimeEvent("before_agent_start", async (event: { systemPrompt: string }) => {
 		registerNativeSupervisorFallbackOnce();
+		const toolDiagnostic = refreshChildToolDiagnostic(pi);
 		const intercomSessionName = process.env[SUBAGENT_INTERCOM_SESSION_NAME_ENV]?.trim();
 		if (intercomSessionName && typeof pi.setSessionName === "function") {
 			pi.setSessionName(intercomSessionName);
@@ -330,12 +360,17 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 		const inheritProjectContext = readBooleanEnv(SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV);
 		const inheritSkills = readBooleanEnv(SUBAGENT_INHERIT_SKILLS_ENV);
 		const fanoutChild = readBooleanEnv(SUBAGENT_FANOUT_CHILD_ENV);
-		if (inheritProjectContext === undefined && inheritSkills === undefined && fanoutChild === undefined) return;
-		const rewritten = rewriteSubagentPrompt(event.systemPrompt, {
-			inheritProjectContext: inheritProjectContext ?? true,
-			inheritSkills: inheritSkills ?? true,
-			fanoutChild: fanoutChild === true,
-		});
+		let rewritten = event.systemPrompt;
+		if (inheritProjectContext !== undefined || inheritSkills !== undefined || fanoutChild !== undefined) {
+			rewritten = rewriteSubagentPrompt(event.systemPrompt, {
+				inheritProjectContext: inheritProjectContext ?? true,
+				inheritSkills: inheritSkills ?? true,
+				fanoutChild: fanoutChild === true,
+			});
+		}
+		if (toolDiagnostic) {
+			rewritten = `${formatChildToolDiagnostic(toolDiagnostic)}\nDo not claim tool-dependent work succeeded; report this configuration error to the parent.\n\n${rewritten}`;
+		}
 		if (rewritten === event.systemPrompt) return;
 		return { systemPrompt: rewritten };
 	});

@@ -31,7 +31,7 @@ export interface ChainOutputMapEntry {
 
 export type ChainOutputMap = Record<string, ChainOutputMapEntry>;
 
-export type WorkflowNodeStatus = "pending" | "running" | "completed" | "failed" | "paused" | "detached";
+export type WorkflowNodeStatus = "pending" | "running" | "completed" | "failed" | "paused" | "stopped" | "detached";
 
 export interface WorkflowGraphNode {
 	id: string;
@@ -209,7 +209,7 @@ export interface ControlEvent {
 	recentFailureSummary?: string;
 }
 
-export type SubagentResultStatus = "completed" | "failed" | "paused" | "detached";
+export type SubagentResultStatus = "completed" | "failed" | "paused" | "stopped" | "detached";
 export type SubagentRunMode = "single" | "parallel" | "chain";
 export const SUBAGENT_LIFECYCLE_ARTIFACT_VERSION = 1;
 export type SubagentLifecycleArtifactVersion = typeof SUBAGENT_LIFECYCLE_ARTIFACT_VERSION;
@@ -239,7 +239,7 @@ export interface SubagentLifecycleHintV1 {
 
 export type PublicNestedStepSummary = Pick<
 	NestedStepSummary,
-	"agent" | "status" | "sessionFile" | "transcriptPath" | "transcriptError" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "startedAt" | "endedAt" | "error" | "timedOut"
+	"agent" | "status" | "sessionFile" | "transcriptPath" | "transcriptError" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "startedAt" | "endedAt" | "error" | "timedOut" | "stopped"
 > & {
 	children?: PublicNestedRunSummary[];
 };
@@ -252,7 +252,7 @@ export type CostSummary = {
 
 export type PublicNestedRunSummary = Pick<
 	NestedRunSummary,
-	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "totalTokens" | "totalCost" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "timeoutMs" | "deadlineAt" | "timedOut" | "turnBudget" | "turnBudgetExceeded" | "wrapUpRequested"
+	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "totalTokens" | "totalCost" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "timeoutMs" | "deadlineAt" | "timedOut" | "stopped" | "turnBudget" | "turnBudgetExceeded" | "wrapUpRequested"
 > & {
 	steps?: PublicNestedStepSummary[];
 	children?: PublicNestedRunSummary[];
@@ -292,6 +292,15 @@ export interface SubagentResultIntercomPayload {
 // Progress Tracking
 // ============================================================================
 
+export interface ChildWatchdogProgress {
+	phase: "idle" | "reviewing" | "autofollow" | "settling" | "stale" | "failed";
+	seq: number;
+	lastUpdate: number;
+	followUpPending: boolean;
+	reason?: string;
+	timedOut?: boolean;
+}
+
 export interface AgentProgress {
 	index: number;
 	agent: string;
@@ -312,6 +321,7 @@ export interface AgentProgress {
 	durationMs: number;
 	error?: string;
 	failedTool?: string;
+	watchdog?: ChildWatchdogProgress;
 }
 
 export interface ToolCallSummary {
@@ -382,7 +392,8 @@ export interface AcceptanceConfig {
 	reason?: string;
 }
 
-export type AcceptanceInput = AcceptanceLevel | false | AcceptanceConfig;
+/** Bare "none" is not accepted: use { level: "none", reason: "..." }; false remains a deprecated shorthand. */
+export type AcceptanceInput = Exclude<AcceptanceLevel, "none"> | false | AcceptanceConfig;
 
 export interface ResolvedAcceptanceGate extends AcceptanceGate {
 	id: string;
@@ -455,6 +466,7 @@ export interface AcceptanceReviewResult {
 }
 
 export type AcceptanceLedgerStatus =
+	| "pending"
 	| "not-required"
 	| "claimed"
 	| "attested"
@@ -482,6 +494,15 @@ export interface AcceptanceLedger {
 	};
 }
 
+export interface ProtocolOutputLimit {
+	code: "protocol_output_limit";
+	stream: "stdout" | "stderr";
+	limitBytes: number;
+	observedBytes: number;
+	diagnosticPrefix: string;
+	diagnosticTail: string;
+}
+
 export interface SingleResult {
 	agent: string;
 	task: string;
@@ -490,6 +511,7 @@ export interface SingleResult {
 	detachedReason?: string;
 	interrupted?: boolean;
 	timedOut?: boolean;
+	stopped?: boolean;
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -502,6 +524,7 @@ export interface SingleResult {
 	modelAttempts?: ModelAttempt[];
 	controlEvents?: ControlEvent[];
 	error?: string;
+	protocolError?: ProtocolOutputLimit;
 	sessionFile?: string;
 	skills?: string[];
 	skillsWarning?: string;
@@ -522,6 +545,7 @@ export interface SingleResult {
 	transcriptPath?: string;
 	transcriptError?: string;
 	children?: NestedRunSummary[];
+	watchdog?: ChildWatchdogProgress;
 }
 
 export interface Details {
@@ -541,6 +565,7 @@ export interface Details {
 	timeoutMs?: number;
 	deadlineAt?: number;
 	timedOut?: boolean;
+	stopped?: boolean;
 	turnBudget?: ResolvedTurnBudget;
 	toolBudget?: ResolvedToolBudget;
 	progress?: AgentProgress[];
@@ -599,7 +624,7 @@ export interface AsyncParallelGroupStatus {
 	stepIndex: number;
 }
 
-export type NestedRunState = "queued" | "running" | "complete" | "failed" | "paused";
+export type NestedRunState = "queued" | "running" | "complete" | "failed" | "paused" | "stopped";
 export type NestedOwnerState = "live" | "gone" | "unknown";
 
 export interface NestedRunAddress {
@@ -613,7 +638,7 @@ export interface NestedRunAddress {
 
 export interface NestedStepSummary {
 	agent: string;
-	status: "pending" | "running" | "complete" | "completed" | "failed" | "paused";
+	status: "pending" | "running" | "complete" | "completed" | "failed" | "paused" | "stopped";
 	sessionFile?: string;
 	transcriptPath?: string;
 	transcriptError?: string;
@@ -627,7 +652,9 @@ export interface NestedStepSummary {
 	startedAt?: number;
 	endedAt?: number;
 	error?: string;
+	watchdog?: ChildWatchdogProgress;
 	timedOut?: boolean;
+	stopped?: boolean;
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -671,6 +698,7 @@ export interface NestedRunSummary extends NestedRunAddress {
 	timeoutMs?: number;
 	deadlineAt?: number;
 	timedOut?: boolean;
+	stopped?: boolean;
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -695,6 +723,10 @@ export interface AsyncStartedEvent {
 	mode?: SubagentRunMode;
 	agent?: string;
 	agents?: string[];
+	/** Truncated first child task retained for backwards compatibility. */
+	task?: string;
+	/** Workflow-level caller task, falling back to the first child task. */
+	goal?: string;
 	chain?: string[];
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
@@ -710,7 +742,7 @@ export interface AsyncStatus {
 	runId: string;
 	sessionId?: string;
 	mode: SubagentRunMode;
-	state: "queued" | "running" | "complete" | "failed" | "paused";
+	state: "queued" | "running" | "complete" | "failed" | "paused" | "stopped";
 	error?: string;
 	activityState?: ActivityState;
 	lastActivityAt?: number;
@@ -727,6 +759,7 @@ export interface AsyncStatus {
 	timeoutMs?: number;
 	deadlineAt?: number;
 	timedOut?: boolean;
+	stopped?: boolean;
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -745,7 +778,7 @@ export interface AsyncStatus {
 		label?: string;
 		outputName?: string;
 		structured?: boolean;
-		status: "pending" | "running" | "complete" | "completed" | "failed" | "paused";
+		status: "pending" | "running" | "complete" | "completed" | "failed" | "paused" | "stopped";
 		children?: NestedRunSummary[];
 		sessionFile?: string;
 		transcriptPath?: string;
@@ -765,6 +798,7 @@ export interface AsyncStatus {
 		durationMs?: number;
 		exitCode?: number | null;
 		timedOut?: boolean;
+		stopped?: boolean;
 		turnBudget?: TurnBudgetState;
 		turnBudgetExceeded?: boolean;
 		wrapUpRequested?: boolean;
@@ -784,6 +818,7 @@ export interface AsyncStatus {
 		structuredOutputPath?: string;
 		structuredOutputSchemaPath?: string;
 		acceptance?: AcceptanceLedger;
+		watchdog?: ChildWatchdogProgress;
 	}>;
 	sessionDir?: string;
 	outputFile?: string;
@@ -800,7 +835,7 @@ export type AsyncJobStep = NonNullable<AsyncStatus["steps"]>[number] & {
 export interface AsyncJobState {
 	asyncId: string;
 	asyncDir: string;
-	status: "queued" | "running" | "complete" | "failed" | "paused";
+	status: "queued" | "running" | "complete" | "failed" | "paused" | "stopped";
 	pid?: number;
 	sessionId?: string;
 	activityState?: ActivityState;
@@ -828,6 +863,7 @@ export interface AsyncJobState {
 	timeoutMs?: number;
 	deadlineAt?: number;
 	timedOut?: boolean;
+	stopped?: boolean;
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -848,11 +884,16 @@ export interface ForegroundResumeChild {
 	sessionFile?: string;
 	status: SubagentResultStatus;
 	exitCode?: number;
+	error?: string;
 	finalOutput?: string;
+	outputMode?: OutputMode;
+	savedOutputPath?: string;
+	outputSaveError?: string;
 	artifactPaths?: ArtifactPaths;
 	transcriptPath?: string;
 	transcriptError?: string;
 	detachedReason?: string;
+	acceptance?: AcceptanceLedger;
 	updatedAt?: number;
 }
 
@@ -860,6 +901,8 @@ export interface ForegroundResumeRun {
 	runId: string;
 	mode: SubagentRunMode;
 	cwd: string;
+	/** Originating parent session. Detached exits can outlive the active session. */
+	sessionId?: string;
 	updatedAt: number;
 	children: ForegroundResumeChild[];
 }
@@ -870,6 +913,8 @@ export interface SubagentState {
 	subagentInProgress?: boolean;
 	subagentSpawns?: { sessionId: string | null; count: number };
 	asyncJobs: Map<string, AsyncJobState>;
+	/** Current-session active and recent async runs for the native fleet inspector. */
+	fleetJobs?: Map<string, AsyncJobState>;
 	foregroundRuns?: Map<string, ForegroundResumeRun>;
 	foregroundControls: Map<string, {
 		runId: string;
@@ -932,6 +977,7 @@ export const INTERCOM_DETACH_REQUEST_EVENT = "pi-intercom:detach-request";
 export const INTERCOM_DETACH_RESPONSE_EVENT = "pi-intercom:detach-response";
 export const SUBAGENT_ASYNC_STARTED_EVENT = "subagent:async-started";
 export const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
+export const SUBAGENT_FOREGROUND_COMPLETE_EVENT = "subagent:foreground-complete";
 export const SUBAGENT_CONTROL_EVENT = "subagent:control-event";
 export const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
 export const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
@@ -1032,6 +1078,8 @@ export interface ScheduledRunsConfig {
 
 export interface ExtensionConfig {
 	asyncByDefault?: boolean;
+	/** Show the above-editor async runs widget. Defaults to true. */
+	asyncWidget?: boolean;
 	/** Tool description variant registered for the parent-facing subagent tool. Defaults to full. */
 	toolDescriptionMode?: ToolDescriptionMode;
 	forceTopLevelAsync?: boolean;
@@ -1147,7 +1195,7 @@ export const POLL_INTERVAL_MS = 250;
 export const MAX_WIDGET_JOBS = 4;
 export const DEFAULT_SUBAGENT_MAX_DEPTH = 2;
 export const DEFAULT_MAX_SUBAGENT_SPAWNS_PER_SESSION = 40;
-export const SUBAGENT_ACTIONS = ["list", "get", "models", "create", "update", "delete", "eject", "disable", "enable", "reset", "status", "interrupt", "resume", "steer", "append-step", "doctor", "schedule", "schedule-list", "schedule-status", "schedule-cancel"] as const;
+export const SUBAGENT_ACTIONS = ["list", "get", "models", "create", "update", "delete", "eject", "disable", "enable", "reset", "status", "interrupt", "resume", "steer", "stop", "append-step", "doctor", "watchdog.status", "watchdog.check", "watchdog.configure", "watchdog.recommend-model", "schedule", "schedule-list", "schedule-status", "schedule-cancel"] as const;
 
 export const DEFAULT_FORK_PREAMBLE =
 	"You are a delegated subagent running from a fork of the parent session. " +

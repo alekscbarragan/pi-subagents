@@ -5,6 +5,8 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { computeMcpServerHash } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
 import { TOOL_BUDGET_ENV } from "../../src/runs/shared/tool-budget.ts";
+import { CHILD_TOOL_DIAGNOSTIC_PATH_ENV, REQUIRED_CHILD_TOOLS_ENV } from "../../src/runs/shared/tool-availability.ts";
+import { CHILD_WATCHDOG_CONFIG_ENV } from "../../src/watchdog/child-status.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_PARENT_CHILD_INDEX_ENV,
@@ -184,6 +186,53 @@ describe("buildPiArgs session wiring", () => {
 
 		assert.equal(env[SUBAGENT_PARENT_SESSION_ENV], "inherited-parent");
 	});
+
+	it("passes child watchdog config only when explicitly provided", () => {
+		const withoutWatchdog = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+		});
+		assert.equal(withoutWatchdog.env[CHILD_WATCHDOG_CONFIG_ENV], undefined);
+
+		const withWatchdog = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			childWatchdog: {
+				enabled: true,
+				runId: "run-1",
+				agent: "worker",
+				childIndex: 2,
+				watchdogTailTimeoutMs: 1234,
+				agentEndTimeoutMs: 500,
+				maxWarnings: 1,
+				lsp: { enabled: false, timeoutMs: 50, maxFiles: 2, maxDiagnostics: 3 },
+				autoFollowBlockers: true,
+				autoFollowMaxAttempts: 3,
+				stalemateRepeats: 2,
+			},
+		});
+		const encoded = withWatchdog.env[CHILD_WATCHDOG_CONFIG_ENV];
+		assert.equal(typeof encoded, "string");
+		assert.deepEqual(JSON.parse(encoded ?? "{}"), {
+			enabled: true,
+			runId: "run-1",
+			agent: "worker",
+			childIndex: 2,
+			watchdogTailTimeoutMs: 1234,
+			agentEndTimeoutMs: 500,
+			maxWarnings: 1,
+			lsp: { enabled: false, timeoutMs: 50, maxFiles: 2, maxDiagnostics: 3 },
+			autoFollowBlockers: true,
+			autoFollowMaxAttempts: 3,
+			stalemateRepeats: 2,
+		});
+	});
 });
 
 describe("buildPiArgs model wiring", () => {
@@ -232,6 +281,24 @@ describe("buildPiArgs model wiring", () => {
 		assert.equal(applyThinkingSuffix("openai-codex/gpt-5.4-mini", "high"), "openai-codex/gpt-5.4-mini:high");
 		assert.ok(args.includes("--model"));
 		assert.ok(args.includes("openai-codex/gpt-5.4-mini:high"));
+	});
+
+	it("passes max thinking through to the model argument", () => {
+		const { args } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			model: "openai/gpt-5",
+			thinking: "max",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+		});
+
+		assert.equal(applyThinkingSuffix("openai/gpt-5", "max"), "openai/gpt-5:max");
+		assert.equal(applyThinkingSuffix("openai/gpt-5:max", "high"), "openai/gpt-5:max");
+		assert.equal(applyThinkingSuffix("openai/gpt-5:max", "high", true), "openai/gpt-5:high");
+		assert.ok(args.includes("--model"));
+		assert.ok(args.includes("openai/gpt-5:max"));
 	});
 
 	it("passes explicit thinking off through to the model arg", () => {
@@ -391,7 +458,7 @@ describe("buildPiArgs system prompt mode wiring", () => {
 	});
 
 	it("emits explicit builtin tool allowlists", () => {
-		const { args } = buildPiArgs({
+		const { args, env, toolDiagnosticPath } = buildPiArgs({
 			baseArgs: ["-p"],
 			task: "hello",
 			sessionEnabled: false,
@@ -402,6 +469,27 @@ describe("buildPiArgs system prompt mode wiring", () => {
 
 		const toolsArg = args[args.indexOf("--tools") + 1];
 		assert.equal(toolsArg, "read,grep,find,ls,bash,edit,write,contact_supervisor");
+		assert.deepEqual(JSON.parse(env[REQUIRED_CHILD_TOOLS_ENV] ?? "[]"), toolsArg.split(","));
+		assert.equal(env[CHILD_TOOL_DIAGNOSTIC_PATH_ENV], toolDiagnosticPath);
+	});
+
+	it("keeps structured_output available under explicit tool allowlists", () => {
+		const { args, env } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			tools: ["read", "fixture_search"],
+			structuredOutput: {
+				schema: { type: "object", properties: {}, additionalProperties: false },
+				schemaPath: "/tmp/schema.json",
+				outputPath: "/tmp/output.json",
+			},
+		});
+
+		assert.equal(args[args.indexOf("--tools") + 1], "read,fixture_search,structured_output");
+		assert.deepEqual(JSON.parse(env[REQUIRED_CHILD_TOOLS_ENV] ?? "[]"), ["read", "fixture_search", "structured_output"]);
 	});
 
 	it("adds read to explicit tool allowlists when skills must be loaded lazily", () => {

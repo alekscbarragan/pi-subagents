@@ -308,7 +308,7 @@ describe("async run status inspection", () => {
 
 			const text = textContent(result);
 			assert.equal(result.isError, undefined);
-			assert.match(text, /Subagent fleet: 2 active/);
+			assert.match(text, /Subagent fleet: 2 tracked/);
 			assert.match(text, /Foreground runs:/);
 			assert.match(text, /fg-run \| running \| scout/);
 			assert.match(text, /Async runs:/);
@@ -956,6 +956,40 @@ describe("async run status inspection", () => {
 
 			assert.equal(result.isError, true);
 			assert.match(textContent(result), /Transcript index must be an integer/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("shows stopped result-only runs without revive guidance", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-stopped-result-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			fs.mkdirSync(path.join(asyncRoot, "run-stopped-result"), { recursive: true });
+			fs.mkdirSync(resultsDir, { recursive: true });
+			const sessionFile = path.join(root, "session.jsonl");
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			fs.writeFileSync(path.join(resultsDir, "run-stopped-result.json"), JSON.stringify({
+				id: "run-stopped-result",
+				agent: "worker",
+				success: false,
+				state: "stopped",
+				stopped: true,
+				sessionFile,
+				summary: "Subagent stopped by user.",
+			}, null, 2), "utf-8");
+
+			const result = inspectSubagentStatus({ id: "run-stopped-result" }, {
+				asyncDirRoot: asyncRoot,
+				resultsDir,
+			});
+
+			const text = textContent(result);
+			assert.equal(result.isError, undefined);
+			assert.match(text, /State: stopped/);
+			assert.match(text, /Resume: unavailable; stopped runs are not resumable/);
+			assert.doesNotMatch(text, /Revive:/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

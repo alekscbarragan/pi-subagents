@@ -5,7 +5,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Compile } from "typebox/compile";
 import { resolveAsyncRunLocation } from "../runs/background/async-resume.ts";
-import { deliverTimeoutRequest } from "../runs/background/control-channel.ts";
+import { deliverStopRequest, deliverTimeoutRequest } from "../runs/background/control-channel.ts";
 import {
 	buildAsyncResultTranscriptPage,
 	buildAsyncRunTranscriptPage,
@@ -41,6 +41,7 @@ import {
 } from "../shared/types.ts";
 import { readStatus } from "../shared/utils.ts";
 import { writeAtomicJson } from "../shared/atomic-json.ts";
+import { validateChainInput } from "./chain-validation.ts";
 import {
 	SubagentParams,
 	SubagentRpcAcquireCheckoutLeaseV1,
@@ -240,6 +241,13 @@ function optionalInteger(input: Record<string, unknown>, key: string): number | 
 }
 
 function assertSubagentParams(params: SubagentParamsLike, label: string): void {
+	// Friendly chain validation first: name the disallowed property, list allowed
+	// ones, and show a valid example instead of raw TypeBox diagnostics.
+	try {
+		validateChainInput(params);
+	} catch (error) {
+		throw new SubagentRpcError("invalid_params", `${label}: ${error instanceof Error ? error.message : String(error)}`);
+	}
 	if (subagentParamsValidator.Check(params)) return;
 	const messages = [...subagentParamsValidator.Errors(params)]
 		.slice(0, 4)
@@ -634,7 +642,7 @@ function stopAsyncRun(
 	}
 
 	try {
-		deliverTimeoutRequest({
+		deliverStopRequest({
 			asyncDir: location.asyncDir,
 			pid: status.pid,
 			kill: options.kill,

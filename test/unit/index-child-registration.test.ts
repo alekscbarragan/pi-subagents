@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
-import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/wait.ts";
+import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/subagent-wait.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../../src/runs/shared/pi-args.ts";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -164,7 +164,7 @@ describe("subagent extension child mode", () => {
 		);
 	});
 
-	it("honors waitTool disabled config for the registered wait tool", () => {
+	it("registers only subagent_wait and honors waitTool disabled config", () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-wait-tool-config-"));
 		try {
 			const configDir = path.join(agentDir, "extensions", "subagent");
@@ -174,10 +174,14 @@ describe("subagent extension child mode", () => {
 			const script = String.raw`
 				import registerSubagentExtension from "./src/extension/index.ts";
 				const events = { on() { return () => {}; }, emit() {} };
-				let waitTool;
+				let subagentWaitTool;
+				let legacyWaitRegistered = false;
 				const fakePi = new Proxy({
 					events,
-					registerTool(tool) { if (tool.name === "wait") waitTool = tool; },
+					registerTool(tool) {
+						if (tool.name === "subagent_wait") subagentWaitTool = tool;
+						if (tool.name === "wait") legacyWaitRegistered = true;
+					},
 					registerCommand() {},
 					registerShortcut() {},
 					registerMessageRenderer() {},
@@ -190,8 +194,9 @@ describe("subagent extension child mode", () => {
 					},
 				});
 				registerSubagentExtension(fakePi);
-				if (!waitTool) throw new Error("wait tool not registered");
-				const result = await waitTool.execute("wait-disabled", {}, new AbortController().signal, undefined, {});
+				if (!subagentWaitTool) throw new Error("subagent_wait tool not registered");
+				if (legacyWaitRegistered) throw new Error("legacy wait tool must not be registered");
+				const result = await subagentWaitTool.execute("subagent-wait-disabled", {}, new AbortController().signal, undefined, {});
 				process.stdout.write(JSON.stringify(result.content[0].text));
 			`;
 
@@ -213,6 +218,85 @@ describe("subagent extension child mode", () => {
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
+	});
+
+	it("does not restore the async widget from tool results when asyncWidget is disabled", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-async-widget-config-"));
+		try {
+			const configDir = path.join(agentDir, "extensions", "subagent");
+			fs.mkdirSync(configDir, { recursive: true });
+			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ asyncWidget: false }), "utf-8");
+			const script = String.raw`
+				import registerSubagentExtension from "./src/extension/index.ts";
+				const eventHandlers = new Map();
+				const handlers = new Map();
+				const events = { on(channel, handler) { eventHandlers.set(channel, handler); return () => {}; }, emit() {} };
+				const fakePi = new Proxy({
+					events,
+					on(channel, handler) { handlers.set(channel, handler); },
+					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+					sendMessage() {}, getSessionName() { return undefined; },
+				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				const widgets = [];
+				const ctx = {
+					cwd: process.cwd(), hasUI: true,
+					ui: { setWidget(_key, value) { widgets.push(value); }, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
+					sessionManager: { getSessionId() { return "session-widget"; }, getSessionFile() { return null; }, getEntries() { return []; } },
+					modelRegistry: { getAvailable() { return []; } },
+				};
+				registerSubagentExtension(fakePi);
+				handlers.get("session_start")({}, ctx);
+				widgets.length = 0;
+				eventHandlers.get("subagent:async-started")({ id: "widget-run", pid: 1, sessionId: "session-widget", mode: "single", agent: "worker", asyncDir: "/tmp/widget-run" });
+				handlers.get("tool_result")({ toolName: "subagent" }, ctx);
+				if (widgets.length < 2 || widgets.some((value) => value !== undefined)) throw new Error("async widget rendered despite disabled config: " + JSON.stringify(widgets));
+				handlers.get("session_shutdown")();
+			`;
+			const env = parentToolEnv();
+			env.PI_CODING_AGENT_DIR = agentDir;
+			execFileSync(process.execPath, ["--experimental-transform-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("registers the main watchdog command and renderer in parent mode", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./src/extension/index.ts";
+			const events = { on() { return () => {}; }, emit() {} };
+			const commands = [];
+			const renderers = [];
+			const fakePi = new Proxy({
+				events,
+				registerTool() {},
+				registerCommand(name) { commands.push(name); },
+				registerShortcut() {},
+				registerMessageRenderer(type) { renderers.push(type); },
+				sendMessage() {},
+				getSessionName() { return undefined; },
+			}, {
+				get(target, prop) {
+					if (prop in target) return target[prop];
+					return () => undefined;
+				},
+			});
+			registerSubagentExtension(fakePi);
+			if (!commands.includes("subagents-watchdog")) throw new Error("watchdog command not registered: " + commands.join(", "));
+			if (!renderers.includes("subagent_watchdog_warning")) throw new Error("watchdog renderer not registered: " + renderers.join(", "));
+		`;
+
+		execFileSync(
+			process.execPath,
+			[
+				"--experimental-transform-types",
+				"--import",
+				"./test/support/register-loader.mjs",
+				"--input-type=module",
+				"--eval",
+				script,
+			],
+			{ cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" },
+		);
 	});
 
 	it("returns before registering anything for non-fanout children", () => {

@@ -46,6 +46,7 @@ describe("registered subagent tool description", () => {
 		assert.doesNotMatch(description, /omit for async\/background runs/i);
 		assert.match(description, /SAFETY-CRITICAL SUBAGENT GUIDANCE/);
 		assert.match(description, /Do not sleep or poll status just to wait/i);
+		assert.match(description, /use subagent_wait/i);
 		assert.match(description, /ordinary child subagents are not orchestrators/i);
 		assert.match(description, /keep one writer/i);
 		assert.match(description, /view: "fleet"/);
@@ -56,6 +57,18 @@ describe("registered subagent tool description", () => {
 		assert.match(description, /action: "disable"/);
 		assert.match(description, /status\.json/);
 		assert.match(description, /events\.jsonl/);
+		// Chain quick-reference: both sequential and parallel fan-out examples (#417)
+		assert.match(description, /CHAIN EXAMPLES/i);
+		assert.match(
+			description,
+			/chain:\s*\[\s*\{\s*agent:\s*"[\w-]+",\s*task:\s*"[^"]*"\s*\}\s*,\s*\{\s*agent:\s*"[\w-]+",\s*task:\s*"[^"]*\{previous\}[^"]*"\s*\}\s*\]/,
+			"full mode should show a sequential chain example using {previous}",
+		);
+		assert.match(
+			description,
+			/\{\s*parallel:\s*\[\s*\{\s*agent:\s*"[\w-]+",\s*task:\s*"[^"]*",\s*count:\s*\d+\s*\}\s*\]\s*\}/,
+			"full mode should show a parallel fan-out chain example with count",
+		);
 	});
 
 	it("offers a compact mode that keeps safety-critical guidance", () => {
@@ -67,7 +80,7 @@ describe("registered subagent tool description", () => {
 		assert.match(description, /PARALLEL/);
 		assert.match(description, /CHAIN/);
 		assert.match(description, /action without execution fields/i);
-		assert.match(description, /wait tool/i);
+		assert.match(description, /subagent_wait/i);
 		assert.match(description, /Do not sleep or poll/i);
 		assert.match(description, /ordinary child subagents are not orchestrators/i);
 		assert.match(description, /one writer/i);
@@ -79,6 +92,11 @@ describe("registered subagent tool description", () => {
 		assert.match(description, /disable/);
 		assert.match(description, /status\.json/);
 		assert.match(description, /events\.jsonl/);
+		// Compact mode keeps a chain quick-reference too (#417)
+		assert.match(description, /chain example/i);
+		assert.match(description, /\{previous\}/);
+		assert.match(description, /parallel:/);
+		assert.match(description, /count:/);
 	});
 
 	it("renders a custom project description with placeholders and mandatory safety guidance", () => {

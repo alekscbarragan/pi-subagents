@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	type AssistantMessage,
 	type Context,
@@ -34,6 +34,8 @@ export interface RealSessionRunOptions {
 	childText: string;
 	respond: FauxResponder;
 	timeoutMs?: number;
+	projectFiles?: Record<string, string>;
+	reportChildTools?: boolean;
 }
 
 export interface RealSessionRun {
@@ -111,38 +113,59 @@ function createModelRegistry(model: { provider: string; id: string }) {
 	};
 }
 
-function installChildPiShim(childText: string): () => void {
+function installChildPiShim(childText: string, reportChildTools = false): () => void {
 	const rootDir = mkdtempSync(path.join(os.tmpdir(), "pi-real-session-cli-"));
 	const binDir = path.join(rootDir, "bin");
+	const piPackageDir = path.join(rootDir, "pi-package");
+	const childCliPath = path.join(piPackageDir, "dist", "cli.mjs");
 	const previousPath = process.env.PATH;
+	const previousPiBinary = process.env.PI_SUBAGENT_PI_BINARY;
 	const previousChildText = process.env.PI_SUBAGENTS_E2E_CHILD_TEXT;
+	const previousReportTools = process.env.PI_SUBAGENTS_E2E_REPORT_CHILD_TOOLS;
 	const previousArgv1 = process.argv[1];
 
 	writeFileSync(path.join(rootDir, ".keep"), "");
 	mkdirSync(binDir, { recursive: true });
+	mkdirSync(path.dirname(childCliPath), { recursive: true });
+	writeFileSync(childCliPath, `import ${JSON.stringify(pathToFileURL(CHILD_CLI_PATH).href)};\n`);
+	writeFileSync(
+		path.join(piPackageDir, "package.json"),
+		JSON.stringify({ name: "@earendil-works/pi-coding-agent" }),
+	);
 	writeFileSync(
 		path.join(binDir, "pi"),
-		`#!/bin/sh\nexec "${process.execPath}" "${CHILD_CLI_PATH}" "$@"\n`,
+		`#!/bin/sh\nexec "${process.execPath}" "${childCliPath}" "$@"\n`,
 		{ mode: 0o755 },
 	);
 	writeFileSync(
 		path.join(binDir, "pi.cmd"),
-		`@echo off\r\n"${process.execPath}" "${CHILD_CLI_PATH}" %*\r\n`,
+		`@echo off\r\n"${process.execPath}" "${childCliPath}" %*\r\n`,
 	);
 
 	process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+	if (process.platform === "win32") {
+		delete process.env.PI_SUBAGENT_PI_BINARY;
+		process.argv[1] = childCliPath;
+	} else {
+		process.env.PI_SUBAGENT_PI_BINARY = path.join(binDir, "pi");
+	}
 	process.env.PI_SUBAGENTS_E2E_CHILD_TEXT = childText;
-	if (process.platform === "win32") process.argv[1] = CHILD_CLI_PATH;
+	if (reportChildTools) process.env.PI_SUBAGENTS_E2E_REPORT_CHILD_TOOLS = "1";
+	else delete process.env.PI_SUBAGENTS_E2E_REPORT_CHILD_TOOLS;
 
 	return () => {
 		if (previousPath === undefined) delete process.env.PATH;
 		else process.env.PATH = previousPath;
-		if (previousChildText === undefined) delete process.env.PI_SUBAGENTS_E2E_CHILD_TEXT;
-		else process.env.PI_SUBAGENTS_E2E_CHILD_TEXT = previousChildText;
+		if (previousPiBinary === undefined) delete process.env.PI_SUBAGENT_PI_BINARY;
+		else process.env.PI_SUBAGENT_PI_BINARY = previousPiBinary;
 		if (process.platform === "win32") {
 			if (previousArgv1 === undefined) delete process.argv[1];
 			else process.argv[1] = previousArgv1;
 		}
+		if (previousChildText === undefined) delete process.env.PI_SUBAGENTS_E2E_CHILD_TEXT;
+		else process.env.PI_SUBAGENTS_E2E_CHILD_TEXT = previousChildText;
+		if (previousReportTools === undefined) delete process.env.PI_SUBAGENTS_E2E_REPORT_CHILD_TOOLS;
+		else process.env.PI_SUBAGENTS_E2E_REPORT_CHILD_TOOLS = previousReportTools;
 		rmSync(rootDir, { recursive: true, force: true });
 	};
 }
@@ -173,7 +196,7 @@ export async function runRealSubagentSession(options: RealSessionRunOptions): Pr
 		["PI_SUBAGENT_PI_BINARY", process.env.PI_SUBAGENT_PI_BINARY],
 		["PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT", process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT],
 	]);
-	const uninstallChildPi = installChildPiShim(options.childText);
+	const uninstallChildPi = installChildPiShim(options.childText, options.reportChildTools);
 	let session: AgentSession | undefined;
 	let faux: ReturnType<typeof registerFauxProvider> | undefined;
 	let disposed = false;
@@ -208,8 +231,13 @@ export async function runRealSubagentSession(options: RealSessionRunOptions): Pr
 		delete process.env.PI_SUBAGENT_DEPTH;
 		delete process.env.PI_SUBAGENT_MAX_DEPTH;
 		delete process.env.PI_SUBAGENT_PARENT_SESSION;
-		delete process.env.PI_SUBAGENT_PI_BINARY;
 		delete process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT;
+		for (const [relativePath, content] of Object.entries(options.projectFiles ?? {})) {
+			const target = path.resolve(cwd, relativePath);
+			if (target !== cwd && !target.startsWith(`${cwd}${path.sep}`)) throw new Error(`E2E project file escapes cwd: ${relativePath}`);
+			mkdirSync(path.dirname(target), { recursive: true });
+			writeFileSync(target, content, "utf-8");
+		}
 
 		faux = registerFauxProvider({
 			provider: "faux-e2e-parent",
