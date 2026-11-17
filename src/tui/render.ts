@@ -1,37 +1,111 @@
-/**
- * Rendering functions for subagent results
- */
-
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { getMarkdownTheme, keyText, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { unresolvedChildWatchdogBlockers } from "../watchdog/child-status.ts";
 import {
 	type AgentProgress,
 	type AsyncJobState,
 	type AsyncJobStep,
 	type AsyncParallelGroupStatus,
+	type AsyncWidgetLayout,
 	type Details,
+	type HostStepState,
+	type HostStepVerdict,
 	type NestedRunSummary,
 	type NestedStepSummary,
+	type WorkflowGraphNode,
 	type WorkflowNodeStatus,
+	type MainWindowRendererConfig,
 	MAX_WIDGET_JOBS,
+	WIDGET_ANIMATION_INTERVAL_MS,
 	WIDGET_KEY,
 } from "../shared/types.ts";
-import { formatTokens, formatUsage, formatDuration, formatModelThinking, formatToolCall, shortenPath } from "../shared/formatters.ts";
-import { getDisplayItems, getSingleResultOutput } from "../shared/utils.ts";
+import { previewDisplayText, sanitizeDisplayText, truncateDisplayText } from "../shared/display-text.ts";
+import { formatShortcutLabel } from "../shared/shortcuts.ts";
+import { formatContextUsage, formatTokens, formatUsage, formatDuration, formatModelThinking, formatToolCall, formatTokenUsage, shortenPath } from "../shared/formatters.ts";
+import { getDisplayItems, getSingleResultOutput, PROMPT_REDACTED } from "../shared/utils.ts";
 import { flatToLogicalStepIndex } from "../runs/background/parallel-groups.ts";
 import { formatNestedAggregate } from "../runs/shared/nested-render.ts";
-import { aggregateStepStatus, formatActivityLabel, formatAgentRunningLabel, formatParallelOutcome } from "../shared/status-format.ts";
+import { aggregateStepStatus, formatActivityAge, formatActivityLabel, formatAgentRunningLabel, formatParallelOutcome } from "../shared/status-format.ts";
+import { contextModeBadge, contextModePrefix } from "../runs/shared/context-mode.ts";
+import { shouldSuppressSingleStep, stripRepeatedAgentPrefix, withDuplicateLabelDiscriminators } from "./render-helpers.ts";
+import { runningTone } from "./running-tone.ts";
+import { childThinkingLevel, type ThinkingLevel } from "../shared/model-info.ts";
+import { buildWorkflowChatProgressRows, type WorkflowChatProgressRow } from "../workflows/chat-progress.ts";
+import { formatWorkflowPreflight, formatWorkflowPreflightPlanSummary, formatWorkflowPreflightWarningSummary, formatWorkflowPreflightWarnings } from "../workflows/workflow-preflight.ts";
+import { encodeAsyncStatusSnapshotWidget } from "../runs/background/async-status-snapshot.ts";
+import { projectAsyncWorkflowRows, type AsyncStatusWorkflowRow } from "../runs/shared/async-status-projection.ts";
+import { hostStepReportName, hostStepVerdictLabel } from "../runs/shared/host-step-status.ts";
+import { workflowGraphStageNodes } from "../runs/shared/workflow-graph.ts";
+import { formatWorkflowChecklistBottleneck, formatWorkflowChecklistPhase, formatWorkflowChecklistSummary, projectWorkflowChecklist, type WorkflowChecklistItem, type WorkflowChecklistProjection, type WorkflowChecklistState, type WorkflowChecklistStep } from "../workflows/workflow-checklist.ts";
 
 type Theme = ExtensionContext["ui"]["theme"];
 
-function liveDetailKeyText(): string {
-	return keyText("app.tools.expand");
+interface WorkflowWidgetProjection {
+	now: number;
+	inlineFleetCovered?: boolean;
+	children?: AsyncJobState[];
+	materializedKeys?: Set<string>;
+	stages: WorkflowGraphNode[];
+	steps: AsyncJobStep[];
+	stageProgress?: { total: number; current?: number };
+	plannedKeys?: Set<string>;
+	checklist?: WorkflowChecklistProjection;
 }
 
-function liveDetailHintText(): string {
-	return `Press ${liveDetailKeyText()} for live detail`;
+type WorkflowWidgetProjectionLookup = (job: AsyncJobState) => WorkflowWidgetProjection;
+
+interface MainWindowRenderLayout {
+	horizontalSpacing: number;
+	compactResultMaxLines?: number;
+}
+
+function resolveMainWindowRenderLayout(config?: MainWindowRendererConfig): MainWindowRenderLayout {
+	return {
+		horizontalSpacing: config?.horizontalSpacing ?? 2,
+		...(config?.compactResultMaxLines !== undefined ? { compactResultMaxLines: config.compactResultMaxLines } : {}),
+	};
+}
+
+function mainWindowIndent(layout: MainWindowRenderLayout, level: number): string {
+	return " ".repeat(Math.max(0, layout.horizontalSpacing * level));
+}
+
+function capCompactMainWindowResult(component: Component, layout: MainWindowRenderLayout, theme: Theme, enabled: boolean): Component {
+	const maxLines = layout.compactResultMaxLines;
+	if (!enabled || maxLines === undefined) return component;
+	const capped = new Container();
+	capped.render = (width: number): string[] => {
+		const lines = component.render(width);
+		if (lines.length <= maxLines) return lines;
+		const visibleRows = maxLines === 1 ? 1 : maxLines - 1;
+		const hiddenCount = lines.length - visibleRows;
+		const hint = theme.fg("accent", `… ${hiddenCount} rows hidden · ${expandKeyHint("to expand")}`);
+		if (maxLines === 1) return [truncLine(`${lines[0] ?? ""} ${hint}`, width)];
+		return [...lines.slice(0, visibleRows), truncLine(hint, width)];
+	};
+	return capped;
+}
+
+function expandKeyHint(action: string): string {
+	// keyText is empty wherever Pi's app keybindings are not loaded (RPC, print mode), even when the key is bound.
+	return `Press ${keyText("app.tools.expand") || "the expand key"} ${action}`;
+}
+
+export function liveDetailHintText(): string {
+	return expandKeyHint("for live detail");
+}
+
+function workflowDetailHintText(): string {
+	return expandKeyHint("for details");
+}
+
+function foregroundSingleHintText(shortcut?: string): string {
+	if (!shortcut) return liveDetailHintText();
+	const label = formatShortcutLabel(shortcut);
+	return `${liveDetailHintText()} · ${label} to run in background`;
 }
 
 function getTermWidth(): number {
@@ -39,6 +113,7 @@ function getTermWidth(): number {
 }
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const ansiStylePattern = /\x1b\[[0-9;]*m/y;
 
 /**
  * Truncate a line to maxWidth, preserving ANSI styling through the ellipsis.
@@ -49,7 +124,8 @@ const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
  * 
  * Uses Intl.Segmenter for proper Unicode/emoji handling (not char-by-char).
  */
-function truncLine(text: string, maxWidth: number): string {
+export function truncLine(text: string, maxWidth: number): string {
+	if (maxWidth <= 0) return "";
 	if (visibleWidth(text) <= maxWidth) return text;
 
 	const targetWidth = maxWidth - 1;
@@ -59,7 +135,8 @@ function truncLine(text: string, maxWidth: number): string {
 	let i = 0;
 
 	while (i < text.length) {
-		const ansiMatch = text.slice(i).match(/^\x1b\[[0-9;]*m/);
+		ansiStylePattern.lastIndex = i;
+		const ansiMatch = ansiStylePattern.exec(text);
 		if (ansiMatch) {
 			const code = ansiMatch[0];
 			result += code;
@@ -73,15 +150,13 @@ function truncLine(text: string, maxWidth: number): string {
 			continue;
 		}
 
-		let end = i;
-		while (end < text.length && !text.slice(end).match(/^\x1b\[[0-9;]*m/)) {
-			end++;
-		}
-
+		let end = text.indexOf("\x1b[", i);
+		if (end === i) end = text.indexOf("\x1b[", i + 2);
+		if (end === -1) end = text.length;
 		const textPortion = text.slice(i, end);
 		for (const seg of segmenter.segment(textPortion)) {
 			const grapheme = seg.segment;
-			const graphemeWidth = visibleWidth(grapheme);
+			const graphemeWidth = grapheme === "\x1b" ? 0 : visibleWidth(grapheme);
 
 			if (currentWidth + graphemeWidth > targetWidth) {
 				return result + activeStyles.join("") + "…";
@@ -109,6 +184,7 @@ function wrapPlainText(text: string, maxWidth: number): string[] {
 		for (const seg of segmenter.segment(rawLine)) {
 			const grapheme = seg.segment;
 			const graphemeWidth = visibleWidth(grapheme);
+			if (graphemeWidth > maxWidth) continue;
 			if (currentWidth > 0 && currentWidth + graphemeWidth > maxWidth) {
 				lines.push(current);
 				current = grapheme;
@@ -140,6 +216,11 @@ function runningSeed(...values: Array<number | undefined>): number | undefined {
 function runningGlyph(seed?: number): string {
 	if (seed === undefined) return STATIC_RUNNING_GLYPH;
 	return RUNNING_FRAMES[Math.abs(seed) % RUNNING_FRAMES.length]!;
+}
+
+function animatedSeed(seed: number | undefined, frame: number | undefined): number | undefined {
+	if (frame === undefined) return seed;
+	return (seed ?? 0) + frame;
 }
 
 function progressRunningSeed(progress: ProgressSeedSource | undefined): number | undefined {
@@ -193,10 +274,589 @@ function getToolCallLines(
 	return result.toolCalls?.map((toolCall) => expanded ? toolCall.expandedText : toolCall.text) ?? [];
 }
 
+const ansiEscapePattern = /\x1b\[[0-9;]*m/g;
+const noisyStatusPatterns = [
+	/^(?:i|we)\s+(?:will|need|can|should|am|are)\b/i,
+	/^i(?:'m|’m| am)\b/i,
+	/\bso i (?:will|need|can)\b/i,
+	/^(?:checking|fetching|reading|inspecting|verifying|collecting|confirming|polling)\b/i,
+	/^(?:async\s+subagent\s+)?[\w.-]+\s*·\s*(?:step|agent)\s+\d+\/\d+\s*·/i,
+	/^(?:Step|Agent)\s+\d+\/\d+:\s+[\w.-]+\s*·\s*(?:running|queued|pending|complete|completed)\b/i,
+	/^(?:async\s+subagent\s+)?[\w.-]+(?:\s+\[(?:fresh|fork|mixed)\])?\s*·\s*(?:running|queued|pending|complete|completed|done)\b/i,
+	/^Press\s+\S+\s+for\s+live\s+detail$/i,
+	/^output:\s+.+\/async-subagent-runs\//i,
+];
+const liveOutputWordSignalPattern = /\b(?:access denied|denied|error|exception|fail(?:ed|ure)?|fatal|panic|rejected|timeout|timed out|unable|warning)\b/i;
+const liveOutputCodeSignalPattern = /\bE[A-Z0-9_]{2,}\b/;
+
+function oneLine(text: string): string {
+	return text.replace(ansiEscapePattern, "").replace(/\s+/g, " ").trim();
+}
+
+const COMPACT_TASK_MAX_CHARS = 96;
+
+/** Display label for a child run: the derived session name (agent + task
+ *  excerpt) when the launcher provided one, else the bare agent name. */
+function childDisplayName(result: { agent?: string; sessionName?: string } | undefined, fallback = "subagent"): string {
+	return result?.sessionName?.trim() || result?.agent || fallback;
+}
+
+export function compactTaskText(task: string | undefined, label?: string): string | undefined {
+	const taskText = task?.trim();
+	const labelText = label?.trim();
+	const normalizedTask = taskText && taskText !== PROMPT_REDACTED ? oneLine(taskText) : "";
+	const normalizedLabel = labelText && labelText !== PROMPT_REDACTED ? oneLine(labelText) : "";
+	const normalized = normalizedLabel && normalizedTask && normalizedLabel !== normalizedTask
+		? `${normalizedLabel} — ${normalizedTask}`
+		: normalizedLabel || normalizedTask;
+	if (!normalized) return undefined;
+	return previewDisplayText(normalized, COMPACT_TASK_MAX_CHARS);
+}
+
+const EXPANDED_TASK_MAX_LINES = 8;
+
+/** Runs on every spinner frame, so the task is cut to what the line cap can show before any sanitizing or wrapping. */
+function expandedTaskLines(task: string | undefined, label: string | undefined, width: number): string[] | undefined {
+	const taskText = task?.trim();
+	if (!taskText || taskText === PROMPT_REDACTED || width <= 0) return undefined;
+	const shown = truncateDisplayText(taskText, EXPANDED_TASK_MAX_LINES * width);
+	const labelText = label?.trim() && label.trim() !== PROMPT_REDACTED ? sanitizeDisplayText(label) : "";
+	const head = labelText && labelText !== sanitizeDisplayText(shown) ? `${labelText} — ` : "";
+	const lines: string[] = [];
+	for (const rawLine of `task: ${head}${shown}`.split("\n")) {
+		const content = sanitizeDisplayText(rawLine);
+		if (!content) {
+			if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
+			continue;
+		}
+		const indent = rawLine.match(/^[ \t]*/)![0].replace(/\t/g, "  ").slice(0, Math.floor(width / 2));
+		for (const part of wrapPlainText(content, width - indent.length)) lines.push(`${indent}${part}`);
+		if (lines.length > EXPANDED_TASK_MAX_LINES) break;
+	}
+	if (lines.length <= EXPANDED_TASK_MAX_LINES && shown.length === taskText.length) return lines;
+	return [...lines.slice(0, EXPANDED_TASK_MAX_LINES), "…"];
+}
+
+export interface AsyncLaneProjection {
+	label?: string;
+	role: string;
+	phase?: string;
+	state: AsyncJobState["status"] | AsyncJobStep["status"];
+	gate?: string;
+	next?: string;
+	output?: string;
+	workspace?: string;
+	ref: string;
+	chips: string[];
+}
+
+const LANE_VALUE_MAX_CHARS = 48;
+
+function boundedLaneValue(value: string | undefined, maxChars = LANE_VALUE_MAX_CHARS): string | undefined {
+	if (!value?.trim() || value.trim() === PROMPT_REDACTED) return undefined;
+	return previewDisplayText(oneLine(value), maxChars);
+}
+
+function workflowNodeStepStatus(status: WorkflowNodeStatus): AsyncJobStep["status"] {
+	switch (status) {
+		case "completed":
+			return "completed";
+		case "detached":
+			return "paused";
+		default:
+			return status;
+	}
+}
+
+function workflowNodeStatusLabel(status: WorkflowNodeStatus): string {
+	switch (status) {
+		case "completed":
+			return "complete";
+		case "detached":
+			return "paused";
+		default:
+			return status;
+	}
+}
+
+function workflowStepPriority(step: AsyncJobStep, currentNodeId?: string): number {
+	const isCurrent = step.workflowKey === currentNodeId;
+	if (step.status === "running" || (isCurrent && step.status !== "complete" && step.status !== "completed")) return 0;
+	const gate = laneGate(step);
+	if (
+		step.status === "failed"
+		|| step.status === "partial"
+		|| step.status === "paused"
+		|| step.status === "stopped"
+		|| step.status === "rejected"
+		|| step.toolBudgetBlocked === true
+		|| step.turnBudgetExceeded === true
+		|| step.activityState === "needs_attention"
+		|| step.watchdog?.phase === "stale"
+		|| unresolvedChildWatchdogBlockers(step.watchdog).length > 0
+		|| gate !== undefined
+	) return 1;
+	if (step.status === "pending") return 2;
+	return 3;
+}
+
+/** Merge materialized child rows with the planned workflow stages for rendering. */
+function workflowWidgetSteps(job: AsyncJobState, planned = job.mode === "workflow" ? workflowGraphStageNodes(job.workflowGraph) : []): AsyncJobStep[] {
+	const loaded = job.steps ?? [];
+	if (planned.length === 0) return loaded;
+
+	const loadedIndexesByKey = new Map<string, number[]>();
+	for (const [index, step] of loaded.entries()) {
+		if (!step.workflowKey) continue;
+		const indexes = loadedIndexesByKey.get(step.workflowKey) ?? [];
+		indexes.push(index);
+		loadedIndexesByKey.set(step.workflowKey, indexes);
+	}
+	const consumed = new Set<number>();
+	const entries: Array<{ step: AsyncJobStep; order: number }> = [];
+	for (const [order, node] of planned.entries()) {
+		const loadedIndex = loadedIndexesByKey.get(node.id)?.find((index) => !consumed.has(index));
+		if (loadedIndex !== undefined) {
+			consumed.add(loadedIndex);
+			const loadedStep = loaded[loadedIndex]!;
+			entries.push({
+				step: {
+					...loadedStep,
+					index: node.flatIndex ?? loadedStep.index ?? order,
+					agent: loadedStep.agent || node.agent || job.agents?.[0] || "workflow",
+					phase: loadedStep.phase ?? node.phase,
+					label: loadedStep.label ?? node.label,
+					workflowKey: loadedStep.workflowKey ?? node.id,
+					...(loadedStep.outputName === undefined && node.outputName !== undefined ? { outputName: node.outputName } : {}),
+					...(loadedStep.structured === undefined && node.structured !== undefined ? { structured: node.structured } : {}),
+					...(loadedStep.error === undefined && node.error !== undefined ? { error: node.error } : {}),
+				},
+				order,
+			});
+			continue;
+		}
+		entries.push({
+			step: {
+				index: node.flatIndex ?? order,
+				agent: node.agent ?? job.agents?.[0] ?? "workflow",
+				status: workflowNodeStepStatus(node.status),
+				workflowKey: node.id,
+				label: node.label,
+				...(node.phase ? { phase: node.phase } : {}),
+				...(node.outputName ? { outputName: node.outputName } : {}),
+				...(node.structured !== undefined ? { structured: node.structured } : {}),
+				...(node.error ? { error: node.error } : {}),
+			},
+			order,
+		});
+	}
+	for (const [index, step] of loaded.entries()) {
+		if (!consumed.has(index)) entries.push({ step, order: planned.length + index });
+	}
+	entries.sort((left, right) => workflowStepPriority(left.step, job.workflowGraph?.currentNodeId) - workflowStepPriority(right.step, job.workflowGraph?.currentNodeId) || left.order - right.order);
+	return entries.map(({ step }) => step);
+}
+
+function workflowStageProgress(job: AsyncJobState, stages = job.mode === "workflow" ? workflowGraphStageNodes(job.workflowGraph) : []): { total: number; current?: number } | undefined {
+	if (job.mode !== "workflow") return undefined;
+	if (stages.length === 0) return undefined;
+	const currentId = job.workflowGraph?.currentNodeId;
+	const currentIndex = currentId ? stages.findIndex((stage) => stage.id === currentId) : -1;
+	if (currentIndex >= 0 && stages[currentIndex]?.status !== "completed") return { total: stages.length, current: currentIndex };
+	const runningIndex = stages.findIndex((stage) => stage.status === "running");
+	if (runningIndex >= 0) return { total: stages.length, current: runningIndex };
+	const indexedStage = job.currentStep !== undefined && job.currentStep >= 0 ? stages[job.currentStep] : undefined;
+	if (indexedStage && indexedStage.status !== "completed") return { total: stages.length, current: job.currentStep };
+	if (stages.every((stage) => stage.status === "completed")) return { total: stages.length, current: stages.length - 1 };
+	return { total: stages.length };
+}
+
+function buildWorkflowWidgetProjection(job: AsyncJobState, now = Date.now()): WorkflowWidgetProjection {
+	const stages = job.mode === "workflow" ? workflowGraphStageNodes(job.workflowGraph) : [];
+	const stageProgress = workflowStageProgress(job, stages);
+	const clock = job.status === "running" ? now : job.updatedAt;
+	const loadedSteps = workflowWidgetSteps(job, stages);
+	const steps = job.mode === "workflow" ? loadedSteps.map((step) => step.status === "running" && step.startedAt !== undefined && clock !== undefined
+		? { ...step, durationMs: Math.max(0, clock - step.startedAt) } : step) : loadedSteps;
+	const projection: WorkflowWidgetProjection = { stages, steps, now };
+	if (stageProgress) projection.stageProgress = stageProgress;
+	if (stages.length) projection.plannedKeys = new Set(stages.map((node) => node.id));
+	if (job.mode === "workflow") {
+		const checklist = projectWorkflowChecklist({
+			graph: job.workflowGraph,
+			steps: job.steps,
+			hostSteps: job.hostSteps,
+			preflight: job.preflight,
+			trace: job.workflow?.trace,
+			now: clock,
+		});
+		if (checklist.total > 0) projection.checklist = checklist;
+	}
+	return projection;
+}
+
+function workflowWidgetProjectionLookup(now = Date.now(), childrenByParent = new Map<string, AsyncJobState[]>()): WorkflowWidgetProjectionLookup {
+	const projections = new WeakMap<AsyncJobState, WorkflowWidgetProjection>();
+	return (job: AsyncJobState) => {
+		const cached = projections.get(job);
+		if (cached) return cached;
+		const projection = buildWorkflowWidgetProjection(job, now);
+		const children = childrenByParent.get(job.asyncId);
+		if (children?.length) {
+			projection.children = children;
+			projection.materializedKeys = new Set(children.flatMap((child) => [child.asyncId, ...(child.workflowKey ? [child.workflowKey] : [])]));
+			for (const step of projection.steps) {
+				if (step.runId && projection.materializedKeys.has(step.runId) && step.workflowKey) projection.materializedKeys.add(step.workflowKey);
+			}
+		}
+		projections.set(job, projection);
+		return projection;
+	};
+}
+
+function laneStepForJob(job: AsyncJobState, steps = workflowWidgetSteps(job)): AsyncJobStep | undefined {
+	if (steps.length === 0) return undefined;
+	const graphCurrent = job.workflowGraph?.currentNodeId;
+	if (graphCurrent) {
+		const current = steps.find((step) => step.workflowKey === graphCurrent);
+		if (current) return current;
+	}
+	if (job.currentStep !== undefined) {
+		const current = steps[job.currentStep];
+		if (current && (current.index === undefined || current.index === job.currentStep)) return current;
+		// Active parallel groups retain flat indices while exposing only the group slice.
+		const indexedCurrent = steps.find((step) => step.index === job.currentStep);
+		if (indexedCurrent) return indexedCurrent;
+		return steps[0];
+	}
+	return steps.find((step) => step.status === "running")
+		?? steps.find((step) => step.status === "pending")
+		?? steps.at(-1);
+}
+
+function laneTraceForJob(job: AsyncJobState): NonNullable<AsyncJobState["workflow"]>["trace"][number] | undefined {
+	return Array.isArray(job.workflow?.trace) ? job.workflow.trace.at(-1) : undefined;
+}
+
+function laneGate(step: AsyncJobStep | undefined): string | undefined {
+	const review = step?.review?.status ?? step?.acceptance?.reviewResult?.status;
+	if (review === "blockers") return "review blockers";
+	if (review === "review-required") return "review required";
+	if (review === "reviewed") return "reviewed";
+	const acceptance = step?.acceptance?.status;
+	if (acceptance === "review-required") return "acceptance review";
+	if (acceptance === "checked" || acceptance === "verified" || acceptance === "accepted") return "acceptance";
+	return undefined;
+}
+
+function laneNextAction(state: AsyncLaneProjection["state"], step: AsyncJobStep | undefined, output: string | undefined, gate: string | undefined): string | undefined {
+	if (unresolvedChildWatchdogBlockers(step?.watchdog).length > 0) return "resolve watchdog blockers";
+	if (step?.watchdog?.phase === "stale") return "inspect stale state";
+	if (step?.toolBudgetBlocked === true || step?.turnBudgetExceeded === true) return "inspect blocked state";
+	if (gate === "review blockers") return "resolve review blockers";
+	if (gate === "review required" || gate === "acceptance review") return "review output";
+	if (step?.activityState === "needs_attention") return "inspect attention";
+	if (state === "queued" || state === "pending") return "await launch";
+	if (state === "failed" || state === "rejected") return "inspect failure";
+	if (state === "partial") return "inspect partial state";
+	if (state === "paused") return "inspect paused state";
+	if (state === "stopped") return "inspect stopped state";
+	if ((state === "complete" || state === "completed") && gate === "reviewed") return "ready";
+	if ((state === "complete" || state === "completed") && output) return "inspect output";
+	return undefined;
+}
+
+function isTerminalLaneState(state: AsyncJobState["status"]): boolean {
+	return state !== "queued" && state !== "running";
+}
+
+/** Project already-loaded async status facts into one bounded, render-only lane row. */
+export function projectAsyncLane(job: AsyncJobState, ...args: [selectedStep?: AsyncJobStep]): AsyncLaneProjection | undefined {
+	const selectedStep = args.length === 0 ? laneStepForJob(job) : args[0];
+	const trace = laneTraceForJob(job);
+	const workspace = job.cwd ? boundedLaneValue(shortenPath(job.cwd)) : undefined;
+	const label = compactTaskText(selectedStep?.description, selectedStep?.label)
+		?? boundedLaneValue(trace?.label)
+		?? (workspace ? undefined : boundedLaneValue(selectedStep?.workflowKey ?? job.workflowKey));
+	const role = boundedLaneValue(selectedStep?.agent ?? trace?.agent ?? job.agents?.[0] ?? widgetJobName(job), 32) ?? "subagent";
+	const phase = boundedLaneValue(selectedStep?.phase ?? trace?.phase);
+	const gate = laneGate(selectedStep);
+	const output = boundedLaneValue(selectedStep?.outputName);
+	const ref = boundedLaneValue(selectedStep?.workflowKey ?? job.workflowKey ?? job.asyncId.slice(0, 8), 24) ?? job.asyncId.slice(0, 8);
+	const chips = [
+		selectedStep?.context,
+		selectedStep?.structured ? "structured" : undefined,
+		selectedStep?.activityState === "active_long_running" ? "long-running" : undefined,
+		selectedStep?.activityState === "needs_attention" ? "attention" : undefined,
+		selectedStep?.watchdog?.phase === "stale" ? "stale" : undefined,
+		unresolvedChildWatchdogBlockers(selectedStep?.watchdog).length > 0 ? `wd:${unresolvedChildWatchdogBlockers(selectedStep?.watchdog).length}` : undefined,
+		selectedStep?.toolBudgetBlocked === true || selectedStep?.turnBudgetExceeded === true ? "blocked" : undefined,
+	].filter((chip): chip is string => Boolean(chip));
+	const state = isTerminalLaneState(job.status) ? job.status : selectedStep?.status ?? job.status;
+	const next = laneNextAction(state, selectedStep, output, gate);
+	if (!label && !phase && !gate && !output && !selectedStep?.workflowKey && !job.workflowKey && !trace?.label && !trace?.phase) return undefined;
+	return { ...(label ? { label } : {}), role, ...(phase ? { phase } : {}), state, ...(gate ? { gate } : {}), ...(next ? { next } : {}), ...(output ? { output } : {}), ...(workspace ? { workspace } : {}), ref, chips };
+}
+
+function laneStateLabel(state: AsyncLaneProjection["state"], theme: Theme): string {
+	if (state === "running") return theme.fg("accent", "running");
+	if (state === "queued" || state === "pending") return theme.fg("muted", state);
+	if (state === "complete" || state === "completed") return theme.fg("success", "complete");
+	if (state === "failed" || state === "rejected") return theme.fg("error", state === "rejected" ? "rejected" : "failed");
+	return theme.fg("warning", state);
+}
+
+function formatLaneProjection(lane: AsyncLaneProjection, theme: Theme): string {
+	const label = boundedLaneValue(lane.label, 56);
+	const identity = [label, lane.role ? `role:${lane.role}` : undefined].filter(Boolean).join(" · ");
+	return `${identity ? theme.bold(identity) : theme.bold(lane.role)} · ${laneStateLabel(lane.state, theme)}`;
+}
+
+function formatLaneChip(chip: string, theme: Theme): string {
+	const text = `[${chip}]`;
+	if (chip === "blocked") return theme.fg("error", text);
+	if (chip === "stale") return theme.fg("warning", text);
+	return text;
+}
+
+function formatLaneProjectionDetails(lane: AsyncLaneProjection, theme: Theme): string | undefined {
+	const details = [
+		lane.phase ? `phase:${lane.phase}` : undefined,
+		lane.gate ? `gate:${lane.gate}` : undefined,
+		lane.next ? `next:${lane.next}` : undefined,
+		lane.output ? `out:${lane.output}` : undefined,
+		lane.workspace ? `workspace:${lane.workspace}` : lane.ref ? `ref:${lane.ref}` : undefined,
+	].filter(Boolean);
+	const chips = lane.chips.map((chip) => formatLaneChip(chip, theme));
+	return [...(details.length ? [theme.fg("dim", details.join(" · "))] : []), ...chips].join(" · ") || undefined;
+}
+
+function formatLaneProjectionLines(lane: AsyncLaneProjection, theme: Theme, indent: string): string[] {
+	const details = formatLaneProjectionDetails(lane, theme);
+	return [
+		`${indent}${formatLaneProjection(lane, theme)}`,
+		...(details ? [`${indent}  ${details}`] : []),
+	];
+}
+
+function laneRenderKey(job: AsyncJobState, projection?: WorkflowWidgetProjection): unknown {
+	const selectedStep = projection ? laneStepForJob(job, projection.steps) : laneStepForJob(job);
+	const lane = projectAsyncLane(job, selectedStep);
+	return lane ? [lane.label, lane.role, lane.phase, lane.state, lane.gate, lane.next, lane.output, lane.workspace, lane.ref, lane.chips] : undefined;
+}
+
+function widgetLaneDetailLines(job: AsyncJobState, theme: Theme, projection?: WorkflowWidgetProjection): string[] {
+	if (job.steps?.length && (job.mode === "parallel" || job.mode === "chain")) return [];
+	const selectedStep = projection ? laneStepForJob(job, projection.steps) : laneStepForJob(job);
+	const lane = projectAsyncLane(job, selectedStep);
+	return lane ? formatLaneProjectionLines(lane, theme, "  ") : [];
+}
+
+function workflowPreflightLines(job: AsyncJobState): string[] {
+	if (job.mode !== "workflow" || !job.preflight) return [];
+	return [
+		...formatWorkflowPreflight(job.preflight, { indent: "  " }).split("\n"),
+		...(job.workflow?.preflightWarnings ? formatWorkflowPreflightWarnings(job.workflow.preflightWarnings, { indent: "  " }).split("\n") : []),
+	];
+}
+
+function workflowLabelForResult(details: Details, resultIndex: number): string | undefined {
+	const flatIndex = foregroundResultIndex(details, resultIndex);
+	const visit = (nodes: NonNullable<Details["workflowGraph"]>["nodes"]): string | undefined => {
+		for (const node of nodes) {
+			if (node.flatIndex === flatIndex && node.label.trim()) return node.label;
+			const nested = node.children ? visit(node.children) : undefined;
+			if (nested) return nested;
+		}
+		return undefined;
+	};
+	return details.workflowGraph ? visit(details.workflowGraph.nodes) : undefined;
+}
+
+function reportedProgressRow(progress: Pick<AgentProgress, "progressText" | "progressUpdatedAt">, theme: Theme, indent: string, width: number): string | undefined {
+	const text = progress.progressText?.trim();
+	if (!text) return undefined;
+	let updated = "";
+	if (progress.progressUpdatedAt !== undefined) {
+		const age = formatActivityAge(Math.max(0, Date.now() - progress.progressUpdatedAt));
+		updated = age === "now" ? " · updated now" : ` · updated ${age} ago`;
+	}
+	return truncLine(theme.fg("dim", `${indent}progress: ${sanitizeDisplayText(text)}${updated}`), width);
+}
+
+function foregroundProgressForResult(details: Details, resultIndex: number): AgentProgress | undefined {
+	const result = details.results[resultIndex];
+	if (result?.progress) return result.progress;
+	const index = result?.index ?? resultIndex;
+	const indexed = details.progress?.find((progress) => progress.index === index);
+	if (indexed) return indexed;
+	return result?.agent
+		? details.progress?.find((progress) => progress.agent === result.agent && progress.status === "running")
+		: undefined;
+}
+
+function foregroundResultIndex(details: Details, resultIndex: number): number {
+	const result = details.results[resultIndex];
+	if (typeof result?.index === "number") return result.index;
+	return foregroundProgressForResult(details, resultIndex)?.index ?? resultIndex;
+}
+
+function foregroundResultDisplayName(
+	details: Details,
+	resultIndex: number,
+	result: Details["results"][number] | undefined,
+	fallback: string,
+): string {
+	const progress = foregroundProgressForResult(details, resultIndex);
+	const agent = normalizedParallelDisplayText(result?.agent) ?? normalizedParallelDisplayText(progress?.agent);
+	const workflowLabel = normalizedParallelDisplayText(workflowLabelForResult(details, resultIndex));
+	if (workflowLabel) return compactTaskText(undefined, workflowLabel) ?? workflowLabel;
+
+	const sessionName = normalizedParallelDisplayText(result?.sessionName) ?? normalizedParallelDisplayText(progress?.sessionName);
+	if (sessionName) {
+		const sessionTask = stripRepeatedAgentPrefix(sessionName, agent);
+		if (sessionTask && sessionTask !== PROMPT_REDACTED && sessionTask.toLowerCase() !== agent?.toLowerCase()) {
+			return compactTaskText(sessionTask) ?? sessionTask;
+		}
+	}
+
+	return compactTaskText(result?.task) ?? compactTaskText(progress?.task) ?? agent ?? fallback;
+}
+
+function foregroundSingleDisplayName(result: Details["results"][number] | undefined): string {
+	return normalizedParallelDisplayText(result?.agent)
+		?? normalizedParallelDisplayText(result?.sessionName)
+		?? compactTaskText(result?.task)
+		?? "subagent";
+}
+
+function hasLiveOutputSignal(line: string): boolean {
+	const clean = oneLine(line);
+	return liveOutputWordSignalPattern.test(clean) || liveOutputCodeSignalPattern.test(clean);
+}
+
+function isNoisyStatusLine(line: string): boolean {
+	const clean = oneLine(line);
+	return clean.length > 0
+		&& clean.length <= 240
+		&& !hasLiveOutputSignal(clean)
+		&& noisyStatusPatterns.some((pattern) => pattern.test(clean));
+}
+
+function latestActivityText(line: string): string {
+	return oneLine(line)
+		.replace(/^i (?:will|can|need to|am going to)\s+/i, "")
+		.replace(/^i(?:'m|’m| am)\s+/i, "");
+}
+
+function progressUpdateSummary(lines: string[]): string {
+	const counts = new Map<string, number>();
+	for (const line of lines) counts.set(line.toLowerCase(), (counts.get(line.toLowerCase()) ?? 0) + 1);
+	const exactRepeatCount = Math.max(...counts.values());
+	const latest = latestActivityText(lines[lines.length - 1]!);
+	const repeat = exactRepeatCount > 1 ? ` · repeated ${exactRepeatCount}×` : "";
+	return `↻ ${lines.length} progress updates${repeat} · latest: ${latest}`;
+}
+
+function compactRecentOutputLines(recentOutput: string[] | undefined): string[] {
+	const lines: string[] = [];
+	const noisyLines: string[] = [];
+	const otherLines: string[] = [];
+	for (const rawLine of recentOutput ?? []) {
+		const line = oneLine(rawLine);
+		if (!line || line === "(running...)") continue;
+		lines.push(line);
+		(isNoisyStatusLine(line) ? noisyLines : otherLines).push(line);
+	}
+	if (noisyLines.length >= 4 && !otherLines.some(hasLiveOutputSignal)) {
+		if (otherLines.length === 0) {
+			return [
+				progressUpdateSummary(noisyLines),
+				"pattern: repeated short status lines",
+			];
+		}
+		const visibleTail = otherLines.slice(-3);
+		const hiddenSignals = otherLines.slice(0, -3).filter(hasLiveOutputSignal);
+		return [
+			progressUpdateSummary(noisyLines),
+			...(hiddenSignals.length > 0 ? [`… ${hiddenSignals.length} older signal ${hiddenSignals.length === 1 ? "line" : "lines"}: ${hiddenSignals.at(-1)}`] : []),
+			...visibleTail,
+		].slice(0, 5);
+	}
+	if (lines.length <= 5) return lines;
+
+	const tail = lines.slice(-5);
+	const hiddenSignals = lines.slice(0, -5).filter(hasLiveOutputSignal);
+	if (hiddenSignals.length === 0) return tail;
+	return [
+		`… ${hiddenSignals.length} older signal ${hiddenSignals.length === 1 ? "line" : "lines"}: ${hiddenSignals.at(-1)}`,
+		...lines.slice(-4),
+	];
+}
+
+function compactWorkflowError(error: string): string {
+	const outputMatch = error.match(/(?:^|\n)Output:\s*([\s\S]+)/);
+	if (!outputMatch) return oneLine(error);
+	const prefix = oneLine(error.slice(0, outputMatch.index)).replace(/:$/, "") || "Failed";
+	const outputLines = outputMatch[1]!.split(/\r?\n/).map(oneLine).filter(Boolean);
+	const allOutputLinesAreNoisy = outputLines.length > 0 && outputLines.every(isNoisyStatusLine);
+	const latest = outputLines.at(-1);
+	return allOutputLinesAreNoisy && latest
+		? `${prefix} · latest: ${latestActivityText(latest)}`
+		: `${prefix} · ${oneLine(outputMatch[1] ?? "")}`;
+}
+
+const WORKFLOW_LIVE_ROW_LIMIT = 8;
+
+function visibleWorkflowRows(rows: WorkflowChatProgressRow[]): { rows: WorkflowChatProgressRow[]; hiddenRows: number } {
+	if (rows.length <= WORKFLOW_LIVE_ROW_LIMIT) return { rows, hiddenRows: 0 };
+	const selected = new Set<string>();
+	const add = (row: WorkflowChatProgressRow): void => {
+		if (selected.size >= WORKFLOW_LIVE_ROW_LIMIT || selected.has(row.key)) return;
+		selected.add(row.key);
+	};
+	for (const row of [...rows].reverse()) {
+		if (row.state === "failed" || row.state === "detached") add(row);
+	}
+	for (const row of [...rows].reverse()) add(row);
+	return {
+		rows: rows.filter((row) => selected.has(row.key)),
+		hiddenRows: rows.length - selected.size,
+	};
+}
+
+/**
+ * Lines for at most `cap` rows: every unfinished row plus the newest finished ones, in order, with the
+ * older finished rows folded into one line, because live widgets list rows oldest first. When unfinished
+ * rows alone fill `cap`, only they are returned, possibly more than `cap`.
+ */
+function foldEarlierDoneLines<T extends { state: string }>(rows: readonly T[], cap: number, line: (row: T) => string, foldLine: (hidden: number) => string): string[] {
+	if (rows.length <= cap) return rows.map(line);
+	const unfinished = rows.filter((row) => row.state !== "complete");
+	if (unfinished.length >= cap) return unfinished.map(line);
+	// rows.length > cap, so at least two rows fold into the one line.
+	const hidden = rows.length - cap + 1;
+	const lines: string[] = [];
+	let skipped = 0;
+	for (const row of rows) {
+		if (skipped < hidden && row.state === "complete") {
+			if (++skipped === hidden) lines.push(foldLine(hidden));
+			continue;
+		}
+		lines.push(line(row));
+	}
+	return lines;
+}
 
 function snapshotNowForProgress(progress: Pick<AgentProgress, "currentToolStartedAt" | "durationMs" | "lastActivityAt">): number | undefined {
 	if (progress.currentToolStartedAt !== undefined && progress.durationMs !== undefined) return progress.currentToolStartedAt + progress.durationMs;
 	return progress.lastActivityAt;
+}
+
+function renderToolArgsPreview(value: string, maxLength: number, expanded: boolean): string {
+	const normalized = sanitizeDisplayText(value);
+	if (expanded || normalized.length <= maxLength) return normalized;
+	return `${truncateDisplayText(normalized, maxLength)}...`;
 }
 
 function formatCurrentToolLine(
@@ -208,9 +868,7 @@ function formatCurrentToolLine(
 	if (!progress.currentTool) return undefined;
 	const maxToolArgsLen = Math.max(50, availableWidth - 20);
 	const toolArgsPreview = progress.currentToolArgs
-		? (expanded || progress.currentToolArgs.length <= maxToolArgsLen
-			? progress.currentToolArgs
-			: `${progress.currentToolArgs.slice(0, maxToolArgsLen)}...`)
+		? renderToolArgsPreview(progress.currentToolArgs, maxToolArgsLen, expanded)
 		: "";
 	const durationSuffix = progress.currentToolStartedAt !== undefined && snapshotNow !== undefined
 		? ` | ${formatDuration(Math.max(0, snapshotNow - progress.currentToolStartedAt))}`
@@ -276,17 +934,92 @@ function resultStatusLine(result: Details["results"][number], output: string): s
 	return "Done";
 }
 
-function resultGlyph(result: Details["results"][number], output: string, theme: Theme, running = result.progress?.status === "running", seed = progressRunningSeed(result.progress ?? result.progressSummary), frame?: number): string {
-	if (running) {
-		if (frame !== undefined) return theme.fg("accent", runningGlyph((seed ?? 0) + frame));
-		return theme.fg("accent", runningGlyph(seed));
+type ResultPresentation = {
+	glyph: string;
+	label: "running" | "detached" | "stopped" | "paused" | "failed" | "partial" | "completed";
+	tone: "accent" | "warning" | "error" | "success";
+	/** Recorded thinking level of the one child a running presentation stands for. */
+	thinking?: ThinkingLevel;
+};
+
+function semanticResultPresentation(input: {
+	running?: boolean;
+	detached?: boolean;
+	stopped?: boolean;
+	interrupted?: boolean;
+	failed?: boolean;
+	partial?: boolean;
+	completedWithoutOutput?: boolean;
+	seed?: number;
+	frame?: number;
+	thinking?: ThinkingLevel;
+}): ResultPresentation {
+	if (input.running) {
+		const glyph = input.frame !== undefined ? runningGlyph((input.seed ?? 0) + input.frame) : runningGlyph(input.seed);
+		return { glyph, label: "running", tone: "accent", ...(input.thinking ? { thinking: input.thinking } : {}) };
 	}
-	if (result.detached) return theme.fg("warning", "■");
-	if (result.stopped) return theme.fg("warning", "■");
-	if (result.interrupted) return theme.fg("warning", "■");
-	if (result.exitCode !== 0) return theme.fg("error", "✗");
-	if (hasEmptyTextOutputWithoutOutputTarget(result.task, output)) return theme.fg("warning", "✓");
-	return theme.fg("success", "✓");
+	if (input.detached) return { glyph: "■", label: "detached", tone: "warning" };
+	if (input.stopped) return { glyph: "■", label: "stopped", tone: "warning" };
+	if (input.interrupted) return { glyph: "■", label: "paused", tone: "warning" };
+	if (input.failed) return { glyph: "✗", label: "failed", tone: "error" };
+	if (input.partial) return { glyph: "■", label: "partial", tone: "warning" };
+	return { glyph: "✓", label: "completed", tone: input.completedWithoutOutput ? "warning" : "success" };
+}
+
+function hasTerminalResultFlag(result: Details["results"][number]): boolean {
+	return Boolean(result.detached || result.stopped || result.interrupted);
+}
+
+function hasTerminalResult(result: Details["results"][number]): boolean {
+	if (hasTerminalResultFlag(result)) return true;
+	const status = result.progress?.status;
+	if (status === "running" || status === "pending") return false;
+	return result.exitCode !== undefined;
+}
+
+function isResultRunning(result: Details["results"][number], status = result.progress?.status): boolean {
+	return status === "running" && !hasTerminalResultFlag(result);
+}
+
+function detailsHaveRunningResult(details: Details): boolean {
+	return details.progress?.some((progress) => {
+		if (progress.status !== "running") return false;
+		const result = details.results.find((entry) => entry.progress?.index === progress.index) ?? details.results[progress.index];
+		return !result || !hasTerminalResultFlag(result);
+	})
+		|| details.results.some((result) => isResultRunning(result))
+		|| workflowGraphHasStatus(details, ["running"]);
+}
+
+function resultPresentation(result: Details["results"][number], output: string, running = isResultRunning(result), seed = progressRunningSeed(result.progress ?? result.progressSummary), frame?: number): ResultPresentation {
+	return semanticResultPresentation({
+		running,
+		detached: result.detached,
+		stopped: result.stopped,
+		interrupted: result.interrupted,
+		failed: result.exitCode !== 0,
+		completedWithoutOutput: hasEmptyTextOutputWithoutOutputTarget(result.task, output),
+		seed,
+		frame,
+		thinking: childThinkingLevel(result, result.progress),
+	});
+}
+
+function presentationTone(presentation: ResultPresentation, theme: Theme): (text: string) => string {
+	return presentation.label === "running" ? runningTone(theme, presentation.thinking) : (text) => theme.fg(presentation.tone, text);
+}
+
+function resultGlyph(result: Details["results"][number], output: string, theme: Theme, running = isResultRunning(result), seed = progressRunningSeed(result.progress ?? result.progressSummary), frame?: number): string {
+	const presentation = resultPresentation(result, output, running, seed, frame);
+	return presentationTone(presentation, theme)(presentation.glyph);
+}
+
+function styledResultPresentation(presentation: ResultPresentation, theme: Theme): { glyph: string; label: string } {
+	const tone = presentationTone(presentation, theme);
+	return {
+		glyph: tone(presentation.glyph),
+		label: tone(presentation.label),
+	};
 }
 
 function compactCurrentActivity(progress: AgentProgress): string {
@@ -294,10 +1027,121 @@ function compactCurrentActivity(progress: AgentProgress): string {
 	return formatCurrentToolLine(progress, getTermWidth() - 4, false, snapshotNow) ?? buildLiveStatusLine(progress, snapshotNow) ?? "thinking…";
 }
 
-export function widgetRenderKey(job: AsyncJobState): string {
+function textDigest(text: string): string {
+	return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+function displayTextRenderKey(text: string): unknown[] {
+	const normalized = sanitizeDisplayText(text);
+	return [normalized.length, textDigest(normalized)];
+}
+
+function expandedStepActivityRenderKey(step: AsyncJobStep): unknown[] {
+	return [
+		step.recentTools?.slice(-3).map((tool) => [tool.tool, displayTextRenderKey(tool.args), tool.endMs]),
+		compactRecentOutputLines(step.recentOutput).map(displayTextRenderKey),
+	];
+}
+
+function widgetStepRenderKey(step: AsyncJobStep, index: number, expanded = false): unknown[] {
+	return [
+		step.index ?? index,
+		step.agent,
+		step.sessionName,
+		step.workflowKey,
+		step.phase,
+		step.label,
+		step.progressText,
+		step.progressUpdatedAt,
+		step.status,
+		step.activityState,
+		step.lastActivityAt,
+		step.currentTool,
+		step.currentToolArgs,
+		step.currentToolStartedAt,
+		step.currentPath,
+		step.turnCount,
+		step.toolCount,
+		step.startedAt,
+		step.endedAt,
+		step.durationMs,
+		step.tokens?.total,
+		step.model,
+		step.thinking,
+		step.context,
+		step.description,
+		step.outputName,
+		step.structured,
+		step.acceptance?.status,
+		step.acceptance?.reviewResult?.status,
+		step.review?.status,
+		step.toolBudgetBlocked,
+		step.turnBudgetExceeded,
+		step.timedOut,
+		step.stopped,
+		step.execution?.status,
+		step.execution?.error,
+		step.execution?.timedOut,
+		step.execution?.interrupted,
+		step.execution?.stopped,
+		step.execution?.detached,
+		step.watchdog?.phase,
+		unresolvedChildWatchdogBlockers(step.watchdog).length,
+		step.error,
+		expanded ? expandedStepActivityRenderKey(step) : undefined,
+		nestedRenderKey(step.children, expanded),
+	];
+}
+
+function nestedRenderKey(children: NestedRunSummary[] | undefined, expanded = false): unknown[] {
+	return (children ?? []).map((child) => [
+		child.id,
+		child.state,
+		child.agent,
+		child.sessionName,
+		child.model,
+		child.thinking,
+		child.activityState,
+		child.lastActivityAt,
+		child.currentTool,
+		child.currentToolStartedAt,
+		child.currentPath,
+		child.turnCount,
+		child.toolCount,
+		child.startedAt,
+		child.endedAt,
+		child.lastUpdate,
+		child.error,
+		child.totalTokens?.total,
+		child.steps?.map((step, index) => widgetStepRenderKey({ ...step, agent: step.agent, status: step.status }, index, expanded)),
+		nestedRenderKey(child.children, expanded),
+	]);
+}
+
+function hostStepRenderKey(row: AsyncStatusWorkflowRow): unknown[] {
+	return [
+		row.kind,
+		row.name,
+		row.state,
+		row.provider,
+		row.role,
+		row.verdict,
+		row.reasonCode,
+		row.detail,
+		row.target,
+		row.freshness,
+		row.reportPath,
+	];
+}
+
+export function widgetRenderKey(job: AsyncJobState, expanded = false): string {
+	const projection = buildWorkflowWidgetProjection(job, job.updatedAt ?? 0);
 	return JSON.stringify({
 		asyncDir: job.asyncDir,
+		parentWorkflowRunId: job.parentWorkflowRunId,
+		workflowKey: job.workflowKey,
 		status: job.status,
+		description: job.mode === "workflow" ? job.description : undefined,
 		activityState: job.activityState,
 		lastActivityAt: job.lastActivityAt,
 		currentTool: job.currentTool,
@@ -310,14 +1154,33 @@ export function widgetRenderKey(job: AsyncJobState): string {
 		currentStep: job.currentStep,
 		chainStepCount: job.chainStepCount,
 		parallelGroups: job.parallelGroups,
-		steps: job.steps,
-		nestedChildren: job.nestedChildren,
+		workflowHostSteps: projectAsyncWorkflowRows([], job.hostSteps).map(hostStepRenderKey),
+		workflowGraph: job.mode === "workflow" && job.workflowGraph ? {
+			currentNodeId: job.workflowGraph.currentNodeId,
+			stages: projection.stages.map((node) => [node.id, node.status, node.agent, node.phase, node.label, node.flatIndex, node.outputName, node.structured, node.error]),
+		} : undefined,
+		preflight: expanded ? job.preflight : job.preflight?.lanes.map((lane) => [lane.key, lane.mode, lane.decision, lane.claims, lane.expectedOutput]),
+		preflightWarnings: expanded ? job.workflow?.preflightWarnings : undefined,
+		checklist: projection.checklist ? {
+			total: projection.checklist.total,
+			done: projection.checklist.done,
+			running: projection.checklist.running,
+			queued: projection.checklist.queued,
+			blocked: projection.checklist.blocked,
+			failed: projection.checklist.failed,
+			phases: projection.checklist.phases.map((phase) => [phase.key, phase.state, phase.done, phase.total, phase.running, phase.queued, phase.blocked, phase.failed, phase.paused, phase.stopped, phase.items.map((item) => [item.key, item.label, item.agent, item.state, item.preflight?.key, item.preflight?.mode, item.preflight?.decision, item.preflight?.claims, item.preflight?.expectedOutput, item.currentTool, item.currentPath, item.durationMs, item.toolCount, item.error])]),
+		} : undefined,
+		steps: job.steps?.map((step, index) => widgetStepRenderKey(step, index, expanded)),
+		nestedChildren: nestedRenderKey(job.nestedChildren, expanded),
+		lane: laneRenderKey(job, projection),
 		stepsTotal: job.stepsTotal,
 		runningSteps: job.runningSteps,
 		completedSteps: job.completedSteps,
 		activeParallelGroup: job.activeParallelGroup,
 		startedAt: job.startedAt,
 		updatedAt: job.updatedAt,
+		timedOut: job.timedOut,
+		stopped: job.stopped,
 		totalTokens: job.totalTokens,
 	});
 }
@@ -337,6 +1200,65 @@ function widgetJobName(job: AsyncJobState): string {
 	return job.mode ?? "subagent";
 }
 
+function isSingleChildAsyncJob(job: AsyncJobState): boolean {
+	return job.mode === "single"
+		&& job.steps?.length === 1
+		&& shouldSuppressSingleStep(job.chainStepCount, job.stepsTotal);
+}
+
+function isCompletedWidgetStepStatus(status: AsyncJobStep["status"]): boolean {
+	return status === "complete" || status === "completed";
+}
+
+function singleChildAgentName(job: AsyncJobState, step: AsyncJobStep): string {
+	return job.agents?.length === 1 ? job.agents[0]! : step.agent || widgetJobName(job);
+}
+
+function hasSingleChildDetailEvidence(job: AsyncJobState, step: AsyncJobStep): boolean {
+	return Boolean(
+		step.error?.trim()
+		|| step.execution?.error?.trim()
+		|| step.phase?.trim()
+		|| step.label?.trim()
+		|| step.workflowKey?.trim()
+		|| step.outputName?.trim()
+		|| step.lane
+		|| job.workflowKey?.trim()
+		|| job.lane
+		|| laneTraceForJob(job)?.phase?.trim()
+		|| laneTraceForJob(job)?.label?.trim()
+		|| step.timedOut
+		|| step.stopped
+		|| step.execution?.timedOut
+		|| step.execution?.interrupted
+		|| step.execution?.stopped
+		|| step.execution?.detached
+		|| job.timedOut
+		|| job.stopped
+		|| ["failed", "partial", "paused", "stopped", "detached"].includes(step.execution?.status ?? "")
+		|| step.acceptance?.status === "rejected"
+		|| step.acceptance?.reviewResult?.status === "blockers"
+		|| step.review?.status === "blockers",
+	);
+}
+
+function shouldCollapseSingleChildDetails(job: AsyncJobState, step: AsyncJobStep): boolean {
+	if (!isSingleChildAsyncJob(job) || hasSingleChildDetailEvidence(job, step)) return false;
+	if (job.status === "running") return step.status === "running";
+	if (job.status === "complete") return isCompletedWidgetStepStatus(step.status);
+	return false;
+}
+
+/** A child's task in one line: its label and task, else its session name without the repeated agent name. */
+export function stepTaskSummary(step: { description?: string; label?: string; sessionName?: string }, agentName: string | undefined): string | undefined {
+	const task = compactTaskText(step.description, step.label);
+	if (task) return task;
+	const sessionName = step.sessionName?.trim();
+	if (!sessionName) return undefined;
+	const sessionTask = stripRepeatedAgentPrefix(sessionName, agentName);
+	return sessionTask === agentName ? undefined : compactTaskText(sessionTask);
+}
+
 function widgetActivity(job: AsyncJobState): string {
 	const facts: string[] = [];
 	if (job.currentTool && job.currentToolStartedAt !== undefined && job.updatedAt !== undefined) facts.push(`${job.currentTool} ${formatDuration(Math.max(0, job.updatedAt - job.currentToolStartedAt))}`);
@@ -352,6 +1274,7 @@ function widgetActivity(job: AsyncJobState): string {
 	if (job.status === "queued") return "queued…";
 	if (job.status === "paused") return "Paused";
 	if (job.status === "stopped") return "Stopped";
+	if (job.status === "partial") return "Partial";
 	if (job.status === "failed") return "Failed";
 	return "Done";
 }
@@ -395,8 +1318,12 @@ function widgetJobsRunningSeed(jobs: AsyncJobState[]): number | undefined {
 	return seed;
 }
 
-function widgetStatusGlyph(job: AsyncJobState, theme: Theme): string {
-	if (job.status === "running") return theme.fg("accent", runningGlyph(widgetJobRunningSeed(job)));
+function activeHeaderTone(theme: Theme, hasActive: boolean): (text: string) => string {
+	return hasActive ? runningTone(theme) : (text) => theme.fg("dim", text);
+}
+
+function widgetStatusGlyph(job: AsyncJobState, theme: Theme, frame?: number): string {
+	if (job.status === "running") return runningTone(theme, job.mode === "single" ? childThinkingLevel(job.steps?.[0]) : undefined)(runningGlyph(animatedSeed(widgetJobRunningSeed(job), frame)));
 	if (job.status === "queued") return theme.fg("muted", "◦");
 	if (job.status === "complete") return theme.fg("success", "✓");
 	if (job.status === "paused") return theme.fg("warning", "■");
@@ -404,8 +1331,8 @@ function widgetStatusGlyph(job: AsyncJobState, theme: Theme): string {
 	return theme.fg("error", "✗");
 }
 
-function widgetStepGlyph(status: AsyncJobStep["status"], theme: Theme, seed?: number): string {
-	if (status === "running") return theme.fg("accent", runningGlyph(seed));
+function widgetStepGlyph(status: AsyncJobStep["status"], theme: Theme, seed?: number, frame?: number, thinking?: ThinkingLevel): string {
+	if (status === "running") return runningTone(theme, thinking)(runningGlyph(animatedSeed(seed, frame)));
 	if (status === "complete" || status === "completed") return theme.fg("success", "✓");
 	if (status === "failed") return theme.fg("error", "✗");
 	if (status === "paused") return theme.fg("warning", "■");
@@ -413,13 +1340,319 @@ function widgetStepGlyph(status: AsyncJobStep["status"], theme: Theme, seed?: nu
 	return theme.fg("muted", "◦");
 }
 
-function widgetStepStatus(status: AsyncJobStep["status"], theme: Theme): string {
-	if (status === "running") return theme.fg("accent", "running");
+function widgetStepStatus(status: AsyncJobStep["status"], theme: Theme, thinking?: ThinkingLevel): string {
+	if (status === "running") return runningTone(theme, thinking)("running");
 	if (status === "complete" || status === "completed") return theme.fg("success", "complete");
 	if (status === "failed") return theme.fg("error", "failed");
 	if (status === "paused") return theme.fg("warning", "paused");
 	if (status === "stopped") return theme.fg("warning", "stopped");
 	return theme.fg("dim", status);
+}
+
+function workflowChecklistStateLabel(state: WorkflowChecklistState): string {
+	if (state === "running") return "running";
+	if (state === "complete") return "complete";
+	return state;
+}
+
+function workflowChecklistGlyph(item: { state: WorkflowChecklistState; startedAt?: number; durationMs?: number; toolCount?: number; currentToolStartedAt?: number; thinking?: ThinkingLevel }, theme: Theme, frame?: number): string {
+	if (item.state === "running") return runningTone(theme, item.thinking)(runningGlyph(animatedSeed(runningSeed(item.startedAt, item.durationMs, item.toolCount, item.currentToolStartedAt), frame)));
+	if (item.state === "complete") return theme.fg("success", "✓");
+	if (item.state === "blocked") return theme.fg("error", "!");
+	if (item.state === "failed") return theme.fg("error", "✗");
+	if (item.state === "paused" || item.state === "stopped") return theme.fg("warning", "■");
+	return theme.fg("muted", "◦");
+}
+
+function workflowChecklistItemPriority(state: WorkflowChecklistState): number {
+	if (state === "blocked") return 0;
+	if (state === "failed") return 1;
+	if (state === "running") return 2;
+	if (state === "paused") return 3;
+	if (state === "stopped") return 4;
+	if (state === "queued") return 5;
+	return 6;
+}
+
+function workflowChecklistItemLine(item: WorkflowChecklistItem, theme: Theme, indent: string, frame: number | undefined, includeError: boolean): string {
+	const identity = [item.label, item.agent && item.agent !== item.label ? item.agent : undefined].filter(Boolean).join(" · ");
+	const context = contextModeBadge(theme, item.context);
+	const state = item.state === "complete" ? "" : ` ${theme.fg("dim", `· ${workflowChecklistStateLabel(item.state)}`)}`;
+	const details = [
+		item.currentTool ? `${item.currentTool}${item.durationMs !== undefined ? ` ${formatDuration(item.durationMs)}` : ""}` : undefined,
+		!item.currentTool && item.currentPath ? shortenPath(item.currentPath) : undefined,
+		!item.currentTool && item.durationMs !== undefined ? formatDuration(item.durationMs) : undefined,
+		item.toolCount !== undefined ? `${item.toolCount} tools` : undefined,
+		item.outputName ? `out:${item.outputName}` : undefined,
+		includeError && item.error ? `error:${oneLine(item.error)}` : undefined,
+	].filter(Boolean).join(" · ");
+	return `${indent}${workflowChecklistGlyph(item, theme, frame)} ${theme.bold(identity || item.key)}${context}${state}${details ? ` ${theme.fg("dim", `· ${details}`)}` : ""}`;
+}
+
+const COLLAPSED_WORKFLOW_PHASE_LIMIT = 4;
+const EXPANDED_WIDGET_DONE_ITEMS = 4;
+
+interface WorkflowChecklistWidgetOptions {
+	includeSummary?: boolean;
+	limitPhases?: boolean;
+	includeBottleneckOutput?: boolean;
+	includeItemErrors?: boolean;
+	/** Above-editor widget: when expanded, the bottleneck leads and each phase lists only its newest done items. */
+	liveWidget?: boolean;
+}
+
+function workflowChecklistWidgetLines(checklist: WorkflowChecklistProjection | undefined, theme: Theme, indent: string, expanded: boolean, frame?: number, options: WorkflowChecklistWidgetOptions = {}): string[] {
+	if (!checklist?.total) return [];
+	const includeSummary = options.includeSummary ?? true;
+	const limitPhases = options.limitPhases ?? !expanded;
+	const includeBottleneckOutput = options.includeBottleneckOutput ?? expanded;
+	const includeItemErrors = options.includeItemErrors ?? true;
+	const lines = includeSummary ? [`${indent}${theme.fg("dim", `Checklist ${formatWorkflowChecklistSummary(checklist)}`)}`] : [];
+	const bottleneck = formatWorkflowChecklistBottleneck(checklist.bottleneck, { includeOutput: includeBottleneckOutput, includeError: !expanded });
+	const tone = checklist.bottleneck?.state === "blocked" || checklist.bottleneck?.state === "failed" ? "error" : checklist.bottleneck?.state === "running" ? "accent" : "warning";
+	const bottleneckLine = bottleneck ? `${indent}${theme.fg(tone, `bottleneck · ${bottleneck}`)}` : undefined;
+	const liveExpanded = expanded && options.liveWidget === true;
+	if (liveExpanded && bottleneckLine) lines.push(bottleneckLine);
+	const phases = !limitPhases || checklist.phases.length <= COLLAPSED_WORKFLOW_PHASE_LIMIT
+		? checklist.phases
+		: checklist.phases
+			.map((phase, index) => ({ phase, index }))
+			.sort((left, right) => Number(left.phase.state !== "running") - Number(right.phase.state !== "running")
+				|| Number(left.phase.state === "complete") - Number(right.phase.state === "complete")
+				|| left.index - right.index)
+			.slice(0, COLLAPSED_WORKFLOW_PHASE_LIMIT)
+			.sort((left, right) => left.index - right.index)
+			.map(({ phase }) => phase);
+	for (const phase of phases) {
+		const phaseItem = phase.items.find((item) => item.state === "running") ?? phase.items[0];
+		const glyph = workflowChecklistGlyph({
+			state: phase.state,
+			startedAt: phaseItem?.startedAt,
+			durationMs: phaseItem?.durationMs,
+			toolCount: phaseItem?.toolCount,
+			currentToolStartedAt: phaseItem?.currentToolStartedAt,
+		}, theme, frame);
+		lines.push(`${indent}${glyph} ${theme.bold(formatWorkflowChecklistPhase(phase))}`);
+		if (expanded) {
+			const items = [...phase.items].sort((left, right) => workflowChecklistItemPriority(left.state) - workflowChecklistItemPriority(right.state));
+			const line = (item: WorkflowChecklistItem): string => workflowChecklistItemLine(item, theme, `${indent}  `, frame, includeItemErrors || item.kind === "host");
+			const cap = liveExpanded ? items.filter((item) => item.state !== "complete").length + EXPANDED_WIDGET_DONE_ITEMS + 1 : items.length;
+			lines.push(...foldEarlierDoneLines(items, cap, line, (hidden) => `${indent}  ${theme.fg("dim", `… ${hidden} earlier done`)}`));
+		}
+	}
+	if (!liveExpanded && bottleneckLine) lines.push(bottleneckLine);
+	return lines;
+}
+
+interface CompactWorkflowLaneRow {
+	key: string;
+	state: WorkflowChecklistState;
+	/** Recorded thinking level of the lane's child when the lane stands for exactly one. */
+	thinking?: ThinkingLevel;
+	agent?: string;
+	mode?: string;
+	decision?: string;
+	claims?: string;
+	expectedOutput?: string;
+	label?: string;
+	toolUses?: number;
+	durationMs?: number;
+}
+
+interface CompactWorkflowLaneCounts {
+	total: number;
+	done: number;
+	active: number;
+	queued: number;
+	blocked: number;
+	failed: number;
+	paused: number;
+	stopped: number;
+}
+
+function compactWorkflowLaneState(items: readonly WorkflowChecklistItem[]): WorkflowChecklistState {
+	let state: WorkflowChecklistState | undefined;
+	for (const item of items) {
+		if (state === undefined || workflowChecklistItemPriority(item.state) < workflowChecklistItemPriority(state)) state = item.state;
+	}
+	return state ?? "queued";
+}
+
+function compactWorkflowLaneOwner(items: readonly WorkflowChecklistItem[]): string | undefined {
+	const owners = [...new Set(items.map((item) => item.agent ?? item.role).filter((value): value is string => Boolean(value?.trim())))];
+	if (owners.length === 0) return undefined;
+	return boundedLaneValue(owners.length > 2 ? `${owners.slice(0, 2).join(", ")} +${owners.length - 2}` : owners.join(", "), 32);
+}
+
+function compactWorkflowLaneLabel(items: readonly WorkflowChecklistItem[], key: string): string | undefined {
+	const labels = [...new Set(items.map((item) => item.label).filter((value): value is string => Boolean(value?.trim() && value.trim() !== key)))];
+	if (labels.length === 0) return undefined;
+	return boundedLaneValue(labels.length > 1 ? `${labels[0]} +${labels.length - 1}` : labels[0], 48);
+}
+
+function compactWorkflowLaneRow(key: string, items: readonly WorkflowChecklistItem[], lane = items.find((item) => item.preflight)?.preflight, fallbackState: WorkflowChecklistState = "queued"): CompactWorkflowLaneRow {
+	const state = items.length ? compactWorkflowLaneState(items) : fallbackState;
+	const toolCounts = items.map((item) => item.toolCount).filter((value): value is number => value !== undefined);
+	const durations = items.map((item) => item.durationMs).filter((value): value is number => value !== undefined);
+	const label = compactWorkflowLaneLabel(items, key);
+	return {
+		key: boundedLaneValue(key, 40) ?? key,
+		state,
+		agent: compactWorkflowLaneOwner(items),
+		...(items.length === 1 && items[0]?.thinking ? { thinking: items[0].thinking } : {}),
+		...(lane?.mode ? { mode: lane.mode } : {}),
+		...(lane?.decision ? { decision: boundedLaneValue(lane.decision, 56) } : {}),
+		...(lane?.claims?.length ? { claims: boundedLaneValue(lane.claims.join(", "), 56) } : {}),
+		...(lane?.expectedOutput ? { expectedOutput: boundedLaneValue(lane.expectedOutput, 56) } : {}),
+		...(label ? { label } : {}),
+		...(toolCounts.length ? { toolUses: toolCounts.reduce((sum, value) => sum + value, 0) } : {}),
+		...(durations.length ? { durationMs: Math.max(...durations) } : {}),
+	};
+}
+
+function compactWorkflowFallbackState(job: AsyncJobState): WorkflowChecklistState {
+	if (job.activityState === "needs_attention" || job.timedOut || job.toolBudgetBlocked || job.turnBudgetExceeded) return "blocked";
+	switch (job.status) {
+		case "complete": return "complete";
+		case "failed": return "failed";
+		case "paused": return "paused";
+		case "stopped": return "stopped";
+		case "partial":
+		case "rejected": return "blocked";
+		default: return "queued";
+	}
+}
+
+/** Flatten the loaded checklist into one compact row per declared lane. */
+function compactWorkflowLaneRows(job: AsyncJobState, checklist: WorkflowChecklistProjection | undefined): CompactWorkflowLaneRow[] {
+	const groups = new Map<string, WorkflowChecklistItem[]>();
+	for (const item of checklist?.phases.flatMap((phase) => phase.items) ?? []) {
+		const key = item.preflight?.key ?? item.key;
+		const group = groups.get(key);
+		if (group) group.push(item);
+		else groups.set(key, [item]);
+	}
+
+	const rows: CompactWorkflowLaneRow[] = [];
+	const preflightKeys = new Set(job.preflight?.lanes.map((lane) => lane.key) ?? []);
+	if (job.preflight?.lanes.length) {
+		for (const lane of job.preflight.lanes) {
+			rows.push(compactWorkflowLaneRow(lane.key, groups.get(lane.key) ?? [], lane, compactWorkflowFallbackState(job)));
+		}
+	}
+
+	for (const [key, items] of groups) {
+		if (preflightKeys.has(key)) continue;
+		rows.push(compactWorkflowLaneRow(key, items));
+	}
+	return rows;
+}
+
+function compactWorkflowLaneCounts(rows: readonly CompactWorkflowLaneRow[]): CompactWorkflowLaneCounts {
+	const counts: CompactWorkflowLaneCounts = { total: rows.length, done: 0, active: 0, queued: 0, blocked: 0, failed: 0, paused: 0, stopped: 0 };
+	for (const row of rows) {
+		switch (row.state) {
+			case "complete": counts.done++; break;
+			case "running": counts.active++; break;
+			case "queued": counts.queued++; break;
+			case "blocked": counts.blocked++; break;
+			case "failed": counts.failed++; break;
+			case "paused": counts.paused++; break;
+			case "stopped": counts.stopped++; break;
+		}
+	}
+	return counts;
+}
+
+function compactWorkflowLaneLine(row: CompactWorkflowLaneRow, theme: Theme, indent: string, frame?: number): string {
+	const owner = row.agent && row.mode ? `${row.agent}/${row.mode}` : row.agent ?? row.mode;
+	const state = row.state === "complete" ? undefined : row.state === "running" ? "active" : row.state;
+	const intent = [
+		row.decision,
+		row.claims,
+		row.expectedOutput,
+		!row.mode && row.label ? row.label : undefined,
+	].filter((value): value is string => Boolean(value));
+	return `${indent}${workflowChecklistGlyph({ state: row.state, durationMs: row.durationMs, toolCount: row.toolUses, thinking: row.thinking }, theme, frame)} ${theme.bold(row.key)}${owner ? ` ${theme.fg("dim", `· ${owner}`)}` : ""}${state ? ` ${theme.fg("dim", `· ${state}`)}` : ""}${intent.length ? ` ${theme.fg("dim", `· ${intent.join(" · ")}`)}` : ""}`;
+}
+
+function compactWorkflowShortId(job: AsyncJobState): string {
+	return job.asyncId.slice(0, 8);
+}
+
+function compactWorkflowDisplayLabel(job: AsyncJobState): string {
+	return boundedLaneValue(job.description, 64) ?? compactWorkflowShortId(job);
+}
+
+function compactWorkflowStats(job: AsyncJobState, rows: readonly CompactWorkflowLaneRow[], theme: Theme, projection: WorkflowWidgetProjection): string {
+	const counts = compactWorkflowLaneCounts(rows);
+	const total = counts.total || projection.stageProgress?.total || job.stepsTotal || job.agents?.length || 0;
+	const progress = [
+		total > 0 ? `${counts.done}/${total} done` : undefined,
+		counts.active ? `${counts.active} active` : undefined,
+		counts.queued ? `${counts.queued} queued` : undefined,
+		counts.blocked ? `${counts.blocked} blocked` : undefined,
+		counts.failed ? `${counts.failed} failed` : undefined,
+		counts.paused ? `${counts.paused} paused` : undefined,
+		counts.stopped ? `${counts.stopped} stopped` : undefined,
+	].filter((value): value is string => Boolean(value));
+	const rowToolUses = rows.map((row) => row.toolUses).filter((value): value is number => value !== undefined);
+	const toolUses = job.toolCount ?? (rowToolUses.length ? rowToolUses.reduce((sum, value) => sum + value, 0) : undefined);
+	const rowDuration = rows.map((row) => row.durationMs).filter((value): value is number => value !== undefined);
+	const end = job.status === "running" ? projection.now : job.updatedAt;
+	const durationMs = job.status !== "queued" && job.startedAt !== undefined && end !== undefined
+		? Math.max(0, end - job.startedAt)
+		: job.status !== "queued" && rowDuration.length ? Math.max(...rowDuration) : undefined;
+	return statJoin(theme, [
+		`id: ${compactWorkflowShortId(job)}`,
+		...progress,
+		toolUses !== undefined ? formatToolUseStat(toolUses) : undefined,
+		durationMs !== undefined ? formatDuration(durationMs) : undefined,
+	].filter((value): value is string => Boolean(value)));
+}
+
+interface CompactWorkflowBottleneck {
+	text: string;
+	tone: "warning" | "error";
+}
+
+function compactWorkflowBottleneck(rows: readonly CompactWorkflowLaneRow[], job: AsyncJobState): CompactWorkflowBottleneck | undefined {
+	let row: CompactWorkflowLaneRow | undefined;
+	for (const candidate of rows) {
+		if (candidate.state !== "blocked" && candidate.state !== "failed" && candidate.state !== "paused" && candidate.state !== "stopped") continue;
+		if (!row || workflowChecklistItemPriority(candidate.state) < workflowChecklistItemPriority(row.state)) row = candidate;
+	}
+	if (row) return { text: `${row.key} · ${row.state}`, tone: row.state === "blocked" || row.state === "failed" ? "error" : "warning" };
+	if (job.activityState === "needs_attention" || job.timedOut || job.toolBudgetBlocked || job.turnBudgetExceeded) return { text: `workflow · ${job.activityState === "needs_attention" ? "needs attention" : "blocked"}`, tone: job.activityState === "needs_attention" ? "warning" : "error" };
+	if (job.status === "failed" || job.status === "partial" || job.status === "rejected") return { text: `workflow · ${job.status}`, tone: "error" };
+	if (job.status === "paused" || job.status === "stopped") return { text: `workflow · ${job.status}`, tone: "warning" };
+	return undefined;
+}
+
+function compactWorkflowHeaderLine(job: AsyncJobState, theme: Theme, width?: number): string {
+	const label = compactWorkflowDisplayLabel(job);
+	const full = `${theme.fg("toolTitle", themeBold(theme, `async workflow: ${label}`))} ${theme.fg("dim", "─ background")}`;
+	if (width === undefined || visibleWidth(full) <= width) return full;
+	return `${theme.fg("toolTitle", themeBold(theme, `async workflow ${label}`))} ${theme.fg("dim", "· background")}`;
+}
+
+/** `lineBudget` is the room left for these lines; older done lanes fold so the newest and active ones fit. */
+function compactWorkflowWidgetBodyLines(job: AsyncJobState, theme: Theme, frame: number | undefined, projection: WorkflowWidgetProjection, lineBudget?: number): string[] {
+	const rows = compactWorkflowLaneRows(job, projection.checklist);
+	const lines = [`  ${compactWorkflowStats(job, rows, theme, projection)}`];
+	if (projection.inlineFleetCovered) return [...lines, `  ${theme.fg("dim", "Workflow children shown in Fleet roster")}`];
+	const bottleneck = compactWorkflowBottleneck(rows, job);
+	const hint = job.status === "running" || rows.some((row) => row.state === "running");
+	if (rows.length) {
+		const shown = rows.filter((row) => !projection.materializedKeys?.has(row.key));
+		const cap = lineBudget === undefined ? shown.length : Math.max(1, lineBudget - lines.length - Number(Boolean(bottleneck)) - Number(hint));
+		lines.push(...foldEarlierDoneLines(shown, cap, (row) => compactWorkflowLaneLine(row, theme, "  ", frame), (hidden) => `  ${theme.fg("dim", `… ${hidden} earlier done`)}`));
+	} else {
+		lines.push(`  ${theme.fg("dim", "◦ waiting for workflow lanes")}`);
+	}
+	if (bottleneck) lines.push(`  ${theme.fg(bottleneck.tone, `bottleneck · ${bottleneck.text}`)}`);
+	if (hint) lines.push(`  ${theme.fg("accent", workflowDetailHintText())}`);
+	return lines;
 }
 
 function widgetStepActivity(step: NonNullable<AsyncJobState["steps"]>[number], snapshotNow?: number): string {
@@ -429,7 +1662,7 @@ function widgetStepActivity(step: NonNullable<AsyncJobState["steps"]>[number], s
 	if (step.currentPath) facts.push(shortenPath(step.currentPath));
 	if (step.turnCount !== undefined) facts.push(`${step.turnCount} turns`);
 	if (step.toolCount !== undefined) facts.push(`${step.toolCount} tools`);
-	if (step.tokens?.total) facts.push(formatTokenStat(step.tokens.total));
+	if (step.tokens?.total) facts.push(formatTokenUsage(step.tokens, "token"));
 	const activity = buildLiveStatusLine(step, snapshotNow);
 	if (activity && facts.length) return `${activity} · ${facts.join(" · ")}`;
 	if (activity) return activity;
@@ -437,15 +1670,14 @@ function widgetStepActivity(step: NonNullable<AsyncJobState["steps"]>[number], s
 }
 
 
-function widgetChainDetails(job: AsyncJobState, theme: Theme, expanded = false, width = getTermWidth()): string[] {
+function widgetChainDetails(job: AsyncJobState, theme: Theme, expanded = false, width = getTermWidth(), frame?: number, fullTask = false): string[] {
 	if (!job.steps?.length) return [];
 	const total = job.chainStepCount ?? job.steps.length;
 	const lines: string[] = [];
 	for (const span of buildAsyncChainStepSpans(total, job.steps.length, job.parallelGroups)) {
 		const steps = job.steps.slice(span.start, span.start + span.count);
 		if (span.isParallel) {
-			const status = aggregateStepStatus(steps);
-			lines.push(`  ${widgetStepGlyph(status, theme, widgetStepsRunningSeed(steps))} Step ${span.stepIndex + 1}/${total}: ${themeBold(theme, "parallel group")} ${theme.fg("dim", "·")} ${theme.fg("dim", formatParallelOutcome(steps, span.count))}`);
+			lines.push(...parallelWidgetGroupDetails(job, theme, { steps, total: span.count, stepIndex: span.stepIndex, chainTotal: total }, expanded, width, frame, false, fullTask));
 			continue;
 		}
 		const step = steps[0];
@@ -453,15 +1685,22 @@ function widgetChainDetails(job: AsyncJobState, theme: Theme, expanded = false, 
 			lines.push(`  ${theme.fg("dim", `◦ Step ${span.stepIndex + 1}/${total}: pending`)}`);
 			continue;
 		}
-		lines.push(...foregroundStyleWidgetStepLines(job, theme, step, "Step", span.stepIndex + 1, total, expanded, width));
+		lines.push(...foregroundStyleWidgetStepLines(job, theme, step, "Step", span.stepIndex + 1, total, expanded, width, frame, { fullTask }));
 	}
 	return lines;
 }
 
-function widgetParallelAgentDetails(job: AsyncJobState, theme: Theme, expanded = false, width = getTermWidth()): string[] {
+function widgetParallelAgentDetails(job: AsyncJobState, theme: Theme, expanded = false, width = getTermWidth(), frame?: number, fullTask = false): string[] {
 	if (!job.steps?.length) return [];
+	// Multi-job cards prefix every line with a 4-column tree continuation after this returns.
+	const taskLines = (step: AsyncJobStep, indent: string): string[] => expanded && fullTask && step.status === "running"
+		? (expandedTaskLines(step.description, step.label, width - indent.length - 4) ?? []).map((line) => `${indent}${theme.fg("dim", line)}`)
+		: [];
+	if (job.mode === "single") return job.steps.flatMap((step) => taskLines(step, "  "));
 	if (job.mode !== "parallel" && job.mode !== "chain") return [];
-	if (job.mode === "chain" && !job.activeParallelGroup && job.parallelGroups?.length) return widgetChainDetails(job, theme, expanded, width);
+	if (job.mode === "chain" && !job.activeParallelGroup && job.parallelGroups?.length) return widgetChainDetails(job, theme, expanded, width, frame, fullTask);
+	const group = activeParallelWidgetGroup(job);
+	if (group) return parallelWidgetGroupDetails(job, theme, group, expanded, width, frame, Boolean(job.activeParallelGroup), fullTask);
 	const total = job.stepsTotal ?? job.steps.length;
 	const lines: string[] = [];
 	for (const [index, step] of job.steps.entries()) {
@@ -469,8 +1708,14 @@ function widgetParallelAgentDetails(job: AsyncJobState, theme: Theme, expanded =
 		const activity = widgetStepActivity(step, job.updatedAt);
 		const itemTitle = job.mode === "parallel" || job.activeParallelGroup ? "Agent" : "Step";
 		const modelDisplay = modelThinkingBadge(theme, step.model, step.thinking);
-		lines.push(`  ${theme.fg("dim", `${marker} ${widgetStepGlyph(step.status, theme, widgetStepRunningSeed(step, index))} ${itemTitle} ${index + 1}/${total}: ${step.agent} · ${widgetStepStatus(step.status, theme)}${modelDisplay}${activity ? ` · ${activity}` : ""}`)}`);
-		for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, expanded, job.updatedAt, expanded ? 8 : 1)) lines.push(`    ${nestedLine}`);
+		const label = compactTaskText(step.description, step.label);
+		const display = step.sessionName?.trim() || (label ? `${label} (${step.agent})` : step.agent);
+		const thinking = childThinkingLevel(step);
+		lines.push(`  ${theme.fg("dim", `${marker} ${widgetStepGlyph(step.status, theme, widgetStepRunningSeed(step, index), frame, thinking)} ${itemTitle} ${index + 1}/${total}: ${display} · ${widgetStepStatus(step.status, theme, thinking)}${modelDisplay}${activity ? ` · ${activity}` : ""}`)}`);
+		lines.push(...taskLines(step, "    "));
+		const lane = projectAsyncLane(job, step);
+		if (lane) lines.push(...formatLaneProjectionLines(lane, theme, "    "));
+		for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, expanded, job.updatedAt, expanded ? 8 : 6)) lines.push(`    ${nestedLine}`);
 	}
 	return lines;
 }
@@ -528,17 +1773,15 @@ function buildChainStepSpans(details: Pick<Details, "chainAgents" | "workflowGra
 	return spans;
 }
 
-function isChainParallelGroupActive(details: Pick<Details, "mode" | "chainAgents" | "currentStepIndex" | "workflowGraph">): boolean {
-	if (details.mode !== "chain") return false;
-	if (details.currentStepIndex === undefined) return false;
-	return buildChainStepSpans(details).some((span) => span.stepIndex === details.currentStepIndex && span.isParallel);
-}
-
 function buildAsyncChainStepSpans(total: number, stepCount: number, parallelGroups: AsyncParallelGroupStatus[] = []): ChainStepSpan[] {
+	const groupsByStep = new Map<number, AsyncParallelGroupStatus>();
+	for (const group of parallelGroups) {
+		if (!groupsByStep.has(group.stepIndex)) groupsByStep.set(group.stepIndex, group);
+	}
 	const spans: ChainStepSpan[] = [];
 	let flatIndex = 0;
 	for (let stepIndex = 0; stepIndex < total; stepIndex++) {
-		const group = parallelGroups.find((candidate) => candidate.stepIndex === stepIndex);
+		const group = groupsByStep.get(stepIndex);
 		if (group) {
 			spans.push({ stepIndex, start: group.start, count: group.count, isParallel: true });
 			flatIndex = Math.max(flatIndex, group.start + group.count);
@@ -548,6 +1791,129 @@ function buildAsyncChainStepSpans(total: number, stepCount: number, parallelGrou
 		flatIndex++;
 	}
 	return spans;
+}
+
+interface ParallelWidgetGroup {
+	steps: AsyncJobStep[];
+	total: number;
+	stepIndex?: number;
+	chainTotal?: number;
+}
+
+interface ParallelWidgetStepRow {
+	step: AsyncJobStep;
+	index: number;
+	rowLabel: string;
+}
+
+function normalizedParallelDisplayText(value: string | undefined): string | undefined {
+	if (!value?.trim()) return undefined;
+	const normalized = oneLine(value);
+	return normalized && normalized !== PROMPT_REDACTED ? normalized : undefined;
+}
+
+function parallelWidgetStepDisplayName(step: AsyncJobStep): string {
+	const agent = normalizedParallelDisplayText(step.agent);
+	const explicitLabel = normalizedParallelDisplayText(step.label);
+	if (explicitLabel) {
+		const label = compactTaskText(step.description, explicitLabel) ?? explicitLabel;
+		return agent ? `${label} (${agent})` : label;
+	}
+
+	const sessionName = normalizedParallelDisplayText(step.sessionName);
+	if (sessionName) {
+		const sessionTask = stripRepeatedAgentPrefix(sessionName, agent);
+		if (sessionTask && sessionTask !== PROMPT_REDACTED && sessionTask.toLowerCase() !== agent?.toLowerCase()) return sessionTask;
+	}
+
+	return compactTaskText(step.description) ?? agent ?? "subagent";
+}
+
+function parallelWidgetStepPriority(step: AsyncJobStep): number {
+	if (step.status === "running" || step.activityState === "needs_attention") return 0;
+	switch (step.status) {
+		case "failed":
+		case "rejected":
+		case "partial":
+		case "stopped":
+		case "paused":
+			return 1;
+		case "complete":
+		case "completed":
+			return 2;
+		default:
+			return 3;
+	}
+}
+
+function parallelWidgetStepRows(steps: AsyncJobStep[], total: number, prioritizeActive: boolean): ParallelWidgetStepRow[] {
+	const indexed = steps.map((step, index) => ({ step, index, displayName: parallelWidgetStepDisplayName(step) }));
+	if (prioritizeActive) indexed.sort((left, right) => parallelWidgetStepPriority(left.step) - parallelWidgetStepPriority(right.step) || left.index - right.index);
+	return withDuplicateLabelDiscriminators(indexed, total).map(({ displayName, ...row }) => row);
+}
+
+function activeParallelWidgetGroup(job: AsyncJobState): ParallelWidgetGroup | undefined {
+	const steps = job.steps ?? [];
+	if (!steps.length) return undefined;
+	if (job.mode === "parallel") return { steps, total: job.stepsTotal ?? steps.length };
+	if (job.mode !== "chain" || !job.activeParallelGroup) return undefined;
+
+	const chainTotal = job.chainStepCount ?? job.stepsTotal ?? steps.length;
+	const spans = buildAsyncChainStepSpans(chainTotal, steps.length, job.parallelGroups);
+	const currentStep = job.currentStep;
+	const activeSpan = currentStep === undefined
+		? spans.find((span) => span.isParallel)
+		: spans.find((span) => span.isParallel
+			&& currentStep >= span.start
+			&& currentStep < span.start + span.count);
+	return {
+		steps,
+		total: activeSpan?.count ?? job.stepsTotal ?? steps.length,
+		stepIndex: activeSpan?.stepIndex,
+		chainTotal,
+	};
+}
+
+function parallelWidgetGroupHeader(
+	group: ParallelWidgetGroup,
+	theme: Theme,
+	frame?: number,
+): string {
+	const status = aggregateStepStatus(group.steps);
+	const label = group.stepIndex !== undefined && group.chainTotal !== undefined
+		? `Step ${group.stepIndex + 1}/${group.chainTotal}: parallel group`
+		: "parallel group";
+	return `  ${widgetStepGlyph(status, theme, widgetStepsRunningSeed(group.steps), frame)} ${themeBold(theme, label)} ${theme.fg("dim", "·")} ${theme.fg("dim", formatParallelOutcome(group.steps, group.total))}`;
+}
+
+function parallelWidgetGroupDetails(
+	job: AsyncJobState,
+	theme: Theme,
+	group: ParallelWidgetGroup,
+	expanded: boolean,
+	width: number,
+	frame: number | undefined,
+	prioritizeActive: boolean,
+	fullTask = false,
+): string[] {
+	const lines = [parallelWidgetGroupHeader(group, theme, frame)];
+	const rows = parallelWidgetStepRows(group.steps, group.total, prioritizeActive);
+	for (const [rowIndex, row] of rows.entries()) {
+		const marker = rowIndex === rows.length - 1 && rows.length >= group.total ? "└─" : "├─";
+		lines.push(...foregroundStyleWidgetStepLines(job, theme, row.step, "Agent", row.index + 1, group.total, expanded, width, frame, {
+			rowLabel: row.rowLabel,
+			rowIndent: "    ",
+			detailIndent: "      ",
+			rowMarker: marker,
+			includeCurrentPath: true,
+			fullTask,
+		}));
+	}
+	for (let index = rows.length; index < group.total; index++) {
+		const marker = index === group.total - 1 ? "└─" : "├─";
+		lines.push(`    ${marker} ${theme.fg("muted", "◦")} ${theme.fg("dim", "pending")}`);
+	}
+	return lines;
 }
 
 function isDoneResult(result: Details["results"][number]): boolean {
@@ -566,41 +1932,85 @@ interface ChainRenderResultEntry {
 	kind: "result";
 	resultIndex: number;
 	rowNumber: number;
+	rowLabel?: string;
 	agentName: string;
+	displayIndex: number;
+	isParallel?: boolean;
 }
 
-interface ChainRenderPlaceholderEntry {
-	kind: "placeholder";
-	rowNumber: number;
+interface ChainRenderGroupEntry {
+	kind: "group";
 	stepLabel: string;
-	agentName: string;
+	groupLabel?: string;
 	status: WorkflowNodeStatus;
 	error?: string;
 }
 
-type ChainRenderEntry = ChainRenderResultEntry | ChainRenderPlaceholderEntry;
+type ChainRenderEntry = ChainRenderResultEntry | ChainRenderGroupEntry;
+
+function chainSpanStatus(details: Details, span: ChainStepSpan): WorkflowNodeStatus {
+	if (span.status) return span.status;
+	const results = details.results.slice(span.start, span.start + span.count);
+	if (results.some((result) => isResultRunning(result))) return "running";
+	if (results.some((result) => !hasTerminalResultFlag(result) && (result.progress?.status === "failed" || result.exitCode !== 0) && !isResultRunning(result))) return "failed";
+	if (results.some((result) => result.stopped)) return "stopped";
+	if (results.some((result) => result.interrupted)) return "paused";
+	if (results.some((result) => result.detached || result.progress?.status === "detached")) return "detached";
+	if (results.length < span.count) return "pending";
+	if (results.length > 0 && results.every(isDoneResult)) return "completed";
+	return "pending";
+}
+
+function withDuplicateForegroundLabels(entries: ChainRenderResultEntry[], total: number): ChainRenderResultEntry[] {
+	return withDuplicateLabelDiscriminators(
+		entries.map((entry) => ({ ...entry, index: entry.displayIndex, displayName: entry.agentName })),
+		total,
+	).map(({ displayName, rowLabel, ...entry }) => ({
+		...entry,
+		rowLabel: rowLabel === displayName ? undefined : rowLabel.slice(0, -(displayName.length + 2)),
+	}));
+}
 
 function buildChainRenderEntries(details: Details, label: MultiProgressLabel): ChainRenderEntry[] | undefined {
 	if (details.mode !== "chain" || !label.hasParallelInChain || label.showActiveGroupOnly) return undefined;
 	const entries: ChainRenderEntry[] = [];
 	for (const span of buildChainStepSpans(details)) {
-		if (span.isParallel && span.count === 0) {
+		if (span.isParallel) {
 			entries.push({
-				kind: "placeholder",
-				rowNumber: span.stepIndex + 1,
-				stepLabel: `Step ${span.stepIndex + 1}`,
-				agentName: span.label ?? details.chainAgents?.[span.stepIndex] ?? `step-${span.stepIndex + 1}`,
-				status: span.status ?? "pending",
+				kind: "group",
+				stepLabel: `Step ${span.stepIndex + 1}/${label.logicalStepCount}: parallel group`,
+				groupLabel: span.label?.trim() || undefined,
+				status: chainSpanStatus(details, span),
 				error: span.error,
 			});
+			const groupEntries: ChainRenderResultEntry[] = [];
+			for (let index = span.start; index < span.start + span.count; index++) {
+				const result = details.results[index];
+				const localIndex = foregroundResultIndex(details, index);
+				const displayIndex = localIndex >= span.start && localIndex < span.start + span.count
+					? localIndex - span.start
+					: index - span.start;
+				groupEntries.push({
+					kind: "result",
+					resultIndex: index,
+					rowNumber: index - span.start + 1,
+					agentName: foregroundResultDisplayName(details, index, result, `agent-${displayIndex + 1}`),
+					displayIndex,
+					isParallel: true,
+				});
+			}
+			entries.push(...withDuplicateForegroundLabels(groupEntries, span.count));
 			continue;
 		}
 		for (let index = span.start; index < span.start + span.count; index++) {
+			const result = details.results[index];
 			entries.push({
 				kind: "result",
 				resultIndex: index,
-				rowNumber: index + 1,
-				agentName: details.results[index]?.agent ?? details.chainAgents?.[span.stepIndex] ?? `step-${span.stepIndex + 1}`,
+				rowNumber: span.stepIndex + 1,
+				rowLabel: resultRowLabel(label, span.stepIndex + 1),
+				agentName: foregroundResultDisplayName(details, index, result, details.chainAgents?.[span.stepIndex] ?? `step-${span.stepIndex + 1}`),
+				displayIndex: foregroundResultIndex(details, index),
 			});
 		}
 	}
@@ -616,12 +2026,15 @@ interface MultiProgressLabel {
 	groupStartIndex: number;
 	groupEndIndex: number;
 	showActiveGroupOnly: boolean;
+	logicalStepCount: number;
 }
 
 function buildMultiProgressLabel(details: Pick<Details, "mode" | "results" | "progress" | "totalSteps" | "currentStepIndex" | "chainAgents" | "workflowGraph">, hasRunning: boolean): MultiProgressLabel {
 	const stepSpans = buildChainStepSpans(details);
 	const hasParallelInChain = details.mode === "chain" && stepSpans.some((span) => span.isParallel);
-	const activeParallelGroup = isChainParallelGroupActive(details);
+	const activeParallelGroup = details.mode === "chain"
+		&& details.currentStepIndex !== undefined
+		&& stepSpans.some((span) => span.stepIndex === details.currentStepIndex && span.isParallel);
 	const itemTitle: "Step" | "Agent" = details.mode === "parallel" || activeParallelGroup ? "Agent" : "Step";
 
 	if (details.mode === "parallel") {
@@ -636,14 +2049,12 @@ function buildMultiProgressLabel(details: Pick<Details, "mode" | "results" | "pr
 				|| details.progress?.find((progress) => progress.agent === result.agent && progress.status === "running");
 			const index = result.progress?.index ?? progressFromArray?.index ?? i;
 			if (index < 0 || index >= totalCount) continue;
-			const status = result.progress?.status
-				?? (result.stopped
-					? "stopped"
-					: result.interrupted || result.detached
-						? "detached"
-						: result.exitCode === 0
-							? "completed"
-							: "failed");
+			const status = result.stopped
+				? "stopped"
+				: result.interrupted || result.detached
+					? "detached"
+					: result.progress?.status
+						?? (result.exitCode === 0 ? "completed" : "failed");
 			statuses[index] = status;
 		}
 		const running = statuses.filter((status) => status === "running").length;
@@ -651,7 +2062,7 @@ function buildMultiProgressLabel(details: Pick<Details, "mode" | "results" | "pr
 		const headerLabel = hasRunning
 			? `${formatAgentRunningLabel(running)} · ${done}/${totalCount} done`
 			: `${done}/${totalCount} done`;
-		return { headerLabel, itemTitle, totalCount, hasParallelInChain, activeParallelGroup, groupStartIndex: 0, groupEndIndex: totalCount, showActiveGroupOnly: false };
+		return { headerLabel, itemTitle, totalCount, hasParallelInChain, activeParallelGroup, groupStartIndex: 0, groupEndIndex: totalCount, showActiveGroupOnly: false, logicalStepCount: totalCount };
 	}
 
 	if (activeParallelGroup) {
@@ -664,8 +2075,8 @@ function buildMultiProgressLabel(details: Pick<Details, "mode" | "results" | "pr
 		let done = 0;
 		for (let index = groupStart; index < groupEnd; index++) {
 			const progressEntry = details.progress?.find((progress) => progress.index === index);
-			const resultEntry = details.results.find((result) => result.progress?.index === index);
-			if (progressEntry?.status === "running") {
+			const resultEntry = details.results.find((result) => result.progress?.index === index) ?? details.results[index];
+			if (progressEntry?.status === "running" && (!resultEntry || !hasTerminalResultFlag(resultEntry))) {
 				running++;
 				continue;
 			}
@@ -679,7 +2090,7 @@ function buildMultiProgressLabel(details: Pick<Details, "mode" | "results" | "pr
 		const headerLabel = hasRunning
 			? `step ${currentStepIndex + 1}/${totalSteps} · parallel group: ${formatAgentRunningLabel(running)} · ${done}/${groupSize} done`
 			: `step ${currentStepIndex + 1}/${totalSteps} · parallel group: ${done}/${groupSize} done`;
-		return { headerLabel, itemTitle, totalCount: groupSize, hasParallelInChain, activeParallelGroup, groupStartIndex: groupStart, groupEndIndex: groupEnd, showActiveGroupOnly: true };
+		return { headerLabel, itemTitle, totalCount: groupSize, hasParallelInChain, activeParallelGroup, groupStartIndex: groupStart, groupEndIndex: groupEnd, showActiveGroupOnly: true, logicalStepCount: totalSteps };
 	}
 
 	if (details.mode === "chain" && details.chainAgents?.length) {
@@ -697,35 +2108,68 @@ function buildMultiProgressLabel(details: Pick<Details, "mode" | "results" | "pr
 		}).length;
 		const currentStep = details.currentStepIndex !== undefined ? details.currentStepIndex + 1 : Math.min(totalCount, doneLogical + (hasRunning ? 1 : 0));
 		const headerLabel = hasRunning ? `step ${currentStep}/${totalCount}` : `step ${doneLogical}/${totalCount}`;
-		return { headerLabel, itemTitle, totalCount, hasParallelInChain, activeParallelGroup, groupStartIndex: 0, groupEndIndex: details.results.length, showActiveGroupOnly: false };
+		return { headerLabel, itemTitle, totalCount, hasParallelInChain, activeParallelGroup, groupStartIndex: 0, groupEndIndex: details.results.length, showActiveGroupOnly: false, logicalStepCount: totalCount };
 	}
 
 	const totalCount = details.totalSteps ?? details.results.length;
 	const currentStep = details.currentStepIndex !== undefined ? details.currentStepIndex + 1 : Math.min(totalCount, details.results.filter(isDoneResult).length + (hasRunning ? 1 : 0));
 	const done = details.results.filter(isDoneResult).length;
 	const headerLabel = hasRunning ? `step ${currentStep}/${totalCount}` : `step ${done}/${totalCount}`;
-	return { headerLabel, itemTitle, totalCount, hasParallelInChain, activeParallelGroup, groupStartIndex: 0, groupEndIndex: details.results.length, showActiveGroupOnly: false };
+	return { headerLabel, itemTitle, totalCount, hasParallelInChain, activeParallelGroup, groupStartIndex: 0, groupEndIndex: details.results.length, showActiveGroupOnly: false, logicalStepCount: totalCount };
 }
 
-function resultRowLabel(details: Pick<Details, "mode" | "chainAgents" | "workflowGraph">, label: MultiProgressLabel, resultIndex: number, stepNumber: number): string {
-	if (details.mode === "chain" && label.hasParallelInChain) {
-		const span = buildChainStepSpans(details).find((candidate) => resultIndex >= candidate.start && resultIndex < candidate.start + candidate.count);
-		if (span?.isParallel) return `Agent ${resultIndex - span.start + 1}/${span.count}`;
-		if (span) return `Step ${span.stepIndex + 1}`;
-	}
-	if (label.itemTitle === "Agent") {
-		const localStepNumber = label.activeParallelGroup
-			? Math.max(1, stepNumber - label.groupStartIndex)
-			: stepNumber;
-		return `Agent ${localStepNumber}/${label.totalCount}`;
-	}
-	return `Step ${stepNumber}`;
+function resultRowLabel(label: MultiProgressLabel, stepNumber: number): string | undefined {
+	if (label.itemTitle === "Agent") return undefined;
+	if (shouldSuppressSingleStep(label.logicalStepCount)) return undefined;
+	return `Step ${stepNumber}/${label.logicalStepCount}`;
 }
 
-function widgetStats(job: AsyncJobState, theme: Theme): string {
+function buildForegroundResultEntries(
+	details: Details,
+	label: MultiProgressLabel,
+	displayStart: number,
+	displayEnd: number,
+	useResultsDirectly: boolean,
+): ChainRenderResultEntry[] {
+	const fallbackLabel = label.itemTitle.toLowerCase();
+	const entries = Array.from({ length: displayEnd - displayStart }, (_, offset): ChainRenderResultEntry => {
+		const index = displayStart + offset;
+		const result = details.results[index];
+		const stableIndex = foregroundResultIndex(details, index);
+		const rowNumber = label.showActiveGroupOnly ? index - label.groupStartIndex + 1 : stableIndex + 1;
+		const fallbackAgent = useResultsDirectly
+			? (result?.agent || `${fallbackLabel}-${rowNumber}`)
+			: (details.chainAgents![index] || result?.agent || `${fallbackLabel}-${rowNumber}`);
+		const displayIndex = label.activeParallelGroup && stableIndex >= label.groupStartIndex && stableIndex < label.groupEndIndex
+			? stableIndex - label.groupStartIndex
+			: label.activeParallelGroup ? index - label.groupStartIndex : stableIndex;
+		return {
+			kind: "result",
+			resultIndex: index,
+			rowNumber,
+			rowLabel: resultRowLabel(label, rowNumber),
+			agentName: foregroundResultDisplayName(details, index, result, fallbackAgent),
+			displayIndex,
+		};
+	});
+	return label.itemTitle === "Agent" ? withDuplicateForegroundLabels(entries, label.totalCount) : entries;
+}
+
+function widgetStats(job: AsyncJobState, theme: Theme, projection = buildWorkflowWidgetProjection(job), collapsed = false): string {
 	const parts: string[] = [];
-	const stepsTotal = job.stepsTotal ?? (job.agents?.length ?? 1);
-	if (job.activeParallelGroup) {
+	const { stageProgress } = projection;
+	const stepsTotal = stageProgress?.total ?? job.stepsTotal ?? (job.agents?.length ?? 1);
+	const isSingleChild = isSingleChildAsyncJob(job);
+	const checklistPrimary = collapsed && job.mode === "workflow" && projection.checklist !== undefined;
+	if (checklistPrimary) {
+		parts.push(formatWorkflowChecklistSummary(projection.checklist!));
+	} else if (stageProgress) {
+		const currentStage = stageProgress.current !== undefined ? projection.stages[stageProgress.current] : undefined;
+		const focus = currentStage
+			? [compactTaskText(undefined, currentStage.label) ?? boundedLaneValue(currentStage.id), currentStage.agent ? boundedLaneValue(currentStage.agent) : "", workflowNodeStatusLabel(currentStage.status)].filter(Boolean)
+			: [];
+		parts.push(["staged lane", stageProgress.current !== undefined ? `stage ${stageProgress.current + 1}/${stageProgress.total}` : `${stageProgress.total} stages`, ...focus].join(" · "));
+	} else if (job.activeParallelGroup) {
 		const running = job.runningSteps ?? (job.status === "running" ? 1 : 0);
 		const done = job.completedSteps ?? (job.status === "complete" ? stepsTotal : 0);
 		if (job.mode === "parallel") {
@@ -742,27 +2186,37 @@ function widgetStats(job: AsyncJobState, theme: Theme): string {
 			parts.push(`step ${logicalStep + 1}/${total} · parallel group: ${groupParts.join(" · ")}`);
 		}
 	} else if (job.currentStep !== undefined) {
-		if (job.mode === "chain" && job.parallelGroups?.length) {
+		if (job.mode === "chain") {
 			const total = job.chainStepCount ?? stepsTotal;
-			parts.push(`step ${flatToLogicalStepIndex(job.currentStep, total, job.parallelGroups) + 1}/${total}`);
-		} else {
+			parts.push(`step ${flatToLogicalStepIndex(job.currentStep, total, job.parallelGroups ?? []) + 1}/${total}`);
+		} else if (!isSingleChild) {
 			parts.push(`step ${job.currentStep + 1}/${stepsTotal}`);
 		}
 	} else if (stepsTotal > 1) {
 		parts.push(`steps ${stepsTotal}`);
 	}
+	if (projection.checklist && !checklistPrimary) parts.push(formatWorkflowChecklistSummary(projection.checklist));
 	if (job.toolCount !== undefined) parts.push(formatToolUseStat(job.toolCount));
-	if (job.totalTokens?.total) parts.push(formatTokenStat(job.totalTokens.total));
-	if (job.startedAt !== undefined && job.updatedAt !== undefined) parts.push(formatDuration(Math.max(0, job.updatedAt - job.startedAt)));
+	if (job.totalTokens?.total) parts.push(formatTokenUsage(job.totalTokens, "token"));
+	const end = job.status === "running" && (job.mode === "workflow" || job.parentWorkflowRunId) ? projection.now : job.updatedAt;
+	if (job.status !== "queued" && job.startedAt !== undefined && end !== undefined) parts.push(formatDuration(Math.max(0, end - job.startedAt)));
 	return statJoin(theme, parts);
 }
 
-function widgetStepStats(theme: Theme, step: NonNullable<AsyncJobState["steps"]>[number]): string {
+function widgetStepStats(theme: Theme, step: NonNullable<AsyncJobState["steps"]>[number], snapshotNow = Date.now()): string {
+	const externalElapsed = step.runner?.type === "external-cli" && step.externalProcess
+		? step.externalProcess.durationMs ?? Math.max(0, (step.externalProcess.endedAt ?? snapshotNow) - step.externalProcess.startedAt)
+		: undefined;
 	return statJoin(theme, [
+		step.runner?.type === "external-cli" ? "external-cli" : "",
 		step.turnCount !== undefined ? `${step.turnCount} turns` : "",
 		step.toolCount !== undefined ? formatToolUseStat(step.toolCount) : "",
-		step.tokens?.total ? formatTokenStat(step.tokens.total) : "",
-		step.durationMs !== undefined ? formatDuration(step.durationMs) : "",
+		step.tokens
+			? step.contextLimit !== undefined
+				? formatContextUsage(step.tokens, step.contextLimit) ?? formatTokenUsage(step.tokens, "token")
+				: step.tokens.total ? formatTokenUsage(step.tokens, "token") : ""
+			: "",
+		externalElapsed !== undefined ? formatDuration(externalElapsed) : step.durationMs !== undefined ? formatDuration(step.durationMs) : "",
 	]);
 }
 
@@ -786,15 +2240,17 @@ function widgetOutputPath(job: AsyncJobState, step: NonNullable<AsyncJobState["s
 }
 
 function nestedRunName(run: NestedRunSummary): string {
+	if (run.sessionName?.trim()) return run.sessionName.trim();
 	if (run.agent) return run.agent;
 	if (run.agents?.length) return formatWidgetAgents(run.agents);
 	return run.id;
 }
 
-function nestedStatusGlyph(state: NestedRunSummary["state"] | NestedStepSummary["status"], theme: Theme, seed?: number): string {
-	if (state === "running") return theme.fg("accent", runningGlyph(seed));
+function nestedStatusGlyph(state: NestedRunSummary["state"] | NestedStepSummary["status"], theme: Theme, seed?: number, thinking?: ThinkingLevel): string {
+	if (state === "running") return runningTone(theme, thinking)(runningGlyph(seed));
 	if (state === "complete" || state === "completed") return theme.fg("success", "✓");
 	if (state === "failed") return theme.fg("error", "✗");
+	if (state === "partial") return theme.fg("warning", "■");
 	if (state === "paused") return theme.fg("warning", "■");
 	if (state === "stopped") return theme.fg("warning", "■");
 	return theme.fg("muted", "◦");
@@ -802,6 +2258,29 @@ function nestedStatusGlyph(state: NestedRunSummary["state"] | NestedStepSummary[
 
 function nestedRunSeed(run: NestedRunSummary): number | undefined {
 	return runningSeed(run.lastUpdate, run.lastActivityAt, run.currentStep, run.toolCount, run.turnCount, run.totalTokens?.total, run.currentToolStartedAt);
+}
+
+function formatClockTime(ms: number | undefined): string | undefined {
+	if (ms === undefined || !Number.isFinite(ms)) return undefined;
+	const date = new Date(ms);
+	const pad = (value: number) => value.toString().padStart(2, "0");
+	return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function nestedRunEventTime(run: NestedRunSummary): number | undefined {
+	return run.state === "running"
+		? (run.lastActivityAt ?? run.currentToolStartedAt ?? run.lastUpdate ?? run.startedAt)
+		: (run.endedAt ?? run.lastUpdate ?? run.lastActivityAt ?? run.startedAt);
+}
+
+function nestedStepTimestamp(step: NestedStepSummary, fallback?: number): string | undefined {
+	return formatClockTime(step.status === "running"
+		? (step.lastActivityAt ?? step.currentToolStartedAt ?? fallback ?? step.startedAt)
+		: (step.endedAt ?? step.lastActivityAt ?? fallback ?? step.startedAt));
+}
+
+function nestedTimestampPrefix(timestamp: string | undefined): string {
+	return timestamp ? `[${timestamp}] ` : "";
 }
 
 function nestedActivity(input: Pick<NestedRunSummary | NestedStepSummary, "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount">, state: NestedRunSummary["state"] | NestedStepSummary["status"], snapshotNow?: number): string {
@@ -819,6 +2298,7 @@ function nestedActivity(input: Pick<NestedRunSummary | NestedStepSummary, "activ
 	if (state === "queued" || state === "pending") return "queued…";
 	if (state === "paused") return "Paused";
 	if (state === "stopped") return "Stopped";
+	if (state === "partial") return "Partial";
 	if (state === "failed") return "Failed";
 	return "Done";
 }
@@ -826,8 +2306,56 @@ function nestedActivity(input: Pick<NestedRunSummary | NestedStepSummary, "activ
 function formatNestedWidgetLines(children: NestedRunSummary[] | undefined, theme: Theme, width: number, expanded: boolean, snapshotNow?: number, lineBudget = expanded ? 12 : 1): string[] {
 	if (!children?.length || lineBudget <= 0) return [];
 	if (!expanded) {
-		const aggregate = formatNestedAggregate(children);
-		return aggregate ? [theme.fg("dim", `↳ ${aggregate}`)] : [];
+		type CollapsedRow = { text: string; prefix: string };
+		const rows: CollapsedRow[] = [];
+		const maxLeaves = 4;
+		const maxLines = Math.min(6, lineBudget);
+		let leaves = 0;
+		let overflow = 0;
+		const appendLeaf = (step: NestedStepSummary | NestedRunSummary, prefix: string, fallback?: number): void => {
+			if (leaves >= maxLeaves) {
+				overflow++;
+				return;
+			}
+			leaves++;
+			const state = "status" in step ? step.status : step.state;
+			const modelThinking = formatModelThinking(step.model, step.thinking);
+			const activity = nestedActivity(step, state, snapshotNow ?? fallback);
+			const timestamp = "status" in step ? nestedStepTimestamp(step, fallback) : formatClockTime(nestedRunEventTime(step));
+			const error = step.error ? ` · ${step.error}` : "";
+			const name = "status" in step ? childDisplayName(step) : nestedRunName(step);
+			rows.push({
+				prefix,
+				text: `${nestedTimestampPrefix(timestamp)}${nestedStatusGlyph(state, theme, undefined, childThinkingLevel(step))} ${name} · ${state}${modelThinking ? ` · ${modelThinking}` : ""}${activity ? ` · ${activity}` : ""}${error}`,
+			});
+		};
+		for (const child of children) {
+			const steps = (child.mode === "parallel" || child.mode === "chain") ? child.steps ?? [] : [];
+			if (steps.length > 0) {
+				const ownerModelThinking = formatModelThinking(child.model, child.thinking);
+				const ownerActivity = nestedActivity(child, child.state, snapshotNow ?? child.lastUpdate);
+				const ownerError = child.error ? ` · ${child.error}` : "";
+				rows.push({
+					prefix: "↳ ",
+					text: `OWNER ${nestedStatusGlyph(child.state, theme, nestedRunSeed(child), childThinkingLevel(child))} ${nestedRunName(child)} · ${child.state}${ownerModelThinking ? ` · ${ownerModelThinking}` : ""}${ownerActivity ? ` · ${ownerActivity}` : ""}${ownerError}`,
+				});
+				for (const step of steps) appendLeaf(step, "↳ │  ", child.lastUpdate);
+			} else {
+				appendLeaf(child, "↳ ", child.lastUpdate);
+			}
+		}
+		if (overflow > 0) rows.push({ prefix: "↳ ", text: `… +${overflow} more nested leaves` });
+		const visibleRows = rows.length <= maxLines
+			? rows
+			: overflow > 0
+				? [...rows.slice(0, Math.max(0, maxLines - 1)), rows.at(-1)!]
+				: rows.slice(0, maxLines);
+		return visibleRows.map((row, index) => {
+			const marker = index === visibleRows.length - 1 ? "└─" : "├─";
+			const prefix = row.prefix;
+			const text = row.text.startsWith("OWNER ") ? row.text.slice("OWNER ".length) : row.text;
+			return truncLine(theme.fg("dim", `${prefix}${marker} ${text}`), width);
+		});
 	}
 	const lines: string[] = [];
 	const maxDepth = 2;
@@ -847,7 +2375,8 @@ function formatNestedWidgetLines(children: NestedRunSummary[] | undefined, theme
 			}
 			const activity = nestedActivity(child, child.state, snapshotNow ?? child.lastUpdate);
 			const error = child.error ? ` · ${child.error}` : "";
-			lines.push(theme.fg("dim", `${prefix}↳ ${nestedStatusGlyph(child.state, theme, nestedRunSeed(child))} ${nestedRunName(child)} · ${child.state} · ${activity}${error}`));
+			const modelThinking = formatModelThinking(child.model, child.thinking);
+			lines.push(theme.fg("dim", `${prefix}↳ ${nestedTimestampPrefix(formatClockTime(nestedRunEventTime(child)))}${nestedStatusGlyph(child.state, theme, nestedRunSeed(child), childThinkingLevel(child))} ${nestedRunName(child)} · ${child.state}${modelThinking ? ` · ${modelThinking}` : ""} · ${activity}${error}`));
 			if (depth === maxDepth) {
 				const aggregate = formatNestedAggregate([...(child.steps?.flatMap((step) => step.children ?? []) ?? []), ...(child.children ?? [])]);
 				if (aggregate && lines.length < lineBudget) lines.push(theme.fg("dim", `${prefix}  ↳ ${aggregate}`));
@@ -855,7 +2384,8 @@ function formatNestedWidgetLines(children: NestedRunSummary[] | undefined, theme
 			}
 			for (const step of child.steps ?? []) {
 				if (lines.length >= lineBudget) return;
-				lines.push(theme.fg("dim", `${prefix}  ↳ ${nestedStatusGlyph(step.status, theme)} ${step.agent} · ${step.status} · ${nestedActivity(step, step.status, snapshotNow ?? child.lastUpdate)}`));
+				const modelThinking = formatModelThinking(step.model, step.thinking);
+				lines.push(theme.fg("dim", `${prefix}  ↳ ${nestedTimestampPrefix(nestedStepTimestamp(step, child.lastUpdate))}${nestedStatusGlyph(step.status, theme, undefined, childThinkingLevel(step))} ${childDisplayName(step)} · ${step.status}${modelThinking ? ` · ${modelThinking}` : ""} · ${nestedActivity(step, step.status, snapshotNow ?? child.lastUpdate)}`));
 				append(step.children, depth + 1, `${prefix}    `);
 			}
 			append(child.children, depth + 1, `${prefix}  `);
@@ -869,89 +2399,196 @@ function foregroundStyleWidgetStepLines(
 	job: AsyncJobState,
 	theme: Theme,
 	step: NonNullable<AsyncJobState["steps"]>[number],
-	itemTitle: "Agent" | "Step",
+	itemTitle: "Agent" | "Stage" | "Step",
 	index: number,
 	total: number,
 	expanded: boolean,
 	width: number,
+	frame?: number,
+	/** `fullTask`: the widget has exactly one running child, so an expanded row may spend lines on its whole task. */
+	options?: { rowLabel?: string; rowIndent?: string; detailIndent?: string; rowMarker?: string; includeCurrentPath?: boolean; fullTask?: boolean },
 ): string[] {
-	const status = widgetStepStatus(step.status, theme);
-	const stats = widgetStepStats(theme, step);
+	const rowIndent = options?.rowIndent ?? "  ";
+	const detailIndent = options?.detailIndent ?? "    ";
+	const thinking = childThinkingLevel(step);
+	const status = widgetStepStatus(step.status, theme, thinking);
+	const stats = widgetStepStats(theme, step, job.updatedAt);
 	const modelDisplay = modelThinkingBadge(theme, step.model, step.thinking);
-	const lines = [`  ${widgetStepGlyph(step.status, theme, widgetStepRunningSeed(step, index - 1))} ${itemTitle} ${index}/${total}: ${themeBold(theme, step.agent)} ${theme.fg("dim", "·")} ${status}${modelDisplay}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`];
+	const collapseDetails = shouldCollapseSingleChildDetails(job, step);
+	const displayName = collapseDetails ? singleChildAgentName(job, step) : childDisplayName(step);
+	const stageName = itemTitle === "Stage"
+		? compactTaskText(undefined, step.label) ?? boundedLaneValue(step.workflowKey) ?? displayName
+		: undefined;
+	const stageIdentity = stageName && stageName !== displayName ? `${stageName} (${displayName})` : stageName ?? displayName;
+	const rowLabel = collapseDetails ? displayName : (options?.rowLabel ?? `${itemTitle} ${index}/${total}: ${itemTitle === "Stage" ? stageIdentity : displayName}`);
+	const rowMarker = options?.rowMarker ? `${options.rowMarker} ` : "";
+	const lines = [`${rowIndent}${rowMarker}${widgetStepGlyph(step.status, theme, widgetStepRunningSeed(step, index - 1), frame, thinking)} ${themeBold(theme, rowLabel)}${contextModeBadge(theme, step.context)} ${theme.fg("dim", "·")} ${status}${modelDisplay}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`];
+	const lane = projectAsyncLane(job, step);
+	if (lane) lines.push(...formatLaneProjectionLines(lane, theme, detailIndent));
+	// Multi-job cards prefix every line with a 4-column tree continuation after this returns.
+	const fullTask = expanded && options?.fullTask && step.status === "running" ? expandedTaskLines(step.description, step.label, width - detailIndent.length - 4) : undefined;
+	const task = fullTask ? undefined : collapseDetails ? stepTaskSummary(step, displayName) : compactTaskText(step.description, step.label);
+	for (const line of fullTask ?? []) lines.push(`${detailIndent}${theme.fg("dim", line)}`);
+	if (task) lines.push(`${detailIndent}${theme.fg("dim", `task: ${task}`)}`);
+	const progressRow = step.status === "running" ? reportedProgressRow(step, theme, detailIndent, width - 4) : undefined;
+	if (progressRow) lines.push(progressRow);
 	const activity = widgetStepActivityLine(step, width, expanded, job.updatedAt);
-	if (activity) lines.push(`    ${theme.fg("dim", `⎿  ${activity}`)}`);
-	for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, expanded, job.updatedAt)) {
-		lines.push(`    ${nestedLine}`);
+	const currentPath = options?.includeCurrentPath && step.currentPath ? shortenPath(step.currentPath) : undefined;
+	const activityWithPath = currentPath && activity && !activity.includes(currentPath)
+		? `${activity} · ${currentPath}`
+		: activity ?? currentPath;
+	if (activityWithPath) lines.push(`${detailIndent}${theme.fg("dim", `⎿  ${activityWithPath}`)}`);
+	for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, expanded, job.updatedAt, expanded ? 12 : 6)) {
+		lines.push(`${detailIndent}${nestedLine}`);
 	}
+	const error = step.error?.trim() || step.execution?.error?.trim();
+	if (error) lines.push(`${detailIndent}${theme.fg("error", `error: ${oneLine(error)}`)}`);
 	if (step.status === "running") {
-		if (!expanded) lines.push(`    ${theme.fg("accent", liveDetailHintText())}`);
+		if (!expanded) lines.push(`${detailIndent}${theme.fg("accent", liveDetailHintText())}`);
 		const output = widgetOutputPath(job, step);
-		if (output) lines.push(`    ${theme.fg("dim", `output: ${shortenPath(output)}`)}`);
+		if (output) lines.push(`${detailIndent}${theme.fg("dim", `output: ${shortenPath(output)}`)}`);
 		if (expanded) {
 			const liveStatus = buildLiveStatusLine(step, job.updatedAt);
-			if (liveStatus && liveStatus !== activity) lines.push(`    ${theme.fg("accent", liveStatus)}`);
+			if (liveStatus && liveStatus !== activity) lines.push(`${detailIndent}${theme.fg("accent", liveStatus)}`);
 			for (const tool of step.recentTools?.slice(-3) ?? []) {
 				const maxArgsLen = Math.max(40, width - 30);
-				const argsPreview = tool.args.length <= maxArgsLen ? tool.args : `${tool.args.slice(0, maxArgsLen)}...`;
-				lines.push(`      ${theme.fg("dim", `${tool.tool}${argsPreview ? `: ${argsPreview}` : ""}`)}`);
+				const argsPreview = renderToolArgsPreview(tool.args, maxArgsLen, expanded);
+				lines.push(`${detailIndent}  ${theme.fg("dim", `${tool.tool}${argsPreview ? `: ${argsPreview}` : ""}`)}`);
 			}
-			for (const line of step.recentOutput?.slice(-5) ?? []) {
-				lines.push(`      ${theme.fg("dim", line)}`);
+			for (const line of compactRecentOutputLines(step.recentOutput)) {
+				lines.push(`${detailIndent}  ${theme.fg("dim", line)}`);
 			}
 		}
 	}
 	return lines;
 }
 
-function foregroundStyleWidgetDetails(job: AsyncJobState, theme: Theme, expanded: boolean, width: number): string[] {
-	if (!job.steps?.length) return [
-		`  ${theme.fg("dim", `⎿  ${widgetActivity(job)}`)}`,
-		...formatNestedWidgetLines(job.nestedChildren, theme, width, expanded, job.updatedAt).map((line) => `  ${line}`),
-	];
-	if (job.mode === "chain" && !job.activeParallelGroup && job.parallelGroups?.length) return widgetChainDetails(job, theme, expanded, width);
-	const total = job.stepsTotal ?? job.steps.length;
-	const itemTitle = job.mode === "parallel" || job.activeParallelGroup ? "Agent" : "Step";
-	const lines: string[] = [];
-	for (const [index, step] of job.steps.entries()) {
-		lines.push(...foregroundStyleWidgetStepLines(job, theme, step, itemTitle, index + 1, total, expanded, width));
+function hostStepWidgetLines(job: AsyncJobState, theme: Theme, indent: string): string[] {
+	const rows = projectAsyncWorkflowRows([], job.hostSteps).filter((row) => row.kind);
+	const visible = rows.slice(0, 8);
+	const lines = visible.map((row) => {
+		const state = hostStepVerdictLabel(row.state as HostStepState, row.verdict as HostStepVerdict | undefined);
+		const glyph = state === "running" ? theme.fg("accent", "●")
+			: state === "pending" ? theme.fg("muted", "◦")
+			: state === "pass" ? theme.fg("success", "✓")
+			: state === "fail" || state === "error" ? theme.fg("error", "✗")
+			: theme.fg("warning", "■");
+		const details = [
+			row.provider ? `provider:${row.provider}` : undefined,
+			row.role ? `role:${row.role}` : undefined,
+			row.target,
+			row.detail,
+			row.reasonCode ? `reason:${row.reasonCode}` : undefined,
+			row.freshness?.stale ? "stale" : row.freshness?.observedRef ? `ref:${row.freshness.observedRef}` : undefined,
+			row.reportPath ? `out:${hostStepReportName(row.reportPath)}` : undefined,
+		].filter(Boolean).join(" · ");
+		return `${indent}${glyph} ${row.kind}: ${row.name} · ${state}${details ? ` · ${details}` : ""}`;
+	});
+	if (rows.length > visible.length) lines.push(`${indent}${theme.fg("dim", `… +${rows.length - visible.length} host steps hidden`)}`);
+	return lines;
+}
+
+function foregroundStyleWidgetDetails(job: AsyncJobState, theme: Theme, expanded: boolean, width: number, frame?: number, projection = buildWorkflowWidgetProjection(job), fullTask = false): string[] {
+	const steps = projection.steps.filter((step) => !projection.materializedKeys?.has(step.workflowKey ?? "") && !projection.materializedKeys?.has(step.runId ?? ""));
+	const checklist = widgetChecklistWithoutMaterializedChildren(projection);
+	if (!expanded && job.mode === "workflow") {
+		return compactWorkflowWidgetBodyLines(job, theme, frame, projection);
 	}
-	const attached = new Set(job.steps.flatMap((step) => step.children?.map((child) => child.id) ?? []));
+	if (!steps.length) {
+		const lane = projectAsyncLane(job, laneStepForJob(job, steps));
+		return [
+			...(expanded ? workflowPreflightLines(job) : []),
+			...workflowChecklistWidgetLines(checklist, theme, "  ", expanded, frame, { liveWidget: true }),
+			...(lane ? formatLaneProjectionLines(lane, theme, "  ") : []),
+			...hostStepWidgetLines(job, theme, "  "),
+			`  ${theme.fg("dim", `⎿  ${widgetActivity(job)}`)}`,
+			...formatNestedWidgetLines(job.nestedChildren, theme, width, expanded, job.updatedAt, expanded ? 12 : 6).map((line) => `  ${line}`),
+		];
+	}
+	if (job.mode === "chain" && !job.activeParallelGroup && job.parallelGroups?.length) return widgetChainDetails(job, theme, expanded, width, frame, fullTask);
+	const lines: string[] = [
+		...(expanded ? workflowPreflightLines(job) : []),
+		...workflowChecklistWidgetLines(checklist, theme, "  ", expanded, frame, { includeItemErrors: !expanded, liveWidget: true }),
+	];
+	const group = activeParallelWidgetGroup(job);
+	if (group) {
+		lines.push(...parallelWidgetGroupDetails(job, theme, group, expanded, width, frame, Boolean(job.activeParallelGroup), fullTask));
+	} else {
+		const { stageProgress, plannedKeys } = projection;
+		const total = job.mode === "chain"
+			? job.chainStepCount ?? job.stepsTotal ?? steps.length
+			: stageProgress?.total ?? job.stepsTotal ?? steps.length;
+		const stageTotal = stageProgress?.total ?? total;
+		const extraStepCount = plannedKeys
+			? steps.filter((step) => step.workflowKey === undefined || !plannedKeys.has(step.workflowKey)).length
+			: total;
+		let extraStepIndex = 0;
+		for (const [index, step] of steps.entries()) {
+			const isPlannedStage = plannedKeys !== undefined && step.workflowKey !== undefined && plannedKeys.has(step.workflowKey);
+			const itemTitle = isPlannedStage ? "Stage" : "Step";
+			const displayIndex = isPlannedStage ? (step.index ?? index) + 1 : plannedKeys ? ++extraStepIndex : index + 1;
+			const displayTotal = isPlannedStage ? stageTotal : extraStepCount;
+			lines.push(...foregroundStyleWidgetStepLines(job, theme, step, itemTitle, displayIndex, displayTotal, expanded, width, frame, { fullTask }));
+		}
+	}
+	lines.push(...hostStepWidgetLines(job, theme, "  "));
+	const attached = new Set(steps.flatMap((step) => step.children?.map((child) => child.id) ?? []));
 	const unattached = job.nestedChildren?.filter((child) => !attached.has(child.id)) ?? [];
-	for (const nestedLine of formatNestedWidgetLines(unattached, theme, width, expanded, job.updatedAt)) {
+	for (const nestedLine of formatNestedWidgetLines(unattached, theme, width, expanded, job.updatedAt, expanded ? 12 : 6)) {
 		lines.push(`  ${nestedLine}`);
 	}
 	return lines;
 }
 
-function buildSingleWidgetLines(job: AsyncJobState, theme: Theme, width: number, expanded: boolean): string[] {
-	const stats = widgetStats(job, theme);
-	const count = job.mode === "chain" ? job.chainStepCount : job.stepsTotal ?? job.agents?.length ?? job.steps?.length;
+/** `reservedLines` are lines the caller renders after these, such as materialized workflow children. */
+function buildSingleWidgetLines(job: AsyncJobState, theme: Theme, width: number, expanded: boolean, frame?: number, projection = buildWorkflowWidgetProjection(job), reservedLines = 0, fullTask = false): string[] {
+	if ((!expanded || projection.inlineFleetCovered) && job.mode === "workflow") return [compactWorkflowHeaderLine(job, theme, width), ...compactWorkflowWidgetBodyLines(job, theme, frame, projection, widgetLineBudget(expanded) - 1 - reservedLines)].map((line) => truncLine(line, width));
+	const stats = widgetStats(job, theme, projection, !expanded);
+	const count = job.mode === "workflow"
+		? projection.checklist?.total ?? projection.stageProgress?.total ?? job.stepsTotal ?? job.agents?.length ?? job.steps?.length
+		: job.mode === "chain" ? job.chainStepCount : projection.stageProgress?.total ?? job.stepsTotal ?? job.agents?.length ?? job.steps?.length;
 	const mode = widgetJobName(job);
-	const title = `async subagent ${mode}${count && count > 1 ? ` (${count})` : ""}`;
+	const title = isSingleChildAsyncJob(job)
+		? "async subagent"
+		: `async subagent ${mode}${count && count > 1 ? ` (${count})` : ""}`;
+	const checklistPrimary = !expanded && job.mode === "workflow" && projection.checklist !== undefined;
+	const collapseDetails = !checklistPrimary && job.steps?.length === 1 && shouldCollapseSingleChildDetails(job, job.steps[0]!);
+	const summary = `${widgetStatusGlyph(job, theme, frame)} ${themeBold(theme, mode)}${contextModeBadge(theme, job.context)}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`;
 	return [
 		`${theme.fg("toolTitle", themeBold(theme, title))} ${theme.fg("dim", "· background")}`,
-		`${widgetStatusGlyph(job, theme)} ${themeBold(theme, mode)}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`,
-		...foregroundStyleWidgetDetails(job, theme, expanded, width),
+		...(collapseDetails ? [] : [summary]),
+		...foregroundStyleWidgetDetails(job, theme, expanded, width, frame, projection, fullTask),
 	].map((line) => truncLine(line, width));
 }
 
-function compactSingleWidgetLines(job: AsyncJobState, theme: Theme, width: number): string[] {
-	const fullLines = buildSingleWidgetLines(job, theme, width, false);
+function compactSingleWidgetLines(job: AsyncJobState, theme: Theme, width: number, frame?: number, projection = buildWorkflowWidgetProjection(job)): string[] {
+	const fullLines = buildSingleWidgetLines(job, theme, width, false, frame, projection);
 	if (fullLines.length <= 10 || !job.steps?.length || (job.mode !== "parallel" && !job.activeParallelGroup)) return fullLines;
 
-	const total = job.stepsTotal ?? job.steps.length;
-	const itemTitle = job.mode === "parallel" || job.activeParallelGroup ? "Agent" : "Step";
+	const group = activeParallelWidgetGroup(job);
+	if (!group) return fullLines;
+	const rows = parallelWidgetStepRows(group.steps, group.total, Boolean(job.activeParallelGroup));
 	const lines = fullLines.slice(0, 2);
-	for (const [index, step] of job.steps.entries()) {
-		const status = widgetStepStatus(step.status, theme);
+	lines.push(parallelWidgetGroupHeader(group, theme, frame));
+	for (const [rowIndex, row] of rows.entries()) {
+		const step = row.step;
+		const thinking = childThinkingLevel(step);
+		const status = widgetStepStatus(step.status, theme, thinking);
 		const activity = widgetStepActivityLine(step, width, false, job.updatedAt);
-		const stepStats = widgetStepStats(theme, step);
-		const activitySuffix = activity ? ` ${theme.fg("dim", "·")} ${theme.fg("dim", activity)}` : "";
+		const stepStats = widgetStepStats(theme, step, job.updatedAt);
 		const modelDisplay = modelThinkingBadge(theme, step.model, step.thinking);
-		lines.push(`  ${widgetStepGlyph(step.status, theme, widgetStepRunningSeed(step, index))} ${itemTitle} ${index + 1}/${total}: ${themeBold(theme, step.agent)} ${theme.fg("dim", "·")} ${status}${modelDisplay}${activitySuffix}${stepStats ? ` ${theme.fg("dim", "·")} ${stepStats}` : ""}`);
-		for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, false, job.updatedAt)) lines.push(`    ${nestedLine}`);
+		const task = compactTaskText(step.description, step.label);
+		const taskSuffix = task ? ` ${theme.fg("dim", "·")} ${theme.fg("dim", `task: ${task}`)}` : "";
+		const activitySuffix = activity ? ` ${theme.fg("dim", "·")} ${theme.fg("dim", activity)}` : "";
+		const marker = rowIndex === rows.length - 1 && rowIndex >= group.total - 1 ? "└─" : "├─";
+		lines.push(`    ${marker} ${widgetStepGlyph(step.status, theme, widgetStepRunningSeed(step, row.index), frame, thinking)} ${themeBold(theme, row.rowLabel)}${contextModeBadge(theme, step.context)} ${theme.fg("dim", "·")} ${status}${modelDisplay}${taskSuffix}${activitySuffix}${stepStats ? ` ${theme.fg("dim", "·")} ${stepStats}` : ""}`);
+		const progressRow = step.status === "running" ? reportedProgressRow(step, theme, "      ", width) : undefined;
+		if (progressRow) lines.push(progressRow);
+		const lane = projectAsyncLane(job, step);
+		if (lane) lines.push(...formatLaneProjectionLines(lane, theme, "      "));
+		for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, false, job.updatedAt, 6)) lines.push(`      ${nestedLine}`);
 	}
+	lines.push(...hostStepWidgetLines(job, theme, "  "));
 	if (job.steps.some((step) => step.status === "running")) lines.push(theme.fg("accent", `  ${liveDetailHintText()}`));
 	return lines.map((line) => truncLine(line, width));
 }
@@ -964,6 +2601,7 @@ interface WidgetLayoutSession {
 	columns: number;
 	tier: WidgetRenderTier;
 	lockedRows?: number;
+	rootJobCount?: number;
 	visibleJobKeys: string[];
 }
 
@@ -1005,18 +2643,55 @@ function widgetHeaderCounts(jobs: AsyncJobState[]): { running: AsyncJobState[]; 
 	};
 }
 
-function buildSingleLineWidgetLines(jobs: AsyncJobState[], theme: Theme, width: number): string[] {
+// Round elapsed tracking for the collapsed one-line widget, keyed per mounted ui.
+// A "round" starts when the widget first observes a running job and ends when it
+// observes none. Timing is snapshot-based (renderWidget/container.render
+// observations), not a lifecycle-event clock, so sub-debounce transitions may be
+// merged by the caller. State is intentionally not cleared in component.dispose():
+// compaction can temporarily unmount the widget without ending the round.
+interface WidgetRoundState {
+	startedAt: number;
+}
+const roundStateByUi = new WeakMap<object, WidgetRoundState>();
+function trackSubagentsRound(ui: object, jobs: readonly AsyncJobState[], now: number): void {
+	const running = jobs.filter((job) => job.status === "running");
+	if (running.length > 0) {
+		// Seed from the oldest running job so a round restored after a session resume matches the job rows.
+		if (!roundStateByUi.has(ui)) roundStateByUi.set(ui, { startedAt: Math.min(now, ...running.map((job) => job.startedAt ?? now)) });
+		return;
+	}
+	roundStateByUi.delete(ui);
+}
+function roundElapsedSuffix(ui: object, now: number): string {
+	const state = roundStateByUi.get(ui);
+	return state ? ` ${formatRoundElapsed(now - state.startedAt)}` : "";
+}
+function formatRoundElapsed(ms: number): string {
+	const total = Math.max(0, Math.floor(ms / 1000));
+	const hours = Math.floor(total / 3600);
+	const minutes = Math.floor((total % 3600) / 60);
+	const seconds = total % 60;
+	if (hours > 0) return `${hours}h${minutes}m${seconds}s`;
+	if (minutes > 0) return `${minutes}m${seconds}s`;
+	return `${seconds}s`;
+}
+function buildSingleLineWidgetLines(jobs: AsyncJobState[], theme: Theme, width: number, frame?: number, elapsedSuffix = ""): string[] {
 	const counts = widgetHeaderCounts(jobs);
 	const hasActive = counts.running.length > 0 || counts.queued.length > 0;
-	const glyph = counts.running.length > 0 ? runningGlyph(widgetJobsRunningSeed(counts.running)) : hasActive ? "●" : "○";
+	const glyph = counts.running.length > 0 ? runningGlyph(animatedSeed(widgetJobsRunningSeed(counts.running), frame)) : hasActive ? "●" : "○";
 	const parts: string[] = [];
-	if (counts.running.length > 0) parts.push(`${counts.running.length}/${jobs.length} running`);
+	if (counts.running.length > 0) parts.push(`${counts.running.length}/${jobs.length} running${elapsedSuffix}`);
 	if (counts.queued.length > 0) parts.push(`${counts.queued.length} queued`);
 	if (counts.failed.length > 0) parts.push(`${counts.failed.length} failed`);
 	if (counts.stopped.length > 0) parts.push(`${counts.stopped.length} stopped`);
 	if (counts.paused.length > 0) parts.push(`${counts.paused.length} paused`);
+	for (const status of ["partial", "rejected"] as const) {
+		const count = jobs.filter((job) => job.status === status).length;
+		if (count > 0) parts.push(`${count} ${status}`);
+	}
 	if (!hasActive && counts.complete.length > 0) parts.push(`${counts.complete.length}/${jobs.length} done`);
-	return [truncLine(`${theme.fg(hasActive ? "accent" : "dim", glyph)} ${theme.fg(hasActive ? "accent" : "dim", "subagents")} (${parts.join(", ") || `${jobs.length} total`})`, width)];
+	const tone = activeHeaderTone(theme, hasActive);
+	return [truncLine(`${tone(glyph)} ${tone("subagents")} (${parts.join(", ") || `${jobs.length} total`})`, width)];
 }
 
 function orderedWidgetJobs(jobs: AsyncJobState[]): AsyncJobState[] {
@@ -1068,12 +2743,29 @@ function selectProgressiveJobKeys(jobs: AsyncJobState[], previousKeys: string[],
 	return selected;
 }
 
-function progressiveHeaderLine(jobs: AsyncJobState[], theme: Theme, width: number): string {
+// Counts the leaf entries collectFleetStatusEntries (fleet-status.ts) makes for a running async job,
+// so this matches FleetView's "N active agents": a workflow counts only its loaded child runs;
+// another job counts its active steps, synthesized from `agents` when it has no steps.
+function runningLeafAgentCount(job: AsyncJobState, projectionFor: WorkflowWidgetProjectionLookup): number {
+	if (job.mode === "workflow") return (projectionFor(job).children ?? []).reduce((total, child) => total + runningLeafAgentCount(child, projectionFor), 0);
+	if (job.status !== "running") return 0;
+	const sequential = job.mode === "chain" && !job.activeParallelGroup;
+	const current = job.currentStep ?? 0;
+	const steps = job.steps?.length
+		? job.steps
+		: job.agents?.map((_, index) => ({ index, status: sequential && index !== current ? "pending" : "running" }));
+	if (!steps?.length) return 1;
+	return steps.filter((step, offset) => ["running", "queued", "pending"].includes(step.status)
+		&& !(step.status === "pending" && sequential && (step.index ?? offset) !== current)).length;
+}
+
+function progressiveHeaderLine(jobs: AsyncJobState[], theme: Theme, width: number, frame: number | undefined, projectionFor: WorkflowWidgetProjectionLookup): string {
 	const counts = widgetHeaderCounts(jobs);
 	const hasActive = counts.running.length > 0 || counts.queued.length > 0;
-	const glyph = counts.running.length > 0 ? runningGlyph(widgetJobsRunningSeed(counts.running)) : hasActive ? "●" : "○";
+	const glyph = counts.running.length > 0 ? runningGlyph(animatedSeed(widgetJobsRunningSeed(counts.running), frame)) : hasActive ? "●" : "○";
 	const parts: string[] = [];
-	if (counts.running.length > 0) parts.push(formatAgentRunningLabel(counts.running.length));
+	const runningAgents = jobs.reduce((total, job) => total + runningLeafAgentCount(job, projectionFor), 0);
+	if (runningAgents > 0) parts.push(formatAgentRunningLabel(runningAgents));
 	if (counts.queued.length > 0) parts.push(`${counts.queued.length} queued`);
 	if (!hasActive) {
 		if (counts.failed.length > 0) parts.push(`${counts.failed.length} failed`);
@@ -1081,20 +2773,36 @@ function progressiveHeaderLine(jobs: AsyncJobState[], theme: Theme, width: numbe
 		if (counts.paused.length > 0) parts.push(`${counts.paused.length} paused`);
 		if (counts.complete.length > 0) parts.push(`${counts.complete.length}/${jobs.length} done`);
 	}
-	return truncLine(`${theme.fg(hasActive ? "accent" : "dim", glyph)} ${theme.fg(hasActive ? "accent" : "dim", "Async agents")} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(", ") || `${jobs.length} total`)}`, width);
+	const tone = activeHeaderTone(theme, hasActive);
+	return truncLine(`${tone(glyph)} ${tone("Async agents")} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(", ") || `${jobs.length} total`)}`, width);
 }
 
-function progressiveJobLine(job: AsyncJobState, theme: Theme, width: number): string {
-	const stats = widgetStats(job, theme);
+function progressiveJobLine(job: AsyncJobState, theme: Theme, width: number, frame?: number, projection = buildWorkflowWidgetProjection(job), compactRows = job.mode === "workflow" ? compactWorkflowLaneRows(job, projection.checklist) : undefined): string {
+	const compactWorkflow = job.mode === "workflow";
+	const stats = compactWorkflow ? compactWorkflowStats(job, compactRows ?? [], theme, projection) : widgetStats(job, theme, projection, true);
+	if (compactWorkflow) {
+		const bottleneck = compactWorkflowBottleneck(compactRows ?? [], job);
+		const suffix = [stats, bottleneck ? theme.fg(bottleneck.tone, `bottleneck · ${bottleneck.text}`) : undefined].filter((value): value is string => Boolean(value)).join(` ${theme.fg("dim", "·")} `);
+		return truncLine(`  ${widgetStatusGlyph(job, theme, frame)} ${compactWorkflowHeaderLine(job, theme, Math.max(0, width - 4))}${suffix ? ` ${theme.fg("dim", "·")} ${suffix}` : ""}`, width);
+	}
 	const activity = widgetActivity(job);
 	const status = job.status === "complete" ? "done" : job.status;
+	const lane = projectAsyncLane(job, laneStepForJob(job, projection.steps));
+	const laneSummary = lane
+		? [lane.label ?? lane.role, lane.phase ? `phase:${lane.phase}` : undefined, lane.output ? `out:${lane.output}` : undefined, lane.workspace ? `workspace:${lane.workspace}` : `ref:${lane.ref}`].filter(Boolean).join(" · ")
+		: "";
+	const laneSignals = lane
+		? [lane.next ? `next:${lane.next}` : undefined, ...lane.chips.map((chip) => formatLaneChip(chip, theme))].filter(Boolean).join(" · ")
+		: "";
 	const parts = [
-		themeBold(theme, widgetJobName(job)),
+		`${themeBold(theme, widgetJobName(job))}${contextModeBadge(theme, job.context)}`,
 		theme.fg("dim", status),
+		laneSignals ? laneSignals : "",
+		laneSummary ? theme.fg("dim", laneSummary) : "",
 		stats,
 		activity && activity.toLowerCase() !== status ? theme.fg("dim", activity) : "",
 	].filter(Boolean);
-	return truncLine(`  ${widgetStatusGlyph(job, theme)} ${parts.join(` ${theme.fg("dim", "·")} `)}`, width);
+	return truncLine(`  ${widgetStatusGlyph(job, theme, frame)} ${parts.join(` ${theme.fg("dim", "·")} `)}`, width);
 }
 
 function progressiveHiddenLine(hiddenJobs: AsyncJobState[], theme: Theme, width: number): string {
@@ -1107,9 +2815,9 @@ function progressiveHiddenLine(hiddenJobs: AsyncJobState[], theme: Theme, width:
 	return truncLine(theme.fg("dim", `  +${hiddenJobs.length} more${parts.length ? ` (${parts.join(", ")})` : ""}`), width);
 }
 
-function buildProgressiveWidgetLines(jobs: AsyncJobState[], theme: Theme, width: number, lockedRows: number, previousKeys: string[]): { lines: string[]; visibleJobKeys: string[] } {
+function buildProgressiveWidgetLines(jobs: AsyncJobState[], theme: Theme, width: number, lockedRows: number, previousKeys: string[], frame?: number, projectionFor: WorkflowWidgetProjectionLookup = workflowWidgetProjectionLookup(), elapsedSuffix = ""): { lines: string[]; visibleJobKeys: string[]; contentRows: number } {
 	const rowCount = Math.max(1, lockedRows);
-	if (rowCount === 1) return { lines: buildSingleLineWidgetLines(jobs, theme, width), visibleJobKeys: [] };
+	if (rowCount === 1) return { lines: buildSingleLineWidgetLines(jobs, theme, width, frame, elapsedSuffix), visibleJobKeys: [], contentRows: 1 };
 
 	const bodyRows = rowCount - 1;
 	let visibleJobKeys = selectProgressiveJobKeys(jobs, previousKeys, bodyRows);
@@ -1124,37 +2832,54 @@ function buildProgressiveWidgetLines(jobs: AsyncJobState[], theme: Theme, width:
 		hiddenJobs = jobs.filter((job) => !visibleJobKeys.includes(progressiveJobKey(job)));
 	}
 
-	const lines = [
-		progressiveHeaderLine(jobs, theme, width),
-		...visibleJobs.map((job) => progressiveJobLine(job, theme, width)),
-	];
+	// Rows left after every visible job line show the visible workflows' lanes.
+	let spareRows = rowCount - 1 - visibleJobs.length - (hiddenJobs.length > 0 ? 1 : 0);
+	const lines = [progressiveHeaderLine(jobs, theme, width, frame, projectionFor)];
+	for (const job of visibleJobs) {
+		const projection = projectionFor(job);
+		const laneRows = job.mode === "workflow" ? compactWorkflowLaneRows(job, projection.checklist) : undefined;
+		lines.push(progressiveJobLine(job, theme, width, frame, projection, laneRows));
+		if (!laneRows || projection.inlineFleetCovered) continue;
+		const laneLines = foldEarlierDoneLines(laneRows, spareRows, (row) => truncLine(compactWorkflowLaneLine(row, theme, "    ", frame), width), (hidden) => truncLine(`    ${theme.fg("dim", `… ${hidden} earlier done`)}`, width)).slice(0, spareRows);
+		lines.push(...laneLines);
+		spareRows -= laneLines.length;
+	}
 	if (hiddenJobs.length > 0 && lines.length < rowCount) lines.push(progressiveHiddenLine(hiddenJobs, theme, width));
+	const contentRows = Math.min(lines.length, rowCount);
 	while (lines.length < rowCount) lines.push(" ");
-	return { lines: lines.slice(0, rowCount), visibleJobKeys };
+	return { lines: lines.slice(0, rowCount), visibleJobKeys, contentRows };
 }
 
 function collapsedWidgetLineBudget(rows: number): number {
 	return Math.max(10, Math.min(14, Math.floor(rows * 0.35)));
 }
 
+function paddedWidgetLine(line: string, width: number): string {
+	if (width <= 2) return " ".repeat(Math.max(0, width));
+	const text = ` ${truncLine(line, width - 2)} `;
+	return `${text}${" ".repeat(Math.max(0, width - visibleWidth(text)))}`;
+}
+
+function widgetLineBudget(expanded: boolean): number {
+	const rows = currentTerminalRows();
+	return expanded ? Math.max(12, Math.min(24, Math.floor(rows * 0.55))) : collapsedWidgetLineBudget(rows);
+}
+
 function fitWidgetLineBudget(lines: string[], theme: Theme, width: number, expanded: boolean): string[] {
-	const rows = process.stdout.rows || 30;
-	const budget = expanded
-		? Math.max(12, Math.min(24, Math.floor(rows * 0.55)))
-		: collapsedWidgetLineBudget(rows);
+	const budget = widgetLineBudget(expanded);
 	if (lines.length <= budget) return lines;
 	const visibleLines = Math.max(1, budget - 1);
 	const hiddenCount = lines.length - visibleLines;
 	const hint = expanded
 		? `… ${hiddenCount} live-detail lines hidden`
-		: `… ${hiddenCount} lines hidden · ${liveDetailKeyText()} expands`;
+		: `… ${hiddenCount} lines hidden · ${expandKeyHint("to expand")}`;
 	return [...lines.slice(0, visibleLines), truncLine(theme.fg("dim", hint), width)];
 }
 
-function fitAdaptiveWidgetLines(jobs: AsyncJobState[], lines: string[], theme: Theme, width: number, expanded: boolean): string[] {
+function fitAdaptiveWidgetLines(jobs: AsyncJobState[], buildLines: () => string[], theme: Theme, width: number, expanded: boolean, frame?: number, projectionFor?: WorkflowWidgetProjectionLookup, layout: AsyncWidgetLayout = "adaptive", elapsedSuffix = ""): string[] {
 	if (expanded) {
 		resetWidgetLayoutSession();
-		return fitWidgetLineBudget(lines, theme, width, true);
+		return fitWidgetLineBudget(buildLines(), theme, width, true);
 	}
 
 	const hasMatchingSession = widgetSessionMatches(expanded);
@@ -1163,71 +2888,294 @@ function fitAdaptiveWidgetLines(jobs: AsyncJobState[], lines: string[], theme: T
 	const availableRows = estimateAvailableWidgetRows();
 
 	if (hasMatchingSession && widgetLayoutSession?.tier === "single-line") {
-		return buildSingleLineWidgetLines(jobs, theme, width);
+		return buildSingleLineWidgetLines(jobs, theme, width, frame, elapsedSuffix);
 	}
 
 	if (hasMatchingSession && widgetLayoutSession?.tier === "progressive" && widgetLayoutSession.lockedRows !== undefined) {
-		const rendered = buildProgressiveWidgetLines(jobs, theme, width, widgetLayoutSession.lockedRows, widgetLayoutSession.visibleJobKeys);
-		widgetLayoutSession.visibleJobKeys = rendered.visibleJobKeys;
-		return rendered.lines;
+		const session = widgetLayoutSession;
+		const lockedRows = widgetLayoutSession.lockedRows;
+		let rendered = buildProgressiveWidgetLines(jobs, theme, width, lockedRows, session.visibleJobKeys, frame, projectionFor, elapsedSuffix);
+		// The height stays fixed across content-only updates (#186). It grows when a new job would be hidden while the cap
+		// has room, and shrinks to content only when root jobs leave, so finished jobs leave no blank rows.
+		const capRows = Math.min(availableRows, collapsedWidgetLineBudget(rows));
+		if (rendered.visibleJobKeys.length < jobs.length && lockedRows < capRows) {
+			rendered = buildProgressiveWidgetLines(jobs, theme, width, capRows, session.visibleJobKeys, frame, projectionFor, elapsedSuffix);
+			session.lockedRows = Math.max(lockedRows, rendered.contentRows);
+		} else if (jobs.length < (session.rootJobCount ?? 0)) {
+			session.lockedRows = rendered.contentRows;
+		}
+		session.rootJobCount = jobs.length;
+		session.visibleJobKeys = rendered.visibleJobKeys;
+		return rendered.lines.slice(0, session.lockedRows);
 	}
 
-	if (lines.length <= availableRows) {
-		widgetLayoutSession = { expanded, rows, columns, tier: "full", visibleJobKeys: [] };
-		return fitWidgetLineBudget(lines, theme, width, false);
+	if (layout === "adaptive") {
+		const lines = buildLines();
+		if (lines.length <= availableRows) {
+			widgetLayoutSession = { expanded, rows, columns, tier: "full", visibleJobKeys: [] };
+			return fitWidgetLineBudget(lines, theme, width, false);
+		}
+		if (availableRows > 2 && jobs.length === 1 && projectionFor?.(jobs[0]!).stageProgress) {
+			widgetLayoutSession = { expanded, rows, columns, tier: "full", visibleJobKeys: [] };
+			return fitWidgetLineBudget(lines, theme, width, false);
+		}
 	}
 
 	if (availableRows <= 2) {
 		widgetLayoutSession = { expanded, rows, columns, tier: "single-line", visibleJobKeys: [] };
-		return buildSingleLineWidgetLines(jobs, theme, width);
+		return buildSingleLineWidgetLines(jobs, theme, width, frame, elapsedSuffix);
 	}
 
-	const lockedRows = Math.min(availableRows, collapsedWidgetLineBudget(rows));
-	const rendered = buildProgressiveWidgetLines(jobs, theme, width, lockedRows, []);
-	widgetLayoutSession = { expanded, rows, columns, tier: "progressive", lockedRows, visibleJobKeys: rendered.visibleJobKeys };
-	return rendered.lines;
+	// Lock to the rows the content fills so the fixed-height card has no blank padding.
+	const rendered = buildProgressiveWidgetLines(jobs, theme, width, Math.min(availableRows, collapsedWidgetLineBudget(rows)), [], frame, projectionFor, elapsedSuffix);
+	const lockedRows = rendered.contentRows;
+	widgetLayoutSession = { expanded, rows, columns, tier: "progressive", lockedRows, rootJobCount: jobs.length, visibleJobKeys: rendered.visibleJobKeys };
+	return rendered.lines.slice(0, lockedRows);
 }
 
-function buildWidgetComponent(jobs: AsyncJobState[], expanded: boolean): (_tui: unknown, theme: Theme) => Component {
-	return (_tui, theme) => {
-		const width = getTermWidth();
-		const lines = expanded
-			? buildWidgetLines(jobs, theme, width, true)
-			: jobs.length === 1
-				? compactSingleWidgetLines(jobs[0]!, theme, width)
-				: buildWidgetLines(jobs, theme, width, false);
+const asyncWidgetUpdates = new WeakMap<ExtensionContext["ui"], (jobs: AsyncJobState[]) => void>();
+const inlineWorkflowCoverage = new WeakMap<ExtensionContext["ui"], ReadonlyMap<string, string>>();
+const asyncWidgetInvalidations = new WeakMap<ExtensionContext["ui"], () => void>();
+
+function inlineWorkflowDescendantShape(children: AsyncJobState["nestedChildren"]): unknown {
+	return children?.map((child) => [child.id, child.agent, inlineWorkflowDescendantShape(child.children)]);
+}
+
+function inlineWorkflowRowShape(job: AsyncJobState): unknown[] {
+	return [
+		job.asyncId,
+		job.parentWorkflowRunId,
+		job.workflowKey,
+		job.mode,
+		job.currentStep,
+		job.activeParallelGroup,
+		job.status,
+		job.context,
+		job.agents,
+		job.steps?.map((step, index) => [
+			step.index ?? index,
+			step.workflowKey,
+			step.agent,
+			step.status,
+			Boolean(step.runner),
+			inlineWorkflowDescendantShape(step.children),
+		]),
+		inlineWorkflowDescendantShape(job.nestedChildren),
+		job.hostSteps?.map((row) => [row.id, row.monitorKind, row.label]),
+		Boolean(job.workflowGraph),
+	];
+}
+
+/** Structural identity of the workflow rows that Fleet can cover. */
+export function inlineWorkflowRenderKey(job: AsyncJobState, children: AsyncJobState[]): string {
+	return JSON.stringify([inlineWorkflowRowShape(job), children.map(inlineWorkflowRowShape)]);
+}
+
+/** Presentation-only coverage from the mounted inline Fleet roster, never configuration. */
+export function setInlineWorkflowCoverage(ui: ExtensionContext["ui"], coverage: ReadonlyMap<string, string>): void {
+	const previous = inlineWorkflowCoverage.get(ui);
+	if ((previous?.size ?? 0) === coverage.size && [...coverage].every(([id, key]) => previous?.get(id) === key)) return;
+	if (coverage.size) inlineWorkflowCoverage.set(ui, coverage);
+	else inlineWorkflowCoverage.delete(ui);
+	asyncWidgetInvalidations.get(ui)?.();
+}
+
+/** Attach only to loaded workflow parents; orphan jobs remain top-level. */
+function widgetJobTree(jobs: AsyncJobState[], now: number): { roots: AsyncJobState[]; projectionFor: WorkflowWidgetProjectionLookup } {
+	const parents = new Map(jobs.filter((job) => job.mode === "workflow").map((job) => [job.asyncId, job]));
+	const childrenByParent = new Map<string, AsyncJobState[]>();
+	const roots: AsyncJobState[] = [];
+	for (const job of jobs) {
+		const parent = job.parentWorkflowRunId ? parents.get(job.parentWorkflowRunId) : undefined;
+		// Root-only adaptive summaries cannot advertise live work under a non-running parent.
+		const keepLiveRoot = isProgressiveActiveJob(job) && parent?.status !== "running";
+		if (parent && parent.asyncId !== job.asyncId && !keepLiveRoot) {
+			const children = childrenByParent.get(parent.asyncId) ?? [];
+			children.push(job);
+			childrenByParent.set(parent.asyncId, children);
+		} else roots.push(job);
+	}
+	return { roots, projectionFor: workflowWidgetProjectionLookup(now, childrenByParent) };
+}
+
+function widgetChecklistWithoutMaterializedChildren(projection: WorkflowWidgetProjection): WorkflowChecklistProjection | undefined {
+	const { checklist, materializedKeys } = projection;
+	if (!checklist || !materializedKeys) return checklist;
+	return { ...checklist, phases: checklist.phases.map((phase) => ({ ...phase, items: phase.items.filter((item) => !materializedKeys.has(item.key)) })) };
+}
+
+function materializedWidgetChildLines(job: AsyncJobState, theme: Theme, width: number, expanded: boolean, frame: number | undefined, projectionFor: WorkflowWidgetProjectionLookup, fullTask = false): string[] {
+	const { children, inlineFleetCovered } = projectionFor(job);
+	if (inlineFleetCovered || !children?.length) return [];
+	const lines: string[] = [];
+	const shown = orderedWidgetJobs(children).slice(0, MAX_WIDGET_JOBS);
+	for (const [index, child] of shown.entries()) {
+		const projection = projectionFor(child);
+		const last = index === children.length - 1;
+		const identity = child.workflowKey ?? child.asyncId;
+		const stats = widgetStats(child, theme, projection, !expanded);
+		lines.push(`  ${last ? "└─" : "├─"} ${theme.bold(identity)} ${widgetStatusGlyph(child, theme, frame)} ${themeBold(theme, widgetJobName(child))}${contextModeBadge(theme, child.context)}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`);
+		for (const detail of foregroundStyleWidgetDetails(child, theme, expanded, Math.max(0, width - 6), frame, projection, fullTask)) lines.push(`  ${last ? "  " : "│ "}${detail}`);
+		for (const detail of materializedWidgetChildLines(child, theme, Math.max(0, width - 4), expanded, frame, projectionFor, fullTask)) lines.push(`    ${detail}`);
+	}
+	if (shown.length < children.length) lines.push(`  +${children.length - shown.length} more workflow children`);
+	return lines;
+}
+
+function buildWidgetComponent(jobs: AsyncJobState[], ui: ExtensionContext["ui"], initiallyCollapsed = false, layout: AsyncWidgetLayout): (tui: { requestRender(): void }, theme: Theme) => Component {
+	return (tui, theme) => {
 		const container = new Container();
-		for (const line of fitAdaptiveWidgetLines(jobs, lines, theme, width, expanded)) container.addChild(new Text(line, 1, 0));
-		return container;
+		let cachedRenderWidth: number | undefined;
+		let cachedFrame: number | undefined;
+		let cachedExpanded: boolean | undefined;
+		let cachedLines: string[] | undefined;
+		let cachedCoverage = "[]";
+		let collapsed = initiallyCollapsed;
+		const invalidate = (): void => {
+			cachedLines = undefined;
+			resetWidgetLayoutSession();
+			tui.requestRender();
+		};
+		const invalidateCoverage = (): void => {
+			cachedLines = undefined;
+			tui.requestRender();
+		};
+		asyncWidgetInvalidations.set(ui, invalidateCoverage);
+		const update = (nextJobs: AsyncJobState[]): void => {
+			jobs = nextJobs;
+			cachedLines = undefined;
+			tui.requestRender();
+		};
+		asyncWidgetUpdates.set(ui, update);
+		const component = Object.assign(container, {
+			// Only the mouse fields used here, without requiring newer Pi type exports.
+			handleMouse(event: { type: string; button: string; y: number; shift: boolean; alt: boolean; ctrl: boolean }) {
+				if (event.type !== "click" || event.button !== "left" || event.y !== 0) return undefined;
+				if (event.shift || event.alt || event.ctrl) return undefined;
+				collapsed = !collapsed;
+				invalidate();
+				return { handled: true };
+			},
+			dispose(): void {
+				if (asyncWidgetUpdates.get(ui) === update) asyncWidgetUpdates.delete(ui);
+				if (asyncWidgetInvalidations.get(ui) === invalidateCoverage) asyncWidgetInvalidations.delete(ui);
+			},
+		});
+		container.render = (renderWidth: number): string[] => {
+			const now = Date.now();
+			const frame = Math.floor(now / WIDGET_ANIMATION_INTERVAL_MS);
+			trackSubagentsRound(ui, jobs, now);
+			const expanded = ui.getToolsExpanded?.() ?? false;
+			const coverage = inlineWorkflowCoverage.get(ui);
+			const covered = new Set<string>();
+			if (coverage?.size) {
+				const childrenByParent = new Map<string, AsyncJobState[]>();
+				for (const child of jobs) {
+					if (!child.parentWorkflowRunId) continue;
+					const children = childrenByParent.get(child.parentWorkflowRunId) ?? [];
+					children.push(child);
+					childrenByParent.set(child.parentWorkflowRunId, children);
+				}
+				for (const job of jobs) {
+					const snapshot = coverage.get(job.asyncId);
+					if (snapshot === undefined) continue;
+					const children = childrenByParent.get(job.asyncId) ?? [];
+					if (!children.some((child) => childrenByParent.has(child.asyncId))
+						&& snapshot === inlineWorkflowRenderKey(job, children)) covered.add(job.asyncId);
+				}
+			}
+			const coverageKey = JSON.stringify([...covered]);
+			if (cachedLines && cachedRenderWidth === renderWidth && cachedFrame === frame && cachedExpanded === expanded && cachedCoverage === coverageKey) return cachedLines;
+			if (cachedCoverage !== coverageKey) resetWidgetLayoutSession();
+			cachedCoverage = coverageKey;
+			const width = Math.max(0, renderWidth - 2);
+			const { roots, projectionFor } = widgetJobTree(jobs, now);
+			for (const job of roots) projectionFor(job).inlineFleetCovered = covered.has(job.asyncId);
+			const buildLines = (): string[] => expanded
+				? buildWidgetLinesWithProjection(roots, theme, width, true, frame, projectionFor)
+				: roots.length === 1 && !projectionFor(roots[0]!).children?.length
+					? compactSingleWidgetLines(roots[0]!, theme, width, frame, projectionFor(roots[0]!))
+					: buildWidgetLinesWithProjection(roots, theme, width, false, frame, projectionFor);
+			cachedRenderWidth = renderWidth;
+			cachedFrame = frame;
+			cachedExpanded = expanded;
+			const elapsedSuffix = roundElapsedSuffix(ui, now);
+			cachedLines = (collapsed
+				? buildSingleLineWidgetLines(jobs, theme, width, frame, elapsedSuffix)
+				: fitAdaptiveWidgetLines(roots, buildLines, theme, width, expanded, frame, projectionFor, layout, elapsedSuffix)
+			).map((line) => paddedWidgetLine(line, renderWidth));
+			return cachedLines;
+		};
+		return component;
 	};
 }
 
-export function buildWidgetLines(jobs: AsyncJobState[], theme: Theme, width = getTermWidth(), expanded = false): string[] {
+/** Running children the widget shows, counted the way it renders them: a workflow step that has
+ *  its own child job is that job's row, so it counts once. */
+function runningWidgetChildCount(jobs: AsyncJobState[], projectionFor: WorkflowWidgetProjectionLookup): number {
+	let running = 0;
+	for (const job of jobs) {
+		const { steps, materializedKeys, children } = projectionFor(job);
+		if (!steps.length && job.status === "running") running++;
+		for (const step of steps) {
+			if (step.status === "running" && !materializedKeys?.has(step.workflowKey ?? "") && !materializedKeys?.has(step.runId ?? "")) running++;
+		}
+		if (children?.length) running += runningWidgetChildCount(children, projectionFor);
+	}
+	return running;
+}
+
+function buildWidgetLinesWithProjection(jobs: AsyncJobState[], theme: Theme, width = getTermWidth(), expanded = false, frame?: number, projectionFor: WorkflowWidgetProjectionLookup = workflowWidgetProjectionLookup()): string[] {
 	if (jobs.length === 0) return [];
-	if (jobs.length === 1) return buildSingleWidgetLines(jobs[0]!, theme, width, expanded);
+	// Expanded rows show a whole task only while exactly one child runs in the whole widget; with
+	// more, the extra lines would push other running children past the widget's line budget.
+	const fullTask = expanded && runningWidgetChildCount(jobs, projectionFor) === 1;
+	if (jobs.length === 1) {
+		const childLines = materializedWidgetChildLines(jobs[0]!, theme, width, expanded, frame, projectionFor, fullTask).map((line) => truncLine(line, width));
+		return [...buildSingleWidgetLines(jobs[0]!, theme, width, expanded, frame, projectionFor(jobs[0]!), childLines.length, fullTask), ...childLines];
+	}
 	const running = jobs.filter((job) => job.status === "running");
 	const queued = jobs.filter((job) => job.status === "queued");
 	const finished = jobs.filter((job) => job.status !== "running" && job.status !== "queued");
 
 	const lines: string[] = [];
 	const hasActive = running.length > 0 || queued.length > 0;
-	const headerGlyph = running.length > 0 ? runningGlyph(widgetJobsRunningSeed(running)) : hasActive ? "●" : "○";
-	lines.push(truncLine(`${theme.fg(hasActive ? "accent" : "dim", headerGlyph)} ${theme.fg(hasActive ? "accent" : "dim", "Async agents")} ${theme.fg("dim", "· background")}`, width));
+	const headerGlyph = running.length > 0 ? runningGlyph(animatedSeed(widgetJobsRunningSeed(running), frame)) : hasActive ? "●" : "○";
+	const tone = activeHeaderTone(theme, hasActive);
+	lines.push(truncLine(`${tone(headerGlyph)} ${tone("Async agents")} ${theme.fg("dim", "· background")}`, width));
 
 	const items: string[][] = [];
 	let hiddenRunning = 0;
 	let hiddenFinished = 0;
 	let queuedSummaryShown = false;
 	let slots = MAX_WIDGET_JOBS;
+	const compactCards: Array<{ item: string[]; job: AsyncJobState; projection: WorkflowWidgetProjection; bodyLength: number }> = [];
+	const appendJob = (job: AsyncJobState): void => {
+		const projection = projectionFor(job);
+		const compactWorkflow = (!expanded || projection.inlineFleetCovered) && job.mode === "workflow";
+		const stats = compactWorkflow ? "" : widgetStats(job, theme, projection, !expanded);
+		const details = compactWorkflow
+			? compactWorkflowWidgetBodyLines(job, theme, frame, projection)
+			: [
+				`  ${theme.fg("dim", `⎿  ${widgetActivity(job)}`)}`,
+				...widgetLaneDetailLines(job, theme, projection),
+				...workflowChecklistWidgetLines(widgetChecklistWithoutMaterializedChildren(projection), theme, "  ", expanded, frame, { includeItemErrors: !expanded || !job.steps?.length, liveWidget: true }),
+				...widgetParallelAgentDetails(job, theme, expanded, width, frame, fullTask),
+			];
+		const item = [
+			compactWorkflow
+				? compactWorkflowHeaderLine(job, theme, width)
+				: `${widgetStatusGlyph(job, theme, frame)} ${themeBold(theme, widgetJobName(job))}${contextModeBadge(theme, job.context)}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`,
+			...details,
+			...materializedWidgetChildLines(job, theme, width, expanded, frame, projectionFor, fullTask),
+		];
+		items.push(item);
+		if (compactWorkflow) compactCards.push({ item, job, projection, bodyLength: details.length });
+	};
 
 	for (const job of running) {
 		if (slots <= 0) { hiddenRunning++; continue; }
-		const stats = widgetStats(job, theme);
-		items.push([
-			`${widgetStatusGlyph(job, theme)} ${themeBold(theme, widgetJobName(job))}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`,
-			`  ${theme.fg("dim", `⎿  ${widgetActivity(job)}`)}`,
-			...widgetParallelAgentDetails(job, theme, expanded, width),
-		]);
+		appendJob(job);
 		slots--;
 	}
 
@@ -1239,12 +3187,7 @@ export function buildWidgetLines(jobs: AsyncJobState[], theme: Theme, width = ge
 
 	for (const job of finished) {
 		if (slots <= 0) { hiddenFinished++; continue; }
-		const stats = widgetStats(job, theme);
-		items.push([
-			`${widgetStatusGlyph(job, theme)} ${themeBold(theme, widgetJobName(job))}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`,
-			`  ${theme.fg("dim", `⎿  ${widgetActivity(job)}`)}`,
-			...widgetParallelAgentDetails(job, theme, expanded, width),
-		]);
+		appendJob(job);
 		slots--;
 	}
 
@@ -1256,6 +3199,16 @@ export function buildWidgetLines(jobs: AsyncJobState[], theme: Theme, width = ge
 		if (hiddenQueued > 0) parts.push(`${hiddenQueued} queued`);
 		if (hiddenFinished > 0) parts.push(`${hiddenFinished} finished`);
 		items.push([theme.fg("dim", `+${hiddenTotal} more (${parts.join(", ")})`)]);
+	}
+
+	// Fold the oldest done lanes of compact workflow cards by the overflow, so later cards and
+	// materialized children stay inside the line budget.
+	let overflow = 1 + items.reduce((sum, item) => sum + item.length, 0) - widgetLineBudget(expanded);
+	for (const card of compactCards) {
+		if (overflow <= 0) break;
+		const body = compactWorkflowWidgetBodyLines(card.job, theme, frame, card.projection, card.bodyLength - overflow);
+		card.item.splice(1, card.bodyLength, ...body);
+		overflow -= card.bodyLength - body.length;
 	}
 
 	for (let i = 0; i < items.length; i++) {
@@ -1272,65 +3225,233 @@ export function buildWidgetLines(jobs: AsyncJobState[], theme: Theme, width = ge
 	return lines;
 }
 
-/**
- * Render the async jobs widget
- */
-export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void {
+export function buildWidgetLines(jobs: AsyncJobState[], theme: Theme, width = getTermWidth(), expanded = false, frame?: number): string[] {
+	const { roots, projectionFor } = widgetJobTree(jobs, Date.now());
+	return buildWidgetLinesWithProjection(roots, theme, width, expanded, frame, projectionFor);
+}
+
+export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[], initiallyCollapsed = false, layout: AsyncWidgetLayout = "adaptive"): void {
+	// Advance round tracking on every widget update, including the empty-jobs
+	// cleanup path below, which never reaches container.render.
+	trackSubagentsRound(ctx.ui, jobs, Date.now());
 	if (jobs.length === 0) {
 		resetWidgetLayoutSession();
+		asyncWidgetUpdates.delete(ctx.ui);
 		if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
 		return;
 	}
 	if (!ctx.hasUI) return;
-	ctx.ui.setWidget(WIDGET_KEY, buildWidgetComponent(jobs, ctx.ui.getToolsExpanded?.() ?? false));
+	if ((ctx as { mode?: string }).mode === "rpc") {
+		ctx.ui.setWidget(WIDGET_KEY, encodeAsyncStatusSnapshotWidget(jobs));
+		return;
+	}
+	// Pi replaces a widget by deleting and reinserting its key. Update the mounted
+	// component instead so progress cannot move it past other extensions' widgets.
+	const update = asyncWidgetUpdates.get(ctx.ui);
+	if (update) update(jobs);
+	else ctx.ui.setWidget(WIDGET_KEY, buildWidgetComponent(jobs, ctx.ui, initiallyCollapsed, layout));
 }
 
-function renderSingleCompact(d: Details, r: Details["results"][number], theme: Theme, frame?: number): Component {
+function renderSingleCompact(
+	d: Details,
+	r: Details["results"][number],
+	theme: Theme,
+	layout: MainWindowRenderLayout,
+	frame?: number,
+	foregroundDetachShortcut?: string,
+): Component {
 	const output = r.truncation?.text || getSingleResultOutput(r);
 	const progress = r.progress || r.progressSummary;
-	const isRunning = r.progress?.status === "running";
-	const contextBadge = d.context === "fork" ? theme.fg("warning", " [fork]") : "";
+	const isRunning = isResultRunning(r);
+	const contextBadge = contextModeBadge(theme, r.context ?? d.context);
 	const stats = statJoin(theme, [
 		r.usage?.turns ? `⟳ ${r.usage.turns}` : "",
 		formatProgressStats(theme, progress),
 	]);
 	const c = new Container();
 	const width = getTermWidth() - 4;
-	const modelDisplay = modelThinkingBadge(theme, r.model);
-	c.addChild(new Text(truncLine(`${resultGlyph(r, output, theme, isRunning, undefined, frame)} ${theme.fg("toolTitle", theme.bold(r.agent))}${modelDisplay}${contextBadge}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`, width), 0, 0));
+	const detailIndent = mainWindowIndent(layout, 1);
+	const continuationIndent = mainWindowIndent(layout, 2) + (layout.horizontalSpacing > 0 ? " " : "");
+	const modelDisplay = modelThinkingBadge(theme, r.progress?.model ?? r.model, r.thinking ?? r.progress?.thinking);
+	c.addChild(new Text(truncLine(`${resultGlyph(r, output, theme, isRunning, undefined, frame)} ${theme.fg("toolTitle", theme.bold(foregroundSingleDisplayName(r)))}${modelDisplay}${contextBadge}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`, width), 0, 0));
 
 	if (isRunning && r.progress) {
+		const task = compactTaskText(r.task);
+		if (task) c.addChild(new Text(truncLine(theme.fg("dim", `${detailIndent}task: ${task}`), width), 0, 0));
+		const reportedRow = reportedProgressRow(r.progress, theme, detailIndent, width);
+		if (reportedRow) c.addChild(new Text(reportedRow, 0, 0));
 		const progressSnapshotNow = snapshotNowForProgress(r.progress);
 		const activity = compactCurrentActivity(r.progress);
-		c.addChild(new Text(truncLine(theme.fg("dim", `  ⎿  ${activity}`), width), 0, 0));
+		c.addChild(new Text(truncLine(theme.fg("dim", `${detailIndent}⎿  ${activity}`), width), 0, 0));
 		const liveStatus = buildLiveStatusLine(r.progress, progressSnapshotNow);
-		if (liveStatus && liveStatus !== activity) c.addChild(new Text(truncLine(theme.fg("dim", `     ${liveStatus}`), width), 0, 0));
-		c.addChild(new Text(truncLine(theme.fg("accent", `  ${liveDetailHintText()}`), width), 0, 0));
-		if (r.artifactPaths) c.addChild(new Text(truncLine(theme.fg("dim", `  output: ${shortenPath(r.artifactPaths.outputPath)}`), width), 0, 0));
+		if (liveStatus && liveStatus !== activity) c.addChild(new Text(truncLine(theme.fg("dim", `${continuationIndent}${liveStatus}`), width), 0, 0));
+		for (const nestedLine of formatNestedWidgetLines(r.children, theme, width, false, progressSnapshotNow)) {
+			c.addChild(new Text(truncLine(`${detailIndent}${nestedLine}`, width), 0, 0));
+		}
+		c.addChild(new Text(truncLine(theme.fg("accent", `${detailIndent}${foregroundSingleHintText(foregroundDetachShortcut)}`), width), 0, 0));
+		if (r.artifactPaths) c.addChild(new Text(truncLine(theme.fg("dim", `${detailIndent}output: ${shortenPath(r.artifactPaths.outputPath)}`), width), 0, 0));
 		return c;
 	}
 
-	c.addChild(new Text(truncLine(theme.fg("dim", `  ⎿  ${resultStatusLine(r, output)}`), width), 0, 0));
+	for (const nestedLine of formatNestedWidgetLines(r.children, theme, width, false, r.progress?.lastActivityAt)) {
+		c.addChild(new Text(truncLine(`${detailIndent}${nestedLine}`, width), 0, 0));
+	}
+	c.addChild(new Text(truncLine(theme.fg("dim", `${detailIndent}⎿  ${resultStatusLine(r, output)}`), width), 0, 0));
 	const preview = firstOutputLine(output);
 	if (preview && r.exitCode === 0 && !hasEmptyTextOutputWithoutOutputTarget(r.task, output)) {
-		c.addChild(new Text(truncLine(theme.fg("dim", `     ${preview}`), width), 0, 0));
+		c.addChild(new Text(truncLine(theme.fg("dim", `${continuationIndent}${preview}`), width), 0, 0));
 	}
-	if (r.sessionFile) c.addChild(new Text(truncLine(theme.fg("dim", `  session: ${shortenPath(r.sessionFile)}`), width), 0, 0));
-	if (r.artifactPaths) c.addChild(new Text(truncLine(theme.fg("dim", `  output: ${shortenPath(r.artifactPaths.outputPath)}`), width), 0, 0));
-	if (r.truncation?.artifactPath) c.addChild(new Text(truncLine(theme.fg("dim", `  full output: ${shortenPath(r.truncation.artifactPath)}`), width), 0, 0));
+	if (r.sessionFile) c.addChild(new Text(truncLine(theme.fg("dim", `${detailIndent}session: ${shortenPath(r.sessionFile)}`), width), 0, 0));
+	if (r.artifactPaths) c.addChild(new Text(truncLine(theme.fg("dim", `${detailIndent}output: ${shortenPath(r.artifactPaths.outputPath)}`), width), 0, 0));
+	if (r.truncation?.artifactPath) c.addChild(new Text(truncLine(theme.fg("dim", `${detailIndent}full output: ${shortenPath(r.truncation.artifactPath)}`), width), 0, 0));
 	return c;
 }
 
-function renderMultiCompact(d: Details, theme: Theme, frame?: number): Component {
-	const hasRunning = d.progress?.some((p) => p.status === "running")
-		|| d.results.some((r) => r.progress?.status === "running")
-		|| workflowGraphHasStatus(d, ["running"]);
-	const stopped = d.results.some((r) => r.stopped && r.progress?.status !== "running")
+function workflowRowGlyph(row: WorkflowChatProgressRow, theme: Theme, frame?: number, thinking?: ThinkingLevel): string {
+	if (row.state === "planned") return theme.fg("muted", "◦");
+	if (row.state === "running") return runningTone(theme, thinking)(runningGlyph(frame));
+	if (row.state === "complete") return theme.fg("success", "✓");
+	if (row.state === "detached" || row.state === "stopped") return theme.fg("warning", "■");
+	return theme.fg("error", "✗");
+}
+
+function workflowRowStateLabel(row: WorkflowChatProgressRow, theme: Theme, thinking?: ThinkingLevel): string {
+	const label = (row.state === "complete" ? "complete" : row.state).padEnd(8);
+	if (row.state === "planned") return theme.fg("dim", label);
+	if (row.state === "running") return runningTone(theme, thinking)(label);
+	if (row.state === "complete") return theme.fg("success", label);
+	if (row.state === "detached" || row.state === "stopped") return theme.fg("warning", label);
+	return theme.fg("error", label);
+}
+
+function workflowOverallState(rows: WorkflowChatProgressRow[], hasTerminalValue: boolean, isError?: boolean): "running" | "complete" | "failed" | "paused" {
+	if (rows.some((row) => row.state === "failed")) return "failed";
+	if (rows.some((row) => row.state === "detached")) return "paused";
+	if (isError) return "failed";
+	if ((rows.length > 0 && rows.every((row) => row.state === "complete")) || hasTerminalValue) return "complete";
+	return "running";
+}
+
+function foregroundWorkflowChecklist(details: Details): WorkflowChecklistProjection | undefined {
+	if (details.mode !== "workflow") return undefined;
+	const stageNodes = details.workflowGraph ? workflowGraphStageNodes(details.workflowGraph) : [];
+	const steps: WorkflowChecklistStep[] = details.results.flatMap((result, resultIndex) => {
+		const stableIndex = foregroundResultIndex(details, resultIndex);
+		const workflowKey = (result as { workflowKey?: unknown }).workflowKey;
+		if (details.workflowGraph && typeof workflowKey !== "string") return [];
+		const node = typeof workflowKey === "string"
+			? stageNodes.find((candidate) => candidate.id === workflowKey)
+			: undefined;
+		const progress = foregroundProgressForResult(details, resultIndex);
+		const status = isResultRunning(result) || progress?.status === "running"
+			? "running"
+			: result.detached
+				? "paused"
+				: result.stopped
+					? "stopped"
+					: result.exitCode === 0
+						? "complete"
+						: "failed";
+		return [{
+			key: node?.id ?? (typeof workflowKey === "string" ? workflowKey : `result-${resultIndex + 1}`),
+			label: node?.label ?? workflowLabelForResult(details, resultIndex) ?? result.task ?? result.agent,
+			phase: node?.phase,
+			agent: result.agent,
+			thinking: result.thinking ?? progress?.thinking,
+			status,
+			context: result.context,
+			activityState: progress?.activityState,
+			startedAt: progress?.lastActivityAt !== undefined && progress.durationMs !== undefined ? progress.lastActivityAt - progress.durationMs : undefined,
+			durationMs: progress?.durationMs,
+			currentTool: progress?.currentTool,
+			currentToolStartedAt: progress?.currentToolStartedAt,
+			currentPath: progress?.currentPath,
+			turnCount: progress?.turnCount,
+			toolCount: progress?.toolCount ?? result.progressSummary?.toolCount,
+			error: result.error,
+			toolBudgetBlocked: result.toolBudgetBlocked,
+			turnBudgetExceeded: result.turnBudgetExceeded,
+			timedOut: result.timedOut,
+			stopped: result.stopped,
+			acceptance: result.acceptance ? { status: result.acceptance.status, reviewResult: result.acceptance.reviewResult ? { status: result.acceptance.reviewResult.status } : undefined } : undefined,
+			review: result.review ? { status: result.review.status } : undefined,
+			watchdog: result.watchdog,
+		}];
+	});
+	const checklist = projectWorkflowChecklist({
+		graph: details.workflowGraph,
+		steps,
+		hostSteps: details.workflow?.receipt?.hostSteps,
+		preflight: details.preflight,
+		trace: details.workflow?.trace,
+		now: Date.now(),
+	});
+	return checklist.total > 0 ? checklist : undefined;
+}
+
+function renderWorkflowChatProgress(d: Details, result: AgentToolResult<Details>, theme: Theme, layout: MainWindowRenderLayout, frame?: number, expanded = false): Component {
+	const workflow = d.workflow;
+	const rows = workflow ? buildWorkflowChatProgressRows(workflow.trace, d.preflight) : d.preflight ? buildWorkflowChatProgressRows([], d.preflight) : [];
+	const state = workflowOverallState(rows, workflow?.value !== undefined, result.isError);
+	const glyph = state === "running" ? runningTone(theme)(runningGlyph(frame)) : state === "complete" ? theme.fg("success", "✓") : state === "paused" ? theme.fg("warning", "■") : theme.fg("error", "✗");
+	const width = getTermWidth() - 4;
+	const runId = d.runId ? d.runId.slice(0, 12) : "workflow";
+	const repoLabel = d.chatProgress?.repoLabel ?? (d.chatProgress?.repoRelation === "same" ? "same repo" : "other repo");
+	const phase = rows.find((row) => row.state === "running" && row.phase)?.phase ?? [...rows].reverse().find((row) => row.phase)?.phase;
+	const c = new Container();
+	const rowIndent = mainWindowIndent(layout, 1);
+	c.addChild(new Text(truncLine(`${glyph} ${theme.fg("toolTitle", theme.bold("workflow"))} ${runId} ${theme.fg("dim", "·")} ${d.chatProgress?.repoRelation === "same" ? "same repo" : "other repo"} ${theme.fg("dim", "·")} ${state}`, width), 0, 0));
+	c.addChild(new Text(truncLine(theme.fg("dim", `${rowIndent}Repo   ${repoLabel}`), width), 0, 0));
+	if (d.preflight) c.addChild(new Text(truncLine(theme.fg("dim", formatWorkflowPreflightPlanSummary(d.preflight, { indent: rowIndent })), width), 0, 0));
+	if (phase) c.addChild(new Text(truncLine(theme.fg("dim", `${rowIndent}Phase  ${phase}`), width), 0, 0));
+	const checklist = projectWorkflowChecklist({ hostSteps: workflow?.receipt?.hostSteps, preflight: d.preflight, trace: workflow?.trace, now: Date.now() });
+	for (const line of workflowChecklistWidgetLines(checklist, theme, rowIndent, false, frame, { limitPhases: !expanded, includeBottleneckOutput: expanded })) {
+		c.addChild(new Text(truncLine(line, width), 0, 0));
+	}
+	if (rows.length === 0) {
+		c.addChild(new Text(truncLine(theme.fg("dim", `${rowIndent}◦ waiting for workflow child launches`), width), 0, 0));
+		return c;
+	}
+	const visible = visibleWorkflowRows(rows);
+	if (visible.hiddenRows > 0) c.addChild(new Text(truncLine(theme.fg("dim", `${rowIndent}… ${visible.hiddenRows} older workflow rows hidden`), width), 0, 0));
+	const childLevels = new Map((d.workflowChildren?.children ?? []).map((child) => [child.childId, childThinkingLevel(child)]));
+	for (const row of visible.rows) {
+		const thinking = childLevels.get(row.key);
+		const status = workflowRowStateLabel(row, theme, thinking);
+		const label = row.label && row.label !== row.key ? ` ${oneLine(row.label)}` : "";
+		const duration = row.durationMs !== undefined ? ` ${theme.fg("dim", `· ${formatDuration(row.durationMs)}`)}` : "";
+		const run = row.runId ? ` ${theme.fg("dim", `[${row.runId.slice(0, 8)}]`)}` : "";
+		const error = row.error ? ` ${theme.fg(row.state === "detached" ? "warning" : "error", `· ${compactWorkflowError(row.error)}`)}` : "";
+		const hints = expanded && row.preflight ? [
+			row.preflight.mode ? `mode:${row.preflight.mode}` : undefined,
+			row.preflight.decision ? `decision:${row.preflight.decision}` : undefined,
+			row.preflight.claims?.length ? `claims:${row.preflight.claims.join(",")}` : undefined,
+			row.preflight.expectedOutput ? `expected:${row.preflight.expectedOutput}` : undefined,
+			row.preflight.independence ? `independence:${row.preflight.independence}` : undefined,
+		].filter((value): value is string => Boolean(value)).join(" · ") : "";
+		c.addChild(new Text(truncLine(`${rowIndent}${workflowRowGlyph(row, theme, frame, thinking)} ${status} ${theme.bold(row.key)}${label}${run}${duration}${error}${hints ? ` ${theme.fg("dim", `· ${hints}`)}` : ""}`, width), 0, 0));
+	}
+	if (workflow?.preflightWarnings?.length) {
+		const warningLines = expanded
+			? formatWorkflowPreflightWarnings(workflow.preflightWarnings, { indent: rowIndent }).split("\n")
+			: [formatWorkflowPreflightWarningSummary(workflow.preflightWarnings, { indent: rowIndent, hint: "expand for debug" })];
+		for (const warningLine of warningLines) c.addChild(new Text(truncLine(theme.fg("warning", warningLine), width), 0, 0));
+	}
+	if (workflow?.emits.length) c.addChild(new Text(truncLine(theme.fg("dim", `${rowIndent}Emits  ${workflow.emits.length}`), width), 0, 0));
+	return c;
+}
+
+function renderMultiCompact(d: Details, theme: Theme, layout: MainWindowRenderLayout, frame?: number): Component {
+	const hasRunning = detailsHaveRunningResult(d);
+	const detached = d.results.some((r) => r.detached)
+		|| workflowGraphHasStatus(d, ["detached"]);
+	const stopped = d.results.some((r) => r.stopped)
 		|| workflowGraphHasStatus(d, ["stopped"]);
-	const failed = d.results.some((r) => !r.stopped && r.exitCode !== 0 && r.progress?.status !== "running")
+	const failed = d.results.some((r) => !hasTerminalResultFlag(r) && r.exitCode !== 0 && !isResultRunning(r))
 		|| workflowGraphHasStatus(d, ["failed"]);
-	const paused = d.results.some((r) => (r.interrupted || r.detached) && r.progress?.status !== "running")
-		|| workflowGraphHasStatus(d, ["paused", "detached"]);
+	const paused = d.results.some((r) => r.interrupted)
+		|| workflowGraphHasStatus(d, ["paused"]);
+	const partial = workflowGraphHasStatus(d, ["partial"]);
 	let totalSummary = d.progressSummary;
 	if (!totalSummary) {
 		let sawProgress = false;
@@ -1347,38 +3468,49 @@ function renderMultiCompact(d: Details, theme: Theme, frame?: number): Component
 	}
 	const multiLabel = buildMultiProgressLabel(d, hasRunning);
 	const itemTitle = multiLabel.itemTitle;
-	const stats = statJoin(theme, [multiLabel.headerLabel, formatProgressStats(theme, totalSummary), formatTotalCostStat(d.totalCost)]);
-	const glyph = hasRunning
-		? theme.fg("accent", runningGlyph(frame !== undefined ? (runningSeed(progressRunningSeed(totalSummary), d.currentStepIndex) ?? 0) + frame : runningSeed(progressRunningSeed(totalSummary), d.currentStepIndex)))
-		: stopped
-			? theme.fg("warning", "■")
-			: failed
-				? theme.fg("error", "✗")
-			: paused
-				? theme.fg("warning", "■")
-				: theme.fg("success", "✓");
-	const contextBadge = d.context === "fork" ? theme.fg("warning", " [fork]") : "";
+	const workflowChecklist = foregroundWorkflowChecklist(d);
+	const checklistPrimary = d.mode === "workflow" && workflowChecklist !== undefined;
+	const stats = statJoin(theme, [checklistPrimary ? formatWorkflowChecklistSummary(workflowChecklist) : multiLabel.headerLabel, formatProgressStats(theme, totalSummary), formatTotalCostStat(d.totalCost)]);
+	const aggregatePresentation = semanticResultPresentation({
+		running: hasRunning,
+		detached,
+		stopped,
+		interrupted: paused,
+		failed,
+		partial,
+		seed: runningSeed(progressRunningSeed(totalSummary), d.currentStepIndex),
+		frame,
+	});
+	const glyph = presentationTone(aggregatePresentation, theme)(aggregatePresentation.glyph);
+	const contextBadge = contextModeBadge(theme, d.context);
 	const c = new Container();
 	const width = getTermWidth() - 4;
+	const rowIndent = mainWindowIndent(layout, 1);
+	const detailIndent = mainWindowIndent(layout, 2);
 	c.addChild(new Text(truncLine(`${glyph} ${theme.fg("toolTitle", theme.bold(d.mode))}${contextBadge}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`, width), 0, 0));
+	if (checklistPrimary) {
+		for (const line of workflowChecklistWidgetLines(workflowChecklist, theme, rowIndent, false, frame, { includeSummary: false })) {
+			c.addChild(new Text(truncLine(line, width), 0, 0));
+		}
+		if (hasRunning || workflowChecklist.running > 0) c.addChild(new Text(truncLine(theme.fg("accent", `${rowIndent}${liveDetailHintText()}`), width), 0, 0));
+		return c;
+	}
+	for (const line of workflowChecklistWidgetLines(workflowChecklist, theme, rowIndent, false, frame)) {
+		c.addChild(new Text(truncLine(line, width), 0, 0));
+	}
 
 	const useResultsDirectly = multiLabel.hasParallelInChain || !d.chainAgents?.length;
 	const displayStart = multiLabel.showActiveGroupOnly ? multiLabel.groupStartIndex : 0;
 	const displayEnd = multiLabel.showActiveGroupOnly ? multiLabel.groupEndIndex : (useResultsDirectly ? d.results.length : d.chainAgents!.length);
 	const chainEntries = buildChainRenderEntries(d, multiLabel);
-	const renderEntries = chainEntries ?? Array.from({ length: displayEnd - displayStart }, (_, offset): ChainRenderEntry => {
-		const i = displayStart + offset;
-		const r = d.results[i];
-		const fallbackLabel = itemTitle.toLowerCase();
-		const rowNumber = multiLabel.showActiveGroupOnly ? (i - multiLabel.groupStartIndex + 1) : (i + 1);
-		return { kind: "result", resultIndex: i, rowNumber, agentName: useResultsDirectly ? (r?.agent || `${fallbackLabel}-${rowNumber}`) : (d.chainAgents![i] || r?.agent || `${fallbackLabel}-${rowNumber}`) };
-	});
+	const renderEntries = chainEntries ?? buildForegroundResultEntries(d, multiLabel, displayStart, displayEnd, useResultsDirectly);
 	for (const entry of renderEntries) {
-		if (entry.kind === "placeholder") {
+		if (entry.kind === "group") {
 			const glyph = widgetStepGlyph(entry.status as AsyncJobStep["status"], theme);
 			const statusLabel = widgetStepStatus(entry.status as AsyncJobStep["status"], theme);
-			c.addChild(new Text(truncLine(`  ${glyph} ${entry.stepLabel}: ${themeBold(theme, entry.agentName)} ${theme.fg("dim", "·")} ${statusLabel}`, width), 0, 0));
-			if (entry.error) c.addChild(new Text(truncLine(theme.fg("error", `    ⎿  Error: ${entry.error}`), width), 0, 0));
+			const groupLabel = entry.groupLabel ? ` (${compactTaskText(undefined, entry.groupLabel) ?? entry.groupLabel})` : "";
+			c.addChild(new Text(truncLine(`${rowIndent}${glyph} ${entry.stepLabel}${groupLabel} ${theme.fg("dim", "·")} ${statusLabel}`, width), 0, 0));
+			if (entry.error) c.addChild(new Text(truncLine(theme.fg("error", `${detailIndent}⎿  Error: ${entry.error}`), width), 0, 0));
 			continue;
 		}
 		const i = entry.resultIndex;
@@ -1386,53 +3518,127 @@ function renderMultiCompact(d: Details, theme: Theme, frame?: number): Component
 		const rowNumber = entry.rowNumber;
 		const agentName = entry.agentName;
 		if (!r) {
-			const pendingLabel = chainEntries ? resultRowLabel(d, multiLabel, i, rowNumber) : `${itemTitle} ${rowNumber}`;
-			c.addChild(new Text(truncLine(theme.fg("dim", `  ◦ ${pendingLabel}: ${agentName} · pending`), width), 0, 0));
+			const pendingLabel = entry.rowLabel ?? (entry.isParallel ? "" : `${itemTitle} ${rowNumber}`);
+			const labelPrefix = pendingLabel ? `${pendingLabel}: ` : "";
+			c.addChild(new Text(truncLine(theme.fg("dim", `${rowIndent}◦ ${labelPrefix}${agentName} · pending`), width), 0, 0));
 			continue;
 		}
 		const output = getSingleResultOutput(r);
-		const progressFromArray = d.progress?.find((p) => p.index === i) || d.progress?.find((p) => p.agent === r.agent && p.status === "running");
+		const progressFromArray = foregroundProgressForResult(d, i);
 		const rProg = r.progress || progressFromArray || r.progressSummary;
-		const rRunning = rProg && "status" in rProg && rProg.status === "running";
+		const rRunning = rProg && "status" in rProg && isResultRunning(r, rProg.status);
 		const rPending = rProg && "status" in rProg && rProg.status === "pending";
-		const stepNumber = r.progress?.index !== undefined ? r.progress.index + 1 : progressFromArray?.index !== undefined ? progressFromArray.index + 1 : i + 1;
 		const stepStats = formatProgressStats(theme, rProg);
 		const glyph = rPending ? theme.fg("dim", "◦") : resultGlyph(r, output, theme, rRunning, progressRunningSeed(rProg), frame);
 		const pendingLabel = rPending ? ` ${theme.fg("dim", "· pending")}` : "";
-		const stepLabel = resultRowLabel(d, multiLabel, i, stepNumber);
-		const line = `${glyph} ${stepLabel}: ${themeBold(theme, agentName)}${stepStats ? ` ${theme.fg("dim", "·")} ${stepStats}` : ""}${pendingLabel}`;
-		c.addChild(new Text(truncLine(`  ${line}`, width), 0, 0));
+		const stepLabel = entry.rowLabel;
+		const rowProgressModel = rProg && "status" in rProg ? rProg : undefined;
+		const rowModelDisplay = modelThinkingBadge(theme, rowProgressModel?.model ?? r.model, r.thinking ?? rowProgressModel?.thinking);
+		const labelPrefix = stepLabel ? `${stepLabel}: ` : "";
+		const line = `${glyph} ${labelPrefix}${themeBold(theme, agentName)}${contextModeBadge(theme, r.context)}${rowModelDisplay}${stepStats ? ` ${theme.fg("dim", "·")} ${stepStats}` : ""}${pendingLabel}`;
+		c.addChild(new Text(truncLine(`${rowIndent}${line}`, width), 0, 0));
+		if (rRunning || rPending) {
+			const task = compactTaskText(r.task, workflowLabelForResult(d, i));
+			if (task) c.addChild(new Text(truncLine(theme.fg("dim", `${detailIndent}task: ${task}`), width), 0, 0));
+		}
+		const reportedRow = rRunning && progressFromArray ? reportedProgressRow(progressFromArray, theme, detailIndent, width) : undefined;
+		if (reportedRow) c.addChild(new Text(reportedRow, 0, 0));
 		if (rRunning && rProg && "status" in rProg) {
-			const activity = compactCurrentActivity(rProg);
-			c.addChild(new Text(truncLine(theme.fg("dim", `    ⎿  ${activity}`), width), 0, 0));
-			c.addChild(new Text(truncLine(theme.fg("accent", `    ${liveDetailHintText()}`), width), 0, 0));
+			const liveProgress = rProg as AgentProgress;
+			const activity = compactCurrentActivity(liveProgress);
+			c.addChild(new Text(truncLine(theme.fg("dim", `${detailIndent}⎿  ${activity}`), width), 0, 0));
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, width, false, snapshotNowForProgress(liveProgress))) {
+				c.addChild(new Text(truncLine(`${detailIndent}${nestedLine}`, width), 0, 0));
+			}
+			c.addChild(new Text(truncLine(theme.fg("accent", `${detailIndent}${liveDetailHintText()}`), width), 0, 0));
 		} else if (!rPending && (r.exitCode !== 0 || r.interrupted || r.detached || hasEmptyTextOutputWithoutOutputTarget(r.task, output))) {
-			c.addChild(new Text(truncLine(theme.fg(r.exitCode !== 0 ? "error" : "dim", `    ⎿  ${resultStatusLine(r, output)}`), width), 0, 0));
+			c.addChild(new Text(truncLine(theme.fg(r.exitCode !== 0 ? "error" : "dim", `${detailIndent}⎿  ${resultStatusLine(r, output)}`), width), 0, 0));
+		}
+		if (!rRunning && !rPending) {
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, width, false, r.progress?.lastActivityAt)) {
+				c.addChild(new Text(truncLine(`${detailIndent}${nestedLine}`, width), 0, 0));
+			}
 		}
 		const outputTarget = extractOutputTarget(r.task);
-		if (outputTarget) c.addChild(new Text(truncLine(theme.fg("dim", `    output: ${outputTarget}`), width), 0, 0));
-		if (r.artifactPaths) c.addChild(new Text(truncLine(theme.fg("dim", `    output: ${shortenPath(r.artifactPaths.outputPath)}`), width), 0, 0));
+		if (outputTarget) c.addChild(new Text(truncLine(theme.fg("dim", `${detailIndent}output: ${outputTarget}`), width), 0, 0));
+		if (r.artifactPaths) c.addChild(new Text(truncLine(theme.fg("dim", `${detailIndent}output: ${shortenPath(r.artifactPaths.outputPath)}`), width), 0, 0));
 	}
-	if (d.artifacts) c.addChild(new Text(truncLine(theme.fg("dim", `  artifacts: ${shortenPath(d.artifacts.dir)}`), width), 0, 0));
+	if (d.artifacts) c.addChild(new Text(truncLine(theme.fg("dim", `${rowIndent}artifacts: ${shortenPath(d.artifacts.dir)}`), width), 0, 0));
 	return c;
 }
 
-/**
- * Render a subagent result
- */
+export function renderSubagentSummary(
+	result: AgentToolResult<Details>,
+	options: { isPartial?: boolean },
+	theme: Theme,
+): Component {
+	const details = result.details;
+	const results = details?.results ?? [];
+	const hasSingleTerminalResult = results.length === 1 && hasTerminalResult(results[0]!);
+	const hasOnlyTerminalResults = results.length > 0 && results.every(hasTerminalResult);
+	const running = !hasSingleTerminalResult && !hasOnlyTerminalResults && (
+		options.isPartial === true
+		|| Boolean(details?.asyncId && details.mode !== "management")
+		|| Boolean(details && detailsHaveRunningResult(details))
+	);
+	const stopped = results.some((entry) => entry.stopped)
+		|| Boolean(details && workflowGraphHasStatus(details, ["stopped"]));
+	const paused = results.some((entry) => entry.interrupted || entry.detached)
+		|| Boolean(details && workflowGraphHasStatus(details, ["paused", "detached"]));
+	const failed = result.isError === true
+		|| results.some((entry) => !hasTerminalResultFlag(entry) && entry.exitCode !== 0 && !isResultRunning(entry))
+		|| Boolean(details && workflowGraphHasStatus(details, ["failed"]));
+	const partial = Boolean(details && workflowGraphHasStatus(details, ["partial"]));
+	const state = running ? "running" : failed ? "failed" : stopped ? "stopped" : paused ? "paused" : partial ? "partial" : "completed";
+	const glyph = state === "running"
+		? runningTone(theme, details?.mode === "single" && results.length === 1 ? childThinkingLevel(results[0], results[0]?.progress) : undefined)(STATIC_RUNNING_GLYPH)
+		: state === "completed"
+			? theme.fg("success", "✓")
+			: state === "failed"
+				? theme.fg("error", "✗")
+				: theme.fg("warning", "■");
+	const label = details?.mode === "single" && results.length === 1
+		? foregroundSingleDisplayName(results[0])
+		: details?.mode || "subagent";
+	return new Text(
+		truncLine(`${glyph} ${theme.fg("toolTitle", theme.bold(label))} ${theme.fg("dim", "·")} ${theme.fg(state === "failed" ? "error" : state === "completed" ? "success" : state === "running" ? "accent" : "warning", state)}`, getTermWidth() - 4),
+		0,
+		0,
+	);
+}
+
 export function renderSubagentResult(
 	result: AgentToolResult<Details>,
 	options: { expanded: boolean },
 	theme: Theme,
 	frame?: number,
+	rendererConfig?: MainWindowRendererConfig,
+	foregroundDetachShortcut?: string,
 ): Component {
+	const layout = resolveMainWindowRenderLayout(rendererConfig);
+	const compact = (component: Component): Component => capCompactMainWindowResult(component, layout, theme, !options.expanded);
 	const d = result.details;
+	if (d?.mode === "workflow" && d.chatProgress?.mode === "live-card" && d.workflow?.value === undefined && (!result.isError || (d.workflow?.trace.length ?? 0) > 0)) {
+		return compact(renderWorkflowChatProgress(d, result, theme, options.expanded ? resolveMainWindowRenderLayout() : layout, frame, options.expanded));
+	}
 	if (!d || !d.results.length) {
 		const t = result.content[0];
 		const text = t?.type === "text" ? t.text : "(no output)";
-		const contextPrefix = d?.context === "fork" ? `${theme.fg("warning", "[fork]")} ` : "";
+		const contextPrefix = contextModePrefix(theme, d?.context);
 		const width = getTermWidth() - 4;
-		if (!text.includes("\n")) return new Text(truncLine(`${contextPrefix}${text}`, width), 0, 0);
+		if (!text.includes("\n")) return compact(new Text(truncLine(`${contextPrefix}${text}`, width), 0, 0));
+		if (d && !options.expanded && !result.isError) {
+			const lines = text.split(/\r?\n/);
+			const firstNonEmptyLine = lines.find((line) => line.trim())?.trim() || "(no output)";
+			const compactLine = d.mode === "workflow" && d.preflight
+				? formatWorkflowPreflightPlanSummary(d.preflight)
+				: firstNonEmptyLine;
+			const c = new Container();
+			const detailIndent = mainWindowIndent(layout, 1);
+			c.addChild(new Text(truncLine(`${contextPrefix}${compactLine} · ${lines.length} lines`, width), 0, 0));
+			c.addChild(new Text(truncLine(theme.fg("accent", `${detailIndent}${expandKeyHint("for full output")}`), width), 0, 0));
+			return compact(c);
+		}
 		const c = new Container();
 		const wrapped = wrapPlainText(`${contextPrefix}${text}`, width);
 		for (const line of wrapped) c.addChild(new Text(line, 0, 0));
@@ -1444,17 +3650,13 @@ export function renderSubagentResult(
 
 	if (d.mode === "single" && d.results.length === 1) {
 		const r = d.results[0];
-		if (!expanded) return renderSingleCompact(d, r, theme, frame);
-		const isRunning = r.progress?.status === "running";
-		const icon = isRunning
-			? theme.fg("warning", "running")
-			: r.detached
-				? theme.fg("warning", "detached")
-				: r.exitCode === 0
-					? theme.fg("success", "ok")
-					: theme.fg("error", "failed");
-		const contextBadge = d.context === "fork" ? theme.fg("warning", " [fork]") : "";
+		const detachableShortcut = d.asyncId || d.background ? undefined : foregroundDetachShortcut;
+		if (!r) return compact(renderMultiCompact(d, theme, layout, frame));
+		if (!expanded) return compact(renderSingleCompact(d, r, theme, layout, frame, detachableShortcut));
+		const isRunning = isResultRunning(r);
+		const contextBadge = contextModeBadge(theme, r.context ?? d.context);
 		const output = r.truncation?.text || getSingleResultOutput(r);
+		const presentation = styledResultPresentation(resultPresentation(r, output, isRunning, undefined, frame), theme);
 
 		const progressInfo = isRunning && r.progress
 			? ` | ${r.progress.toolCount} tools, ${formatTokens(r.progress.tokens)} tok, ${formatDuration(r.progress.durationMs)}`
@@ -1466,7 +3668,7 @@ export function renderSubagentResult(
 		const fit = (text: string) => expanded ? text : truncLine(text, w);
 		const toolCallLines = getToolCallLines(r, expanded);
 		const c = new Container();
-		c.addChild(new Text(fit(`${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${contextBadge}${progressInfo}`), 0, 0));
+		c.addChild(new Text(fit(`${presentation.glyph} ${theme.fg("toolTitle", theme.bold(foregroundSingleDisplayName(r)))}${contextBadge}${progressInfo} ${theme.fg("dim", "·")} ${presentation.label}`), 0, 0));
 		c.addChild(new Spacer(1));
 		const taskMaxLen = Math.max(20, w - 8);
 		const taskPreview = expanded || r.task.length <= taskMaxLen
@@ -1476,9 +3678,17 @@ export function renderSubagentResult(
 			new Text(fit(theme.fg("dim", `Task: ${taskPreview}`)), 0, 0),
 		);
 		c.addChild(new Spacer(1));
+		if (!isRunning && (r.exitCode !== 0 || r.interrupted || r.detached || r.stopped)) {
+			c.addChild(new Text(fit(theme.fg(r.exitCode !== 0 ? "error" : "dim", `  ⎿  ${resultStatusLine(r, output)}`)), 0, 0));
+		}
 
 		if (isRunning && r.progress) {
+			const reportedRow = reportedProgressRow(r.progress, theme, "  ", w);
+			if (reportedRow) c.addChild(new Text(fit(reportedRow), 0, 0));
 			const progressSnapshotNow = snapshotNowForProgress(r.progress);
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, w, true, progressSnapshotNow, 12)) {
+				c.addChild(new Text(fit(`  ${nestedLine}`), 0, 0));
+			}
 			const toolLine = formatCurrentToolLine(r.progress, w, expanded, progressSnapshotNow);
 			if (toolLine) {
 				c.addChild(new Text(fit(theme.fg("warning", `> ${toolLine}`)), 0, 0));
@@ -1487,24 +3697,26 @@ export function renderSubagentResult(
 			if (liveStatusLine) {
 				c.addChild(new Text(fit(theme.fg("accent", liveStatusLine)), 0, 0));
 			}
-			c.addChild(new Text(fit(theme.fg("accent", liveDetailHintText())), 0, 0));
+			c.addChild(new Text(fit(theme.fg("accent", foregroundSingleHintText(detachableShortcut))), 0, 0));
 			if (r.artifactPaths) {
 				c.addChild(new Text(fit(theme.fg("dim", `Artifacts: ${shortenPath(r.artifactPaths.outputPath)}`)), 0, 0));
 			}
 			if (r.progress.recentTools?.length) {
 				for (const t of r.progress.recentTools.slice(-3)) {
 					const maxArgsLen = Math.max(40, w - 24);
-					const argsPreview = expanded || t.args.length <= maxArgsLen
-						? t.args
-						: `${t.args.slice(0, maxArgsLen)}...`;
+					const argsPreview = renderToolArgsPreview(t.args, maxArgsLen, expanded);
 					c.addChild(new Text(fit(theme.fg("dim", `${t.tool}: ${argsPreview}`)), 0, 0));
 				}
 			}
-			for (const line of (r.progress.recentOutput ?? []).slice(-5)) {
+			for (const line of compactRecentOutputLines(r.progress.recentOutput)) {
 				c.addChild(new Text(fit(theme.fg("dim", `  ${line}`)), 0, 0));
 			}
 			if (toolLine || liveStatusLine || r.progress.recentTools?.length || r.progress.recentOutput?.length || r.artifactPaths) {
 				c.addChild(new Spacer(1));
+			}
+		} else {
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, w, true, r.progress?.lastActivityAt, 8)) {
+				c.addChild(new Text(fit(`  ${nestedLine}`), 0, 0));
 			}
 		}
 
@@ -1523,10 +3735,7 @@ export function renderSubagentResult(
 		if (r.skillsWarning) {
 			c.addChild(new Text(fit(theme.fg("warning", `Warning: ${r.skillsWarning}`)), 0, 0));
 		}
-		if (r.attemptedModels && r.attemptedModels.length > 1) {
-			c.addChild(new Text(fit(theme.fg("dim", `Fallbacks: ${r.attemptedModels.join(" → ")}`)), 0, 0));
-		}
-		c.addChild(new Text(fit(theme.fg("dim", formatUsage(r.usage, r.model))), 0, 0));
+		c.addChild(new Text(fit(theme.fg("dim", formatUsage(r.usage, r.progress?.model ?? r.model))), 0, 0));
 		if (r.sessionFile) {
 			c.addChild(new Text(fit(theme.fg("dim", `Session: ${shortenPath(r.sessionFile)}`)), 0, 0));
 		}
@@ -1538,33 +3747,34 @@ export function renderSubagentResult(
 		return c;
 	}
 
-	if (!expanded) return renderMultiCompact(d, theme, frame);
+	if (!expanded) return compact(renderMultiCompact(d, theme, layout, frame));
 
-	const hasRunning = d.progress?.some((p) => p.status === "running") 
-		|| d.results.some((r) => r.progress?.status === "running")
-		|| workflowGraphHasStatus(d, ["running"]);
-	const ok = d.results.filter((r) => r.progress?.status === "completed" || (r.exitCode === 0 && r.progress?.status !== "running")).length;
-	const hasEmptyWithoutTarget = d.results.some((r) =>
-		r.exitCode === 0
-		&& r.progress?.status !== "running"
+	const hasRunning = detailsHaveRunningResult(d);
+	const detached = d.results.some((r) => r.detached)
+		|| workflowGraphHasStatus(d, ["detached"]);
+	const stopped = d.results.some((r) => r.stopped)
+		|| workflowGraphHasStatus(d, ["stopped"]);
+	const failed = d.results.some((r) => !hasTerminalResultFlag(r) && r.exitCode !== 0 && !isResultRunning(r))
+		|| workflowGraphHasStatus(d, ["failed"]);
+	const paused = d.results.some((r) => r.interrupted)
+		|| workflowGraphHasStatus(d, ["paused"]);
+	const partial = workflowGraphHasStatus(d, ["partial"]);
+	const completedWithoutOutput = d.results.some((r) =>
+		!hasTerminalResultFlag(r)
+		&& r.exitCode === 0
+		&& !isResultRunning(r)
 		&& hasEmptyTextOutputWithoutOutputTarget(r.task, getSingleResultOutput(r)),
 	);
-	const hasWorkflowFailure = workflowGraphHasStatus(d, ["failed"]);
-	const hasWorkflowStop = d.results.some((r) => r.stopped && r.progress?.status !== "running") || workflowGraphHasStatus(d, ["stopped"]);
-	const hasWorkflowPause = workflowGraphHasStatus(d, ["paused", "detached"]);
-	const icon = hasRunning
-		? theme.fg("warning", "running")
-		: hasEmptyWithoutTarget
-			? theme.fg("warning", "warning")
-			: hasWorkflowFailure
-				? theme.fg("error", "failed")
-				: hasWorkflowStop
-					? theme.fg("warning", "stopped")
-					: hasWorkflowPause
-						? theme.fg("warning", "paused")
-					: ok === d.results.length
-						? theme.fg("success", "ok")
-						: theme.fg("error", "failed");
+	const presentation = styledResultPresentation(semanticResultPresentation({
+		running: hasRunning,
+		detached,
+		stopped,
+		interrupted: paused,
+		failed,
+		partial,
+		completedWithoutOutput,
+		frame,
+	}), theme);
 
 	const totalSummary =
 		d.progressSummary ||
@@ -1593,7 +3803,7 @@ export function renderSubagentResult(
 	const summaryStr = summaryParts.length ? ` | ${summaryParts.join(", ")}` : "";
 
 	const modeLabel = d.mode;
-	const contextBadge = d.context === "fork" ? theme.fg("warning", " [fork]") : "";
+	const contextBadge = contextModeBadge(theme, d.context);
 	const multiLabel = buildMultiProgressLabel(d, hasRunning);
 	const itemTitle = multiLabel.itemTitle;
 	
@@ -1601,22 +3811,15 @@ export function renderSubagentResult(
 		? d.chainAgents
 				.map((agent, i) => {
 					const result = d.results[i];
-					const isFailed = result && result.exitCode !== 0 && result.progress?.status !== "running";
-					const isComplete = result && result.exitCode === 0 && result.progress?.status !== "running";
-					const isEmptyWithoutTarget = Boolean(result)
-						&& Boolean(isComplete)
-						&& hasEmptyTextOutputWithoutOutputTarget(result.task, getSingleResultOutput(result));
+					const displayName = foregroundResultDisplayName(d, i, result, agent);
 					const isCurrent = i === (d.currentStepIndex ?? d.results.length);
-					const stepIcon = isFailed
-						? theme.fg("error", "failed")
-						: isEmptyWithoutTarget
-							? theme.fg("warning", "warning")
-							: isComplete
-								? theme.fg("success", "done")
-								: isCurrent && hasRunning
-									? theme.fg("warning", "running")
-									: theme.fg("dim", "pending");
-					return `${stepIcon} ${agent}`;
+					const stepPresentation = result
+						? styledResultPresentation(resultPresentation(result, getSingleResultOutput(result), isCurrent && hasRunning && !hasTerminalResultFlag(result)), theme)
+						: undefined;
+					const stepStatus = stepPresentation
+						? `${stepPresentation.glyph} ${stepPresentation.label}`
+						: theme.fg("dim", "◦ pending");
+					return `${stepStatus} ${displayName}${contextModeBadge(theme, result?.context)}`;
 				})
 				.join(theme.fg("dim", " → "))
 		: null;
@@ -1626,7 +3829,7 @@ export function renderSubagentResult(
 	const c = new Container();
 	c.addChild(
 		new Text(
-			fit(`${icon} ${theme.fg("toolTitle", theme.bold(modeLabel))}${contextBadge} · ${multiLabel.headerLabel}${summaryStr}`),
+			fit(`${presentation.glyph} ${theme.fg("toolTitle", theme.bold(modeLabel))}${contextBadge} · ${multiLabel.headerLabel}${summaryStr} ${theme.fg("dim", "·")} ${presentation.label}`),
 			0,
 			0,
 		),
@@ -1634,24 +3837,24 @@ export function renderSubagentResult(
 	if (chainVis) {
 		c.addChild(new Text(fit(`  ${chainVis}`), 0, 0));
 	}
+	const workflowChecklist = foregroundWorkflowChecklist(d);
+	for (const line of workflowChecklistWidgetLines(workflowChecklist, theme, "  ", true, frame, { includeItemErrors: false })) {
+		c.addChild(new Text(fit(line), 0, 0));
+	}
 
 	const useResultsDirectly = multiLabel.hasParallelInChain || !d.chainAgents?.length;
 	const displayStart = multiLabel.showActiveGroupOnly ? multiLabel.groupStartIndex : 0;
 	const displayEnd = multiLabel.showActiveGroupOnly ? multiLabel.groupEndIndex : (useResultsDirectly ? d.results.length : d.chainAgents!.length);
 	const chainEntries = buildChainRenderEntries(d, multiLabel);
-	const renderEntries = chainEntries ?? Array.from({ length: displayEnd - displayStart }, (_, offset): ChainRenderEntry => {
-		const i = displayStart + offset;
-		const r = d.results[i];
-		const rowNumber = multiLabel.showActiveGroupOnly ? (i - multiLabel.groupStartIndex + 1) : (i + 1);
-		return { kind: "result", resultIndex: i, rowNumber, agentName: useResultsDirectly ? (r?.agent || `step-${rowNumber}`) : (d.chainAgents![i] || r?.agent || `step-${rowNumber}`) };
-	});
+	const renderEntries = chainEntries ?? buildForegroundResultEntries(d, multiLabel, displayStart, displayEnd, useResultsDirectly);
 
 	c.addChild(new Spacer(1));
 
 	for (const entry of renderEntries) {
-		if (entry.kind === "placeholder") {
+		if (entry.kind === "group") {
 			const statusLabel = widgetStepStatus(entry.status as AsyncJobStep["status"], theme);
-			c.addChild(new Text(fit(`  ${statusLabel} ${entry.stepLabel}: ${theme.bold(entry.agentName)}`), 0, 0));
+			const groupLabel = entry.groupLabel ? ` (${compactTaskText(undefined, entry.groupLabel) ?? entry.groupLabel})` : "";
+			c.addChild(new Text(fit(`  ${statusLabel} ${entry.stepLabel}${groupLabel}`), 0, 0));
 			c.addChild(new Text(theme.fg(entry.status === "failed" ? "error" : "dim", `    status: ${entry.status}`), 0, 0));
 			if (entry.error) c.addChild(new Text(theme.fg("error", `    error: ${entry.error}`), 0, 0));
 			c.addChild(new Spacer(1));
@@ -1663,33 +3866,28 @@ export function renderSubagentResult(
 		const agentName = entry.agentName;
 
 		if (!r) {
-			const pendingLabel = chainEntries ? resultRowLabel(d, multiLabel, i, rowNumber) : `${itemTitle} ${rowNumber}`;
-			c.addChild(new Text(fit(theme.fg("dim", `  ${pendingLabel}: ${agentName}`)), 0, 0));
+			const pendingLabel = entry.rowLabel ?? (entry.isParallel ? "" : `${itemTitle} ${rowNumber}`);
+			const labelPrefix = pendingLabel ? `${pendingLabel}: ` : "";
+			c.addChild(new Text(fit(theme.fg("dim", `  ${labelPrefix}${agentName}`)), 0, 0));
 			c.addChild(new Text(theme.fg("dim", `    status: pending`), 0, 0));
 			c.addChild(new Spacer(1));
 			continue;
 		}
 
-		const progressFromArray = d.progress?.find((p) => p.index === i) 
-			|| d.progress?.find((p) => p.agent === r.agent && p.status === "running");
+		const progressFromArray = foregroundProgressForResult(d, i);
 		const rProg = r.progress || progressFromArray || r.progressSummary;
-		const rRunning = rProg?.status === "running";
-		const stepNumber = typeof rProg?.index === "number" ? rProg.index + 1 : i + 1;
+		const rRunning = isResultRunning(r, rProg?.status);
 
 		const resultOutput = getSingleResultOutput(r);
-		const statusIcon = rRunning
-			? theme.fg("warning", "running")
-			: r.exitCode !== 0
-				? theme.fg("error", "failed")
-				: hasEmptyTextOutputWithoutOutputTarget(r.task, resultOutput)
-					? theme.fg("warning", "warning")
-					: theme.fg("success", "done");
+		const rowPresentation = styledResultPresentation(resultPresentation(r, resultOutput, rRunning, progressRunningSeed(rProg), frame), theme);
 		const stats = rProg ? ` | ${rProg.toolCount} tools, ${formatDuration(rProg.durationMs)}` : "";
-		const modelDisplay = modelThinkingBadge(theme, r.model);
-		const stepLabel = resultRowLabel(d, multiLabel, i, stepNumber);
+		const modelDisplay = modelThinkingBadge(theme, rProg?.model ?? r.model, r.thinking ?? rProg?.thinking);
+		const stepLabel = entry.rowLabel;
+		const contextBadge = contextModeBadge(theme, r.context);
+		const labelPrefix = stepLabel ? `${stepLabel}: ` : "";
 		const stepHeader = rRunning
-			? `${statusIcon} ${stepLabel}: ${theme.bold(theme.fg("warning", r.agent))}${modelDisplay}${stats}`
-			: `${statusIcon} ${stepLabel}: ${theme.bold(r.agent)}${modelDisplay}${stats}`;
+			? `${rowPresentation.glyph} ${labelPrefix}${theme.bold(theme.fg("warning", agentName))}${contextBadge}${modelDisplay}${stats} ${theme.fg("dim", "·")} ${rowPresentation.label}`
+			: `${rowPresentation.glyph} ${labelPrefix}${theme.bold(agentName)}${contextBadge}${modelDisplay}${stats} ${theme.fg("dim", "·")} ${rowPresentation.label}`;
 		const toolCallLines = getToolCallLines(r, expanded);
 		c.addChild(new Text(fit(stepHeader), 0, 0));
 
@@ -1698,10 +3896,15 @@ export function renderSubagentResult(
 			? r.task
 			: `${r.task.slice(0, taskMaxLen)}...`;
 		c.addChild(new Text(fit(theme.fg("dim", `    task: ${taskPreview}`)), 0, 0));
+		const reportedRow = rRunning && progressFromArray ? reportedProgressRow(progressFromArray, theme, "    ", w) : undefined;
+		if (reportedRow) c.addChild(new Text(fit(reportedRow), 0, 0));
 
 		const outputTarget = extractOutputTarget(r.task);
 		if (outputTarget) {
 			c.addChild(new Text(fit(theme.fg("dim", `    output: ${outputTarget}`)), 0, 0));
+		}
+		if (!rRunning && (r.exitCode !== 0 || r.interrupted || r.detached || r.stopped)) {
+			c.addChild(new Text(fit(theme.fg(r.exitCode !== 0 ? "error" : "dim", `    ⎿  ${resultStatusLine(r, resultOutput)}`)), 0, 0));
 		}
 
 		if (r.skills?.length) {
@@ -1709,9 +3912,6 @@ export function renderSubagentResult(
 		}
 		if (r.skillsWarning) {
 			c.addChild(new Text(fit(theme.fg("warning", `    Warning: ${r.skillsWarning}`)), 0, 0));
-		}
-		if (r.attemptedModels && r.attemptedModels.length > 1) {
-			c.addChild(new Text(fit(theme.fg("dim", `    fallbacks: ${r.attemptedModels.join(" → ")}`)), 0, 0));
 		}
 
 		if (rRunning && rProg) {
@@ -1727,6 +3927,9 @@ export function renderSubagentResult(
 			if (liveStatusLine) {
 				c.addChild(new Text(fit(theme.fg("accent", `    ${liveStatusLine}`)), 0, 0));
 			}
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, w, true, progressSnapshotNow, 8)) {
+				c.addChild(new Text(fit(`    ${nestedLine}`), 0, 0));
+			}
 			c.addChild(new Text(fit(theme.fg("accent", `    ${liveDetailHintText()}`)), 0, 0));
 			if (r.artifactPaths) {
 				c.addChild(new Text(fit(theme.fg("dim", `    artifacts: ${shortenPath(r.artifactPaths.outputPath)}`)), 0, 0));
@@ -1734,15 +3937,18 @@ export function renderSubagentResult(
 			if (rProg.recentTools?.length) {
 				for (const t of rProg.recentTools.slice(-3)) {
 					const maxArgsLen = Math.max(40, w - 30);
-					const argsPreview = expanded || t.args.length <= maxArgsLen
-						? t.args
-						: `${t.args.slice(0, maxArgsLen)}...`;
+					const argsPreview = renderToolArgsPreview(t.args, maxArgsLen, expanded);
 					c.addChild(new Text(fit(theme.fg("dim", `      ${t.tool}: ${argsPreview}`)), 0, 0));
 				}
 			}
-			const recentLines = (rProg.recentOutput ?? []).slice(-5);
-			for (const line of recentLines) {
+			for (const line of compactRecentOutputLines(rProg.recentOutput)) {
 				c.addChild(new Text(fit(theme.fg("dim", `      ${line}`)), 0, 0));
+			}
+		}
+
+		if (!rRunning) {
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, w, true, r.progress?.lastActivityAt, 8)) {
+				c.addChild(new Text(fit(`    ${nestedLine}`), 0, 0));
 			}
 		}
 

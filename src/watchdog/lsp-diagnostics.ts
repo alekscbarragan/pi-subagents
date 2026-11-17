@@ -216,7 +216,7 @@ export function watchdogWarningFromLspDiagnostics(result: WatchdogLspResult): Wa
 	return {
 		severity,
 		category: "correctness",
-		confidence: "high",
+		importance: "high",
 		source: "lsp",
 		summary: `LSP found ${count} ${kind}${count === 1 ? "" : "s"} in changed ${count === 1 ? "file" : "files"}.`,
 		evidence: evidence || formatDiagnostic(primary),
@@ -260,6 +260,7 @@ class JsonRpcLspClient {
 	private readonly child: ChildProcessWithoutNullStreams;
 	private stderr = "";
 	private exited = false;
+	private terminating = false;
 	private readonly exitWaiters: Array<() => void> = [];
 
 	constructor(child: ChildProcessWithoutNullStreams) {
@@ -295,17 +296,21 @@ class JsonRpcLspClient {
 
 	async shutdown(): Promise<void> {
 		if (this.exited) return;
-		try {
-			await this.request("shutdown", null, SHUTDOWN_TIMEOUT_MS);
-			this.notify("exit", null);
-		} catch {
-			this.child.kill("SIGTERM");
+		if (!this.terminating) {
+			try {
+				await this.request("shutdown", null, SHUTDOWN_TIMEOUT_MS);
+				this.notify("exit", null);
+			} catch {
+				this.kill();
+			}
 		}
 		await this.waitForExit(SHUTDOWN_TIMEOUT_MS);
 	}
 
 	kill(): void {
-		if (!this.exited) this.child.kill("SIGTERM");
+		if (this.exited || this.terminating) return;
+		this.terminating = true;
+		this.child.kill("SIGTERM");
 	}
 
 	stderrTail(): string {
@@ -367,7 +372,7 @@ class JsonRpcLspClient {
 	private failProtocol(error: Error): void {
 		if (this.exited) return;
 		this.rejectPending(error);
-		this.child.kill("SIGTERM");
+		this.kill();
 	}
 
 	private waitForExit(timeoutMs: number): Promise<void> {
@@ -439,6 +444,7 @@ async function collectWithTypeScriptLanguageServer(input: {
 }): Promise<WatchdogLspResult> {
 	const started = Date.now();
 	const child = spawn(input.command.command, input.command.args, {
+		windowsHide: true,
 		cwd: input.root,
 		stdio: "pipe",
 		env: { ...process.env, NO_COLOR: "1" },

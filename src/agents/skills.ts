@@ -1,11 +1,9 @@
-/**
- * Skill resolution and caching for subagent extension
- */
-
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { parse as parseYaml } from "yaml";
+import { parseFrontmatter } from "./frontmatter.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
 
 export type SkillSource =
@@ -25,6 +23,7 @@ interface ResolvedSkill {
 	content: string;
 	description?: string;
 	source: SkillSource;
+	disableModelInvocation?: boolean;
 }
 
 interface SkillCacheEntry {
@@ -37,6 +36,7 @@ interface CachedSkillEntry {
 	filePath: string;
 	source: SkillSource;
 	description?: string;
+	disableModelInvocation?: boolean;
 	order: number;
 }
 
@@ -87,7 +87,8 @@ function readOptionalJsonFile(filePath: string, label: string): unknown {
 		const code = typeof error === "object" && error !== null && "code" in error
 			? (error as { code?: unknown }).code
 			: undefined;
-		if (code === "ENOENT") return null;
+		// ENOTDIR: a settings package entry may name a single extension file, so `<file>/package.json` is no manifest.
+		if (code === "ENOENT" || code === "ENOTDIR") return null;
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`Failed to read ${label} '${filePath}': ${message}`, {
 			cause: error instanceof Error ? error : undefined,
@@ -122,9 +123,26 @@ function extractSkillPathsFromPackageRoot(packageRoot: string, source: SkillSour
 let cachedGlobalNpmRoot: string | null = null;
 
 function getGlobalNpmRoot(): string | null {
+	const offline = process.env.PI_OFFLINE?.toLowerCase();
+	if (offline === "1" || offline === "true" || offline === "yes") return null;
 	if (cachedGlobalNpmRoot !== null) return cachedGlobalNpmRoot;
+
+	const windowsGlobalRoot = process.platform === "win32" && process.env.APPDATA
+		? path.join(process.env.APPDATA, "npm", "node_modules")
+		: undefined;
+	if (windowsGlobalRoot) {
+		try {
+			if (fs.statSync(windowsGlobalRoot).isDirectory()) {
+				cachedGlobalNpmRoot = fs.realpathSync(windowsGlobalRoot);
+				return cachedGlobalNpmRoot;
+			}
+		} catch {
+			// Fall through if the directory disappears while resolving it.
+		}
+	}
+
 	try {
-		cachedGlobalNpmRoot = execSync("npm root -g", { encoding: "utf-8", timeout: 5000 }).trim();
+		cachedGlobalNpmRoot = fs.realpathSync(execSync("npm root -g", { encoding: "utf-8", timeout: 5000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }).trim());
 		return cachedGlobalNpmRoot;
 	} catch {
 		// Global npm root is optional in constrained environments.
@@ -377,21 +395,34 @@ function chooseHigherPrioritySkill(existing: CachedSkillEntry | undefined, candi
 	return candidate.order < existing.order ? candidate : existing;
 }
 
-function maybeReadSkillDescription(filePath: string): string | undefined {
+function parseSkillDescription(content: string): string | undefined {
+	return parseFrontmatter(content).frontmatter.description;
+}
+
+function maybeReadSkillMetadata(filePath: string): Pick<CachedSkillEntry, "description" | "disableModelInvocation"> {
 	try {
 		const content = fs.readFileSync(filePath, "utf-8");
+		return { description: parseSkillDescription(content), disableModelInvocation: maybeReadSkillDisableModelInvocation(content) };
+	} catch {
+		return {};
+	}
+}
+
+function maybeReadSkillDisableModelInvocation(content: string): boolean | undefined {
+	try {
 		const normalized = content.replace(/\r\n/g, "\n");
 		if (!normalized.startsWith("---")) return undefined;
-
 		const endIndex = normalized.indexOf("\n---", 3);
 		if (endIndex === -1) return undefined;
-
-		const frontmatter = normalized.slice(3, endIndex).trim();
-		const match = frontmatter.match(/^description:\s*(.+)$/m);
-		if (!match) return undefined;
-		return match[1]?.trim().replace(/^['\"]|['\"]$/g, "");
+		const parsed: unknown = parseYaml(normalized.slice(4, endIndex));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+		// Match the pi host's skill loader semantics: only YAML boolean true
+		// disables model invocation; strings and other values stay invocable.
+		// Hidden skills remain user-invocable via explicit `/skill:name` commands
+		// but must stay out of the model-facing default skill set.
+		return (parsed as Record<string, unknown>)["disable-model-invocation"] === true ? true : undefined;
 	} catch {
-		// Description parsing is best-effort metadata extraction.
+		// Best-effort metadata extraction.
 		return undefined;
 	}
 }
@@ -406,15 +437,18 @@ function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: Skil
 		const resolvedFile = path.resolve(filePath);
 		if (!fs.existsSync(resolvedFile)) return;
 		const source = inferSkillSource(resolvedFile, cwd, agentDir, sourceHint);
+		const { description, disableModelInvocation } = maybeReadSkillMetadata(resolvedFile);
 		const existingIndex = seen.get(resolvedFile);
 		if (existingIndex !== undefined) {
 			const existing = entries[existingIndex];
 			if (existing && (SOURCE_PRIORITY[source] ?? 0) > (SOURCE_PRIORITY[existing.source] ?? 0)) {
+				const { description: _description, disableModelInvocation: _disableModelInvocation, ...existingWithoutMetadata } = existing;
 				entries[existingIndex] = {
-					...existing,
+					...existingWithoutMetadata,
 					name,
 					source,
-					description: maybeReadSkillDescription(resolvedFile),
+					...(description !== undefined ? { description } : {}),
+					...(disableModelInvocation !== undefined ? { disableModelInvocation } : {}),
 				};
 			}
 			return;
@@ -424,7 +458,8 @@ function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: Skil
 			name,
 			filePath: resolvedFile,
 			source,
-			description: maybeReadSkillDescription(resolvedFile),
+			...(description !== undefined ? { description } : {}),
+			...(disableModelInvocation !== undefined ? { disableModelInvocation } : {}),
 			order: order++,
 		});
 	};
@@ -583,12 +618,14 @@ function readSkill(
 
 		const raw = fs.readFileSync(skillPath, "utf-8");
 		const content = stripSkillFrontmatter(raw);
-		const description = maybeReadSkillDescription(skillPath);
+		const description = parseSkillDescription(raw);
+		const disableModelInvocation = maybeReadSkillDisableModelInvocation(raw);
 		const skill: ResolvedSkill = {
 			name: skillName,
 			path: skillPath,
 			content,
-			description,
+			...(description !== undefined ? { description } : {}),
+			...(disableModelInvocation !== undefined ? { disableModelInvocation } : {}),
 			source,
 		};
 
@@ -665,7 +702,12 @@ export function resolveSkillsWithFallback(
 }
 
 export function buildSkillInjection(skills: ResolvedSkill[]): string {
-	if (skills.length === 0) return "";
+	// Hidden skills (disable-model-invocation: true) must never reach a child
+	// prompt, even if a caller resolves them by name. This is the single
+	// chokepoint every prompt-injection path funnels through, so filtering
+	// here closes the leak regardless of which caller assembled the list.
+	const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
+	if (visibleSkills.length === 0) return "";
 
 	const lines = [
 		"The following configured skills are available to this subagent.",
@@ -674,7 +716,7 @@ export function buildSkillInjection(skills: ResolvedSkill[]): string {
 		"",
 		"<available_skills>",
 	];
-	for (const skill of skills) {
+	for (const skill of visibleSkills) {
 		lines.push("  <skill>");
 		lines.push(`    <name>${escapeXmlText(skill.name)}</name>`);
 		lines.push(`    <description>${escapeXmlText(skill.description ?? "")}</description>`);
@@ -722,6 +764,7 @@ export function discoverAvailableSkills(cwd: string): Array<{
 	name: string;
 	source: SkillSource;
 	description?: string;
+	disableModelInvocation?: boolean;
 }> {
 	const skills = getCachedSkills(cwd);
 	return skills
@@ -729,7 +772,8 @@ export function discoverAvailableSkills(cwd: string): Array<{
 		.map((s) => ({
 			name: s.name,
 			source: s.source,
-			description: s.description,
+			...(s.description !== undefined ? { description: s.description } : {}),
+			...(s.disableModelInvocation !== undefined ? { disableModelInvocation: s.disableModelInvocation } : {}),
 		}))
 		.sort((a, b) => a.name.localeCompare(b.name));
 }

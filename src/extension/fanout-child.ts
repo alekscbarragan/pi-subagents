@@ -4,14 +4,23 @@ import * as path from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "../agents/agents.ts";
 import { getArtifactsDir } from "../shared/artifacts.ts";
-import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
-import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
-import { readNestedControlRequests, resolveNestedRouteFromEnv, writeNestedControlResult } from "../runs/shared/nested-events.ts";
+import { createSubagentExecutor } from "../runs/foreground/subagent-executor.ts";
+import { resolveWaitToolConfig } from "../runs/background/wait-config.ts";
+import type { ChildRuntimeConfig } from "../runs/shared/child-runtime-config.ts";
+import { nestedRunNotActiveMessage, readNestedControlRequests, resolveInheritedNestedRoute, type NestedRoute, writeNestedControlResult } from "../runs/shared/nested-events.ts";
 import { deliverSubagentIntercomMessageEvent } from "../intercom/result-intercom.ts";
+import { createNativeSupervisorChannel, NATIVE_SUPERVISOR_TOOL_NAME, resolveSupervisorChannelDir } from "../intercom/native-supervisor-channel.ts";
+import { readStatus } from "../shared/utils.ts";
 import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
-import { SubagentParams } from "./schemas.ts";
-import { loadConfig } from "./config.ts";
-import { type Details, type SubagentState } from "../shared/types.ts";
+import { createSubagentParamsSchema } from "./schemas.ts";
+import { registerPinnedTool } from "./declaration-pinning.ts";
+import { resolveDisabledFeatureSurface } from "../shared/disabled-features.ts";
+import { finalizeToolResult } from "./tool-result.ts";
+import { flattenSubagentToolOptions } from "./subagent-options.ts";
+import { loadConfig, resolveAsyncByDefault } from "./config.ts";
+import { SUBAGENT_ASYNC_STARTED_EVENT, type AsyncStartedEvent, type Details, type SubagentState } from "../shared/types.ts";
+import { createChildExternalJobBridgeSweeper } from "../runs/shared/external-job-bridge.ts";
+import { MODEL_ONLY_TOOL } from "../shared/extension-context.ts";
 
 function getSubagentSessionRoot(parentSessionFile: string | null): string {
 	if (parentSessionFile) {
@@ -26,7 +35,7 @@ function expandTilde(p: string): string {
 	return p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
 }
 
-function createChildSafeState(): SubagentState {
+export function createChildSafeState(): SubagentState {
 	return {
 		baseCwd: "",
 		currentSessionId: null,
@@ -36,7 +45,6 @@ function createChildSafeState(): SubagentState {
 		foregroundRuns: new Map(),
 		foregroundControls: new Map(),
 		lastForegroundControlId: null,
-		pendingForegroundControlNotices: new Map(),
 		cleanupTimers: new Map(),
 		lastUiContext: null,
 		poller: null,
@@ -50,32 +58,45 @@ function createChildSafeState(): SubagentState {
 	};
 }
 
-function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState): NodeJS.Timeout | undefined {
-	let route;
-	try {
-		route = resolveNestedRouteFromEnv();
-	} catch {
-		return undefined;
-	}
-	if (!route) return undefined;
-	const seen = new Set<string>();
-	const inFlight = new Set<string>();
-	const pendingResults = new Map<string, Parameters<typeof writeNestedControlResult>[1]>();
+function resolveNestedControlRoute(config: ChildRuntimeConfig): NestedRoute | undefined {
+	return config.nestedRoute ? resolveInheritedNestedRoute(config.nestedRoute) : undefined;
+}
+
+function nestedControlRouteKey(route: NestedRoute): string {
+	return route.controlInbox;
+}
+
+interface NestedControlInboxState {
+	seen: Set<string>;
+	inFlight: Set<string>;
+	pendingResults: Map<string, Parameters<typeof writeNestedControlResult>[1]>;
+}
+
+interface NestedControlListenerEntry {
+	cleanup: () => void;
+	state: NestedControlInboxState;
+}
+
+function createNestedControlInboxState(): NestedControlInboxState {
+	return { seen: new Set(), inFlight: new Set(), pendingResults: new Map() };
+}
+
+function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState, route: NestedRoute, inboxState: NestedControlInboxState): () => void {
 	const timer = setInterval(() => {
 		try {
 			for (const request of readNestedControlRequests(route)) {
-				if (seen.has(request.requestId) || inFlight.has(request.requestId)) continue;
-				inFlight.add(request.requestId);
+				if (inboxState.seen.has(request.requestId) || inboxState.inFlight.has(request.requestId)) continue;
+				inboxState.inFlight.add(request.requestId);
 				void (async () => {
 					try {
-						let result = pendingResults.get(request.requestId);
+						let result = inboxState.pendingResults.get(request.requestId);
 						if (!result) {
 							let ok = false;
 							let message = "Control request failed.";
 							try {
 								const control = state.foregroundControls.get(request.targetRunId);
 								if (!control) {
-									message = `Nested run ${request.targetRunId} is not active in this fanout child.`;
+									message = nestedRunNotActiveMessage(request.targetRunId);
 								} else if (request.action === "interrupt") {
 									ok = control.interrupt?.() === true;
 									message = ok
@@ -107,15 +128,15 @@ function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState)
 						try {
 							writeNestedControlResult(route, result);
 						} catch (error) {
-							pendingResults.set(request.requestId, result);
+							inboxState.pendingResults.set(request.requestId, result);
 							console.error(`Failed to write nested control result for request '${request.requestId}' targeting '${request.targetRunId}' via inbox '${route.controlInbox}'; keeping request for retry:`, error);
 							return;
 						}
-						pendingResults.delete(request.requestId);
-						seen.add(request.requestId);
+						inboxState.pendingResults.delete(request.requestId);
+						inboxState.seen.add(request.requestId);
 						try { fs.unlinkSync(request.filePath); } catch {}
 					} finally {
-						inFlight.delete(request.requestId);
+						inboxState.inFlight.delete(request.requestId);
 					}
 				})();
 			}
@@ -124,11 +145,12 @@ function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState)
 		}
 	}, 200);
 	timer.unref?.();
-	return timer;
+	return () => clearInterval(timer);
 }
 
-export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI): void {
-	if (process.env[SUBAGENT_CHILD_ENV] !== "1" || process.env[SUBAGENT_FANOUT_CHILD_ENV] !== "1") return;
+/** Register delegation and supervisor replies for fanout-authorized children. */
+export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, childConfig: ChildRuntimeConfig): void {
+	if (!childConfig.fanoutChild) return;
 
 	const globalStore = globalThis as Record<string, unknown>;
 	const registeredKey = "__piSubagentFanoutChildRegisteredApis";
@@ -140,33 +162,120 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI): 
 	registeredApis.add(pi);
 
 	const config = loadConfig();
-	const state = createChildSafeState();
+	const waitToolConfig = resolveWaitToolConfig(config.waitTool);
+	const state = childConfig.runtimeState ?? createChildSafeState();
+	const asyncChildren = new Map<string, { dir: string; agents: string[] }>();
+	const foregroundChannels = new Set<string>();
+	const supervisorChannel = createNativeSupervisorChannel(pi, state, {
+		getChannelDirs: () => {
+			const dirs = new Set<string>();
+			for (const run of state.foregroundControls.values()) {
+				for (const child of run.activeChildren?.values() ?? []) dirs.add(resolveSupervisorChannelDir(run.runId, child.agent, child.index));
+			}
+			for (const run of state.foregroundRuns?.values() ?? []) {
+				for (const child of run.children) {
+					if (child.status === "detached") dirs.add(resolveSupervisorChannelDir(run.runId, child.agent, child.index));
+				}
+			}
+			const retiringForeground = [...foregroundChannels].filter(dir => !dirs.has(dir));
+			for (const dir of dirs) foregroundChannels.add(dir);
+			for (const dir of retiringForeground) dirs.add(dir);
+			const retiringAsync: string[] = [];
+			for (const [id, child] of asyncChildren) {
+				const status = readStatus(child.dir);
+				if (status && status.state !== "queued" && status.state !== "running") retiringAsync.push(id);
+				for (const [index, agent] of child.agents.entries()) dirs.add(resolveSupervisorChannelDir(id, agent, index));
+			}
+			return {
+				dirs: [...dirs],
+				retire: () => {
+					for (const dir of retiringForeground) foregroundChannels.delete(dir);
+					for (const id of retiringAsync) asyncChildren.delete(id);
+				},
+			};
+		},
+	});
+	const hasPendingSupervisorRequest = supervisorChannel.hasPendingRequests;
+	childConfig.hasPendingSupervisorRequest = hasPendingSupervisorRequest;
 	const executor = createSubagentExecutor({
 		pi,
 		state,
 		config,
-		asyncByDefault: config.asyncByDefault === true,
+		asyncByDefault: resolveAsyncByDefault(config),
+		waitToolEnabled: waitToolConfig.enabled,
+		waitToolDefaultTimeoutMs: waitToolConfig.defaultTimeoutMs,
 		tempArtifactsDir: getArtifactsDir(null),
 		getSubagentSessionRoot,
 		expandTilde,
 		discoverAgents,
 		allowMutatingManagementActions: false,
+		childRuntime: childConfig,
+		activateSupervisorTransport: supervisorChannel.activateTransport,
+		findPendingAsks: supervisorChannel.findPendingAsks,
 	});
 
-	const tool: ToolDefinition<typeof SubagentParams, Details> = {
+	const disabledFeatures = resolveDisabledFeatureSurface(config);
+	const listEnabled = (actions: string[]) => actions.filter((action) => !disabledFeatures.actions.has(action)).join(", ");
+	const blockedActions = listEnabled(["create", "update", "delete", "eject", "disable", "enable", "reset", "grant-spawn-budget", "lane.recordMerge", "lane.recordSupersession"]);
+	const params = createSubagentParamsSchema(disabledFeatures);
+	const tool: ToolDefinition<typeof params, Details> = {
 		name: "subagent",
+		...MODEL_ONLY_TOOL,
 		label: "Subagent",
 		description: [
 			"Delegate to subagents from child-safe fanout mode.",
-			"Allowed management/control actions: list, get, status, interrupt, resume, steer, append-step, doctor.",
-			"Agent config mutation actions (create, update, delete, eject, disable, enable, reset) are blocked in this mode.",
+			`Allowed management/control actions: ${listEnabled(["list", "get", "status", "lane.status", "interrupt", "resume", "steer", "doctor"])}.`,
+			...(blockedActions ? [`Mutating management actions (${blockedActions}) are blocked in this mode.`] : []),
 		].join("\n"),
-		parameters: SubagentParams,
-		execute(id, params, signal, onUpdate, ctx) {
-			return executor.execute(id, params as SubagentParamsLike, signal, onUpdate, ctx);
+		parameters: params,
+		async execute(id, params, signal, onUpdate, ctx) {
+			return finalizeToolResult(await executor.executePublic(id, flattenSubagentToolOptions(params, disabledFeatures), signal ?? new AbortController().signal, onUpdate, ctx));
 		},
 	};
 
-	pi.registerTool(tool);
-	startNestedControlInboxListener(pi, state);
+	registerPinnedTool(pi, tool);
+	const bridgeSweeper = createChildExternalJobBridgeSweeper();
+	const unsubscribeBridgeStarted = pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, (payload: unknown) => {
+		const info = payload as AsyncStartedEvent;
+		if (info.id && info.asyncDir && info.sessionId === state.currentSessionId) bridgeSweeper.track(info.id, info.asyncDir);
+	});
+	let unsubscribeAsyncStarted: (() => void) | undefined;
+	pi.on("session_start", (_event, ctx) => {
+		supervisorChannel.registerTools();
+		// The host applies the explicit allowlist to dynamic registration too.
+		if (!pi.getAllTools().some(tool => tool.name === NATIVE_SUPERVISOR_TOOL_NAME)) return;
+		// Downward asks belong to this coordinator, not its parent or persisted session file.
+		state.supervisorOwnerSessionId = ctx.sessionManager.getSessionId() || null;
+		unsubscribeAsyncStarted = pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, (payload: unknown) => {
+			const info = payload as AsyncStartedEvent;
+			if (!info.id || !info.asyncDir || info.sessionId !== state.currentSessionId) return;
+			const agents = info.agents ?? (info.agent ? [info.agent] : []);
+			asyncChildren.set(info.id, { dir: info.asyncDir, agents });
+			supervisorChannel.activateTransport();
+		});
+		supervisorChannel.start();
+		supervisorChannel.activateTransport();
+	});
+	pi.on("session_shutdown", () => {
+		unsubscribeAsyncStarted?.();
+		unsubscribeBridgeStarted?.();
+		bridgeSweeper.dispose();
+		asyncChildren.clear();
+		foregroundChannels.clear();
+		supervisorChannel.dispose();
+		if (childConfig.hasPendingSupervisorRequest === hasPendingSupervisorRequest) childConfig.hasPendingSupervisorRequest = undefined;
+		state.supervisorOwnerSessionId = null;
+	});
+	const route = resolveNestedControlRoute(childConfig);
+	if (!route) return;
+	const listenerCleanupKey = "__piSubagentFanoutChildNestedControlInboxCleanups";
+	const listenerCleanups = globalStore[listenerCleanupKey] instanceof Map
+		? globalStore[listenerCleanupKey] as Map<string, NestedControlListenerEntry>
+		: new Map<string, NestedControlListenerEntry>();
+	globalStore[listenerCleanupKey] = listenerCleanups;
+	const routeKey = nestedControlRouteKey(route);
+	const previous = listenerCleanups.get(routeKey);
+	previous?.cleanup();
+	const inboxState = previous?.state ?? createNestedControlInboxState();
+	listenerCleanups.set(routeKey, { state: inboxState, cleanup: startNestedControlInboxListener(pi, state, route, inboxState) });
 }

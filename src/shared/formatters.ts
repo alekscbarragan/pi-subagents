@@ -1,36 +1,38 @@
-/**
- * Formatting utilities for display output
- */
-
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Usage, SingleResult } from "./types.ts";
+import type { Usage, SingleResult, TokenUsage } from "./types.ts";
 import type { ChainStep } from "./settings.ts";
 import { isDynamicParallelStep, isParallelStep } from "./settings.ts";
+import { previewDisplayText, sanitizeDisplayText } from "./display-text.ts";
 import { splitKnownThinkingSuffix, THINKING_LEVELS } from "./model-info.ts";
 
-/**
- * Format token count with k suffix for large numbers
- */
 export function formatTokens(n: number): string {
-	return n < 1000 ? String(n) : n < 10000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n / 1000)}k`;
+	if (n < 1000) return String(n);
+	if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
+	if (n < 999_500) return `${Math.round(n / 1000)}k`;
+	return `${Number((n / 1_000_000).toFixed(1))}M`;
+}
+
+export function formatTokenUsage(usage: TokenUsage, legacyLabel = "tok"): string {
+	return usage.window !== undefined
+		? `${formatTokens(usage.window)} window · ${formatTokens(usage.total)} spent`
+		: `${formatTokens(usage.total)} ${legacyLabel}`;
+}
+export function formatContextUsage(usage: Pick<TokenUsage, "window" | "windowPeak">, contextLimit: number): string | undefined {
+	if (usage.window === undefined || !Number.isFinite(usage.window) || !Number.isFinite(contextLimit) || contextLimit <= 0) return undefined;
+	const peak = usage.windowPeak !== undefined && Number.isFinite(usage.windowPeak) ? usage.windowPeak : usage.window;
+	const used = Math.max(0, usage.window, peak);
+	return `ctx ${formatTokens(used)}/${formatTokens(contextLimit)} (${Math.round((used / contextLimit) * 100)}%)`;
 }
 
 export function formatModelThinking(model?: string, thinking?: string): string {
 	const parsed = model ? splitKnownThinkingSuffix(model) : undefined;
-	let displayModel = parsed?.baseModel ?? model;
+	const displayModel = parsed?.baseModel ?? model;
 	const explicitThinking = THINKING_LEVELS.find((level) => level === thinking?.trim());
 	const displayThinking = parsed?.thinkingSuffix ? parsed.thinkingSuffix.slice(1) : explicitThinking;
-	if (displayModel) {
-		const slashIdx = displayModel.lastIndexOf("/");
-		if (slashIdx !== -1) displayModel = displayModel.slice(slashIdx + 1);
-	}
 	return [displayModel, displayThinking ? `thinking ${displayThinking}` : undefined].filter(Boolean).join(" · ");
 }
 
-/**
- * Format usage statistics into a compact string
- */
 export function formatUsage(u: Usage, model?: string): string {
 	const parts: string[] = [];
 	if (u.turns) parts.push(`${u.turns} turn${u.turns > 1 ? "s" : ""}`);
@@ -43,18 +45,12 @@ export function formatUsage(u: Usage, model?: string): string {
 	return parts.join(" ");
 }
 
-/**
- * Format duration in human-readable form
- */
 export function formatDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
 	if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
 	return `${Math.floor(ms / 60000)}m${Math.floor((ms % 60000) / 1000)}s`;
 }
 
-/**
- * Build a summary string for a completed/failed chain
- */
 export function buildChainSummary(
 	steps: ChainStep[],
 	results: SingleResult[],
@@ -93,15 +89,11 @@ export function buildChainSummary(
 	}
 }
 
-/**
- * Format a tool call for display
- */
 export function formatToolCall(name: string, args: Record<string, unknown>, expanded = false): string {
 	switch (name) {
 		case "bash": {
 			const command = typeof args.command === "string" ? args.command : "";
-			const maxLength = expanded ? 240 : 60;
-			return `$ ${command.slice(0, maxLength)}${command.length > maxLength ? "..." : ""}`;
+			return `$ ${previewDisplayText(command, expanded ? 240 : 60)}`;
 		}
 		case "read":
 		case "write":
@@ -111,12 +103,10 @@ export function formatToolCall(name: string, args: Record<string, unknown>, expa
 				: typeof args.file_path === "string"
 					? args.file_path
 					: "";
-			return `${name} ${shortenPath(target)}`;
+			return `${name} ${sanitizeDisplayText(shortenPath(target))}`;
 		}
 		default: {
-			const s = JSON.stringify(args);
-			const maxLength = expanded ? 160 : 40;
-			return `${name} ${s.slice(0, maxLength)}${s.length > maxLength ? "..." : ""}`;
+			return `${name} ${previewDisplayText(JSON.stringify(args), expanded ? 160 : 40)}`;
 		}
 	}
 }

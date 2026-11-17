@@ -1,65 +1,48 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
-
-export const REQUIRED_CHILD_TOOLS_ENV = "PI_SUBAGENT_REQUIRED_TOOLS";
-export const CHILD_TOOL_DIAGNOSTIC_PATH_ENV = "PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH";
-
 export interface ChildToolDiagnostic {
 	agent?: string;
 	required: string[];
 	available: string[];
 	missing: string[];
+	missingMcpDirectTools?: string[];
+	/** Registered allowlisted tools an extension left out of the tools sent to the model. */
+	undeclared?: string[];
+	/** Tools sent to the model that this child cannot call. */
+	uncallable?: string[];
 }
 
-export function writeChildToolDiagnostic(
-	filePath: string,
-	required: string[],
-	available: string[],
-	agent?: string,
-): ChildToolDiagnostic | undefined {
-	const availableNames = new Set(available);
-	const missing = required.filter((name) => !availableNames.has(name));
-	if (missing.length === 0) {
-		fs.rmSync(filePath, { force: true });
-		return undefined;
-	}
-
-	const diagnostic: ChildToolDiagnostic = { agent, required, available, missing };
-	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	fs.writeFileSync(filePath, JSON.stringify(diagnostic), { mode: 0o600 });
-	return diagnostic;
-}
-
-export function readChildToolDiagnostic(filePath: string | undefined): ChildToolDiagnostic | undefined {
-	if (!filePath || !fs.existsSync(filePath)) return undefined;
-	const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8")) as Partial<ChildToolDiagnostic>;
-	const stringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every((entry) => typeof entry === "string" && entry.length > 0);
-	if (!stringArray(parsed.required) || !stringArray(parsed.available) || !stringArray(parsed.missing) || (parsed.agent !== undefined && typeof parsed.agent !== "string")) {
-		throw new Error(`Malformed child tool diagnostic at '${filePath}'.`);
-	}
-	return {
-		...(parsed.agent ? { agent: parsed.agent } : {}),
-		required: parsed.required,
-		available: parsed.available,
-		missing: parsed.missing,
-	};
-}
-
-export function formatChildToolDiagnostic(diagnostic: ChildToolDiagnostic): string {
+/**
+ * Explain missing child tools. Foreground children run inside the parent
+ * process and never load the parent's ambient extensions, so tools an ambient
+ * extension registers (MCP tools, provider tools) only exist for background
+ * children; the diagnostic says so instead of reporting a generic gap.
+ */
+export function formatChildToolDiagnostic(diagnostic: ChildToolDiagnostic, options: { host?: "parent" | "runner" } = {}): string {
 	const subject = diagnostic.agent ? `Agent '${diagnostic.agent}'` : "Subagent";
+	if (diagnostic.undeclared?.length) {
+		const uncallable = diagnostic.uncallable?.length ? ` and added ${diagnostic.uncallable.join(", ")}, which this child cannot call` : "";
+		return [
+			`${subject} declares tools: ${diagnostic.required.join(", ")}, but an extension loaded in this child replaced the tools sent to the model: it left out ${diagnostic.undeclared.join(", ")}${uncallable}.`,
+			"The `tools` field is a strict allowlist. Set `extensions: []` or list only the extensions this child needs, or omit `tools` to use that extension's tool surface.",
+		].join("\n");
+	}
+	if (options.host === "parent") {
+		return [
+			`${subject} ran as a foreground child, which never loads the parent's ambient extensions, and these child tools were unavailable: ${diagnostic.missing.join(", ")}.`,
+			"The `tools` field is a strict allowlist; it does not load extension code.",
+			...(diagnostic.missingMcpDirectTools?.length
+				? [`MCP direct tools missing from the child registry: ${diagnostic.missingMcpDirectTools.join(", ")}.`]
+				: []),
+			"MCP tools require background children (`async: true`) because only they load ambient extensions.",
+			"For extension tools a foreground child can load, add the provider path to `subagentOnlyExtensions` (child-only), `extensions`, or as a path-like entry in `tools`, while keeping each registered tool name in `tools`.",
+		].join("\n");
+	}
 	return [
 		`${subject} requested unavailable child tools: ${diagnostic.missing.join(", ")}.`,
 		"The `tools` field is a strict allowlist; it does not load extension code.",
+		...(diagnostic.missingMcpDirectTools?.length
+			? [`Resolved MCP direct tools missing from the child registry: ${diagnostic.missingMcpDirectTools.join(", ")}. Resolved names must match what the host or pi-mcp-adapter registers; check the MCP direct-tool registration before treating this as a tool-call failure.`]
+			: []),
 		"For extension tools, add the provider path to `subagentOnlyExtensions` (child-only), `extensions`, or as a path-like entry in `tools`, while keeping each registered tool name in `tools`.",
 		"For MCP tools, verify the MCP adapter configuration and selected tool names. For builtin tools, verify the name against the installed Pi version.",
 	].join("\n");
-}
-
-export function readChildToolDiagnosticError(filePath: string | undefined): string | undefined {
-	try {
-		const diagnostic = readChildToolDiagnostic(filePath);
-		return diagnostic ? formatChildToolDiagnostic(diagnostic) : undefined;
-	} catch (error) {
-		return `Failed to read child tool availability diagnostic: ${error instanceof Error ? error.message : String(error)}`;
-	}
 }

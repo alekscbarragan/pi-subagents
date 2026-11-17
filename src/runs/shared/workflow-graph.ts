@@ -13,6 +13,22 @@ export interface WorkflowGraphBuildInput {
 	dynamicGroupStatuses?: Record<number, { status: WorkflowNodeStatus; error?: string; acceptance?: SingleResult["acceptance"] }>;
 }
 
+/** Return displayable workflow stages while hiding structural parallel groups and host monitors. */
+export function workflowGraphStageNodes(graph: WorkflowGraphSnapshot | undefined): WorkflowGraphNode[] {
+	const nodes = graph?.nodes;
+	if (!nodes?.length) return [];
+	const stages: WorkflowGraphNode[] = [];
+	const visit = (node: WorkflowGraphNode): void => {
+		if (node.kind === "parallel-group" || node.kind === "dynamic-parallel-group") {
+			for (const child of node.children ?? []) visit(child);
+			return;
+		}
+		if (node.kind !== "host-step") stages.push(node);
+	};
+	for (const node of nodes) visit(node);
+	return stages;
+}
+
 function normalizeStatus(status: string | undefined): WorkflowNodeStatus | undefined {
 	switch (status) {
 		case "complete":
@@ -26,6 +42,8 @@ function normalizeStatus(status: string | undefined): WorkflowNodeStatus | undef
 			return "paused";
 		case "detached":
 			return "detached";
+		case "rejected":
+			return "rejected";
 		case "pending":
 			return "pending";
 		default:
@@ -62,6 +80,7 @@ function seqLabel(step: SequentialStep, stepIndex: number): string {
 
 function summarizeParallelStatuses(statuses: WorkflowNodeStatus[]): WorkflowNodeStatus {
 	if (statuses.some((status) => status === "running")) return "running";
+	if (statuses.some((status) => status === "rejected")) return "rejected";
 	if (statuses.some((status) => status === "failed")) return "failed";
 	if (statuses.some((status) => status === "paused")) return "paused";
 	if (statuses.some((status) => status === "detached")) return "detached";

@@ -1,36 +1,43 @@
 import { spawn } from "node:child_process";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
 	AcceptanceConfig,
 	AcceptanceEvidenceKind,
 	AcceptanceInput,
+	AgentContract,
 	AcceptanceLedger,
 	AcceptanceLevel,
 	AcceptanceReport,
+	AcceptanceReviewGate,
+	AcceptanceRole,
 	AcceptanceRuntimeCheck,
 	AcceptanceRuntimeCheckStatus,
 	AcceptanceReviewResult,
 	AcceptanceVerifyCommand,
 	AcceptanceVerifyResult,
+	JsonSchemaObject,
 	ResolvedAcceptanceConfig,
 	ResolvedAcceptanceGate,
 	SingleResult,
 	SubagentRunMode,
+	ChildWatchdogProgress,
 } from "../../shared/types.ts";
-import { classifyTaskMutationIntent, taskMayMutate } from "./task-intent.ts";
+import { unresolvedChildWatchdogBlockers } from "../../watchdog/child-status.ts";
+import { isAgentContract } from "./agent-contract.ts";
+import { validateStructuredOutputValue } from "./structured-output.ts";
 
 const LEVEL_RANK: Record<Exclude<AcceptanceLevel, "auto">, number> = {
 	none: 0,
 	attested: 1,
 	checked: 2,
 	verified: 3,
-	reviewed: 4,
 };
 
-const VALID_LEVELS = new Set<AcceptanceLevel>(["auto", "none", "attested", "checked", "verified", "reviewed"]);
-const VALID_EVIDENCE = new Set<AcceptanceEvidenceKind>([
+const VALID_LEVELS = new Set<AcceptanceLevel>(["auto", "none", "attested", "checked", "verified"]);
+const VALID_EVIDENCE_KINDS: AcceptanceEvidenceKind[] = [
 	"changed-files",
 	"tests-added",
 	"commands-run",
@@ -40,12 +47,15 @@ const VALID_EVIDENCE = new Set<AcceptanceEvidenceKind>([
 	"diff-summary",
 	"review-findings",
 	"manual-notes",
-]);
-const ACCEPTANCE_CONFIG_KEYS = new Set(["level", "criteria", "evidence", "verify", "review", "stopRules", "reason"]);
+];
+const VALID_EVIDENCE = new Set<AcceptanceEvidenceKind>(VALID_EVIDENCE_KINDS);
+const ACCEPTANCE_EVIDENCE_HELP = `Supported evidence kinds: ${VALID_EVIDENCE_KINDS.join(", ")}. Example: { level: "checked", evidence: ["commands-run", "changed-files"] }.`;
+const ACCEPTANCE_OBJECT_EXAMPLE = "Example: { level: \"checked\", evidence: [\"commands-run\", \"changed-files\"] }.";
+const ACCEPTANCE_CONFIG_KEYS = new Set(["level", "report", "preserveStagedIndex", "criteria", "evidence", "verify", "review", "stopRules", "reason"]);
 const ACCEPTANCE_GATE_KEYS = new Set(["id", "must", "evidence", "severity"]);
-const ACCEPTANCE_VERIFY_KEYS = new Set(["id", "command", "timeoutMs", "cwd", "env", "allowFailure"]);
+const ACCEPTANCE_VERIFY_KEYS = new Set(["id", "command", "timeoutMs", "cwd", "env", "allowFailure", "output", "schema"]);
 const ACCEPTANCE_REVIEW_KEYS = new Set(["agent", "focus", "required"]);
-const EXPLICIT_REVIEWED_UNAVAILABLE = "cannot be requested explicitly because this run cannot supply an independent reviewer result; use checked/verified and orchestrate the reviewer separately, or omit acceptance for read-only review tasks.";
+const EXPLICIT_REVIEWED_UNAVAILABLE = "is an achieved status, not a requestable acceptance level. For a read-only reviewer call, omit acceptance. To require independent review of a writer result, use acceptance.review.required and orchestrate the reviewer separately.";
 
 function normalizeLevel(level: AcceptanceLevel | undefined): Exclude<AcceptanceLevel, "auto"> | "auto" {
 	return level ?? "auto";
@@ -64,108 +74,220 @@ function requiredEvidenceForLevel(level: Exclude<AcceptanceLevel, "auto">): Acce
 		case "checked":
 			return ["changed-files", "tests-added", "commands-run", "residual-risks", "no-staged-files"];
 		case "verified":
-		case "reviewed":
 			return ["changed-files", "tests-added", "commands-run", "validation-output", "residual-risks", "no-staged-files"];
 	}
 }
 
 function inferLevel(input: {
 	agentName: string;
+	acceptanceRole?: AcceptanceRole;
 	task?: string;
 	mode?: SubagentRunMode;
 	async?: boolean;
 	dynamic?: boolean;
 	dynamicGroup?: boolean;
 }): { level: Exclude<AcceptanceLevel, "auto">; reasons: string[]; criteria: string[]; evidence: AcceptanceEvidenceKind[]; review?: { agent?: string; required?: boolean } } {
-	const agent = input.agentName.toLowerCase();
-	const task = input.task?.toLowerCase() ?? "";
-	const reasons: string[] = [];
-	const intent = classifyTaskMutationIntent(input.agentName, input.task ?? "");
-	const readOnlyAgent = /\b(?:reviewer|scout|context-builder|researcher|analyst)\b/.test(agent);
-	const readOnlyTask = intent.kind === "read-only"
-		|| (intent.kind === "unknown" && /\b(?:read[- ]only|review[- ]only|no edits|without edits|inspect|summari[sz]e)\b/.test(task));
-	const writeTask = taskMayMutate(input.task ?? "")
-		|| intent.kind === "implementation"
-		|| (/\bworker\b/.test(agent) && !readOnlyTask);
-	const risky = Boolean(input.async && writeTask)
-		|| Boolean(input.dynamic)
-		|| Boolean(input.dynamicGroup)
-		|| (intent.kind !== "read-only" && /\b(?:release|migration|migrate|security|data[- ]loss|destructive|post-review|fix pass)\b/.test(task));
-
-	if (risky) {
-		reasons.push(input.async ? "async write-capable or risky run" : "risky write-capable run");
+	if (input.acceptanceRole === "writer" && (input.async || input.dynamic || input.dynamicGroup)) {
+		const reasons = [input.async ? "async declared writer" : "dynamic declared writer"];
 		if (input.dynamic || input.dynamicGroup) reasons.push("dynamic fanout context");
-		return {
-			level: "reviewed",
-			reasons,
-			criteria: ["Implement the requested change without widening scope", "Return evidence sufficient for an independent acceptance review"],
-			evidence: requiredEvidenceForLevel("reviewed"),
-			review: { agent: "reviewer", required: true },
-		};
-	}
-	if (writeTask && !readOnlyTask) {
-		reasons.push("write-capable worker/task");
 		return {
 			level: "checked",
 			reasons,
+			criteria: ["Implement the requested change without widening scope", "Return evidence sufficient for an independent acceptance review"],
+			evidence: requiredEvidenceForLevel("checked"),
+			review: { agent: "reviewer", required: true },
+		};
+	}
+	if (input.acceptanceRole === "writer") {
+		return {
+			level: "checked",
+			reasons: ["declared writer acceptance role"],
 			criteria: ["Implement the requested change without widening scope"],
 			evidence: requiredEvidenceForLevel("checked"),
 		};
 	}
-	if (readOnlyAgent || readOnlyTask) {
-		reasons.push(readOnlyAgent ? "read-only/reviewer-style agent" : "read-only task wording");
+	if (input.acceptanceRole === "read-only") {
 		return {
-			level: "attested",
-			reasons,
+			level: "none",
+			reasons: ["declared read-only acceptance role"],
 			criteria: ["Return concrete findings with file paths and severity when applicable"],
 			evidence: ["review-findings", "residual-risks"],
 		};
 	}
-	reasons.push("default lightweight attestation");
 	return {
 		level: "attested",
-		reasons,
+		reasons: ["default lightweight attestation"],
 		criteria: ["Return a concise result and residual risks when applicable"],
 		evidence: ["manual-notes", "residual-risks"],
 	};
 }
 
-export function normalizeAcceptanceInput(input: AcceptanceInput | undefined): AcceptanceConfig {
+type AcceptanceInputNormalizationResult = { value: unknown; error?: string };
+
+function normalizeAcceptanceValue(input: unknown, pathLabel = "acceptance"): AcceptanceInputNormalizationResult {
+	if (typeof input !== "string") return { value: input };
+	const trimmed = input.trim();
+	if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return { value: input };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch (error) {
+		return {
+			value: input,
+			error: `${pathLabel} JSON string must encode a valid acceptance object: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		const kind = parsed === null ? "null" : Array.isArray(parsed) ? "an array" : typeof parsed;
+		return { value: input, error: `${pathLabel} JSON string must encode an object; got ${kind}.` };
+	}
+	return { value: parsed };
+}
+
+export function normalizeAcceptanceInput(input: unknown): AcceptanceConfig {
+	const normalized = normalizeAcceptanceValue(input);
+	if (normalized.error) throw new Error(normalized.error);
+	input = normalized.value;
 	if (input === undefined || input === "auto") return { level: "auto" };
 	if (input === false) return { level: "none", reason: "disabled by deprecated false shorthand" };
-	if (typeof input === "string") return { level: input };
-	return { ...input };
+	if (typeof input === "string") return { level: input as AcceptanceConfig["level"] };
+	return { ...(input as AcceptanceConfig) };
+}
+
+export type ResolvedAcceptanceReportMode = "off" | "optional" | "required";
+
+export function resolveAcceptanceReportMode(input: unknown): ResolvedAcceptanceReportMode {
+	const normalized = normalizeAcceptanceValue(input);
+	if (normalized.error) throw new Error(normalized.error);
+	const value = normalized.value;
+	const report = value && typeof value === "object" && !Array.isArray(value) ? (value as AcceptanceConfig).report : undefined;
+	return value === false || report === "off" ? "off" : report === "on" ? "required" : "optional";
+}
+
+type GateAcceptanceNormalizationResult =
+	| { ok: true; acceptance?: AcceptanceInput }
+	| { ok: false; error: string };
+
+const GATE_OBJECT_KEYS = new Set(["command", "output", "schema", "timeoutMs"]);
+export const GATE_INPUT_ERROR = "gate must be a non-empty command string or { command, output?: \"json\", schema?, timeoutMs? }.";
+
+export interface GateObjectInput {
+	command: string;
+	output?: "json";
+	schema?: JsonSchemaObject;
+	timeoutMs?: number;
+}
+
+/** Validates the two accepted gate shapes without normalizing them. Shared by preflight and the workflow sandbox mirror. */
+export function parseGateInput(gate: unknown): { ok: true; gate: GateObjectInput } | { ok: false; error: string } {
+	if (typeof gate === "string") {
+		return gate.trim() ? { ok: true, gate: { command: gate.trim() } } : { ok: false, error: GATE_INPUT_ERROR };
+	}
+	if (!gate || typeof gate !== "object" || Array.isArray(gate)) return { ok: false, error: GATE_INPUT_ERROR };
+	const value = gate as Record<string, unknown>;
+	for (const key of Object.keys(value)) {
+		if (!GATE_OBJECT_KEYS.has(key)) return { ok: false, error: `gate.${key} is not supported.` };
+	}
+	if (typeof value.command !== "string" || !value.command.trim()) return { ok: false, error: GATE_INPUT_ERROR };
+	if (value.output !== undefined && value.output !== "json") return { ok: false, error: "gate.output must be \"json\" when present." };
+	if (value.schema !== undefined) {
+		if (value.output !== "json") return { ok: false, error: "gate.schema requires gate.output: \"json\"." };
+		if (!value.schema || typeof value.schema !== "object" || Array.isArray(value.schema)) return { ok: false, error: "gate.schema must be a JSON Schema object." };
+	}
+	if (value.timeoutMs !== undefined && (!Number.isInteger(value.timeoutMs) || (value.timeoutMs as number) < 1)) return { ok: false, error: "gate.timeoutMs must be an integer >= 1." };
+	const parsed: GateObjectInput = { command: value.command.trim() };
+	if (value.output === "json") parsed.output = "json";
+	// SAFETY: schema was checked above to be a non-array object; timeoutMs to be an integer >= 1.
+	if (value.schema !== undefined) parsed.schema = value.schema as JsonSchemaObject;
+	if (value.timeoutMs !== undefined) parsed.timeoutMs = value.timeoutMs as number;
+	return { ok: true, gate: parsed };
+}
+
+/** True when an acceptance policy declares at least one `output: "json"` verify command, from either the gate shorthand or an explicit verify list. */
+export function acceptanceHasTypedVerify(acceptance: AcceptanceInput | undefined): boolean {
+	if (!acceptance || typeof acceptance !== "object") return false;
+	return Array.isArray(acceptance.verify) && acceptance.verify.some((command) => command && typeof command === "object" && command.output === "json");
+}
+
+export const TYPED_VERIFY_OUTPUT_SCHEMA_CONFLICT = "a typed verify command (output: \"json\") cannot be combined with outputSchema; the child would have two structured-output sources.";
+
+export function normalizeGateAcceptance(gate: unknown, acceptance: AcceptanceInput | undefined): GateAcceptanceNormalizationResult {
+	if (gate === undefined) {
+		if (acceptance === undefined) return { ok: true };
+		const normalized = normalizeAcceptanceValue(acceptance);
+		return normalized.error ? { ok: false, error: normalized.error } : { ok: true, acceptance: normalized.value as AcceptanceInput };
+	}
+	const parsed = parseGateInput(gate);
+	if (!parsed.ok) return { ok: false, error: parsed.error };
+	if (acceptance !== undefined && acceptance !== false) return { ok: false, error: "gate cannot be combined with acceptance; use one gate command or acceptance.verify." + describeGateAcceptanceConflict(gate, acceptance) };
+	return { ok: true, acceptance: { level: "verified", verify: [{ id: "gate", ...parsed.gate }] } };
+}
+
+export function describeGateAcceptanceConflict(gate: unknown, acceptance: unknown): string {
+	const render = (value: unknown): string => {
+		let encoded: string;
+		try {
+			encoded = JSON.stringify(value) ?? String(value);
+		} catch {
+			encoded = String(value);
+		}
+		return encoded.length > 120 ? `${encoded.slice(0, 120)}...` : encoded;
+	};
+	return ` Both fields were present: gate=${render(gate)} acceptance=${render(acceptance)}.`;
 }
 
 function explicitAcceptanceCanDisable(explicit: AcceptanceConfig): boolean {
 	return explicit.level === "none" && typeof explicit.reason === "string" && explicit.reason.trim().length > 0;
 }
 
+function explicitAcceptanceRequestsPolicy(explicit: AcceptanceConfig): boolean {
+	return (explicit.level !== undefined && explicit.level !== "auto") || Object.keys(explicit).some((key) => key !== "level");
+}
+
+function unsupportedEvidenceKindMessage(pathLabel: string, item: unknown): string {
+	const value = typeof item === "string" ? ` "${item}"` : "";
+	return `${pathLabel}${value} is not a supported evidence kind. ${ACCEPTANCE_EVIDENCE_HELP}`;
+}
+
 export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"): string[] {
 	const errors: string[] = [];
 	if (input === undefined) return errors;
 	if (input === false) return errors;
+	const normalized = normalizeAcceptanceValue(input, pathLabel);
+	if (normalized.error) return [normalized.error];
+	input = normalized.value;
 	if (typeof input === "string") {
-		if (!VALID_LEVELS.has(input as AcceptanceLevel)) errors.push(`${pathLabel} has invalid level '${input}'.`);
+		if (input === "reviewed") errors.push(`${pathLabel} ${EXPLICIT_REVIEWED_UNAVAILABLE}`);
+		else if (!VALID_LEVELS.has(input as AcceptanceLevel)) errors.push(`${pathLabel} has invalid level '${input}'.`);
 		else if (input === "none") errors.push(`${pathLabel} level "none" requires a reason; use { level: "none", reason: "..." }.`);
-		else if (input === "reviewed") errors.push(`${pathLabel} ${EXPLICIT_REVIEWED_UNAVAILABLE}`);
+		else if (input === "verified") errors.push(`${pathLabel} level "verified" requires object form with at least one runtime verify command. Use level "checked" or provide a non-empty acceptance.verify array.`);
 		return errors;
 	}
 	if (!input || typeof input !== "object" || Array.isArray(input)) {
-		errors.push(`${pathLabel} must be a string level, false, or an object.`);
+		errors.push(`${pathLabel} must be a string level, false, or an object. ${ACCEPTANCE_OBJECT_EXAMPLE}`);
 		return errors;
 	}
 	const value = input as Record<string, unknown>;
 	for (const key of Object.keys(value)) {
 		if (!ACCEPTANCE_CONFIG_KEYS.has(key)) errors.push(`${pathLabel}.${key} is not supported.`);
 	}
-	if (value.level !== undefined && (typeof value.level !== "string" || !VALID_LEVELS.has(value.level as AcceptanceLevel))) {
-		errors.push(`${pathLabel}.level must be one of auto, none, attested, checked, verified, reviewed.`);
+	if (value.level === "reviewed") {
+		errors.push(`${pathLabel}.level ${EXPLICIT_REVIEWED_UNAVAILABLE}`);
+	} else if (value.level !== undefined && (typeof value.level !== "string" || !VALID_LEVELS.has(value.level as AcceptanceLevel))) {
+		errors.push(`${pathLabel}.level must be one of auto, none, attested, checked, verified.`);
+	}
+	if (value.report !== undefined && value.report !== "on" && value.report !== "off") {
+		errors.push(`${pathLabel}.report must be on or off.`);
+	}
+	if (value.preserveStagedIndex !== undefined && value.preserveStagedIndex !== true) {
+		errors.push(`${pathLabel}.preserveStagedIndex must be true when provided.`);
+	}
+	if (value.preserveStagedIndex === true && value.level !== "checked" && value.level !== "verified") {
+		errors.push(`${pathLabel}.preserveStagedIndex requires level checked or verified.`);
 	}
 	if (value.level === "none" && (typeof value.reason !== "string" || !value.reason.trim())) {
 		errors.push(`${pathLabel}.reason is required when level is none.`);
 	}
-	if (value.level === "reviewed") errors.push(`${pathLabel}.level ${EXPLICIT_REVIEWED_UNAVAILABLE}`);
 	if (value.reason !== undefined && typeof value.reason !== "string") errors.push(`${pathLabel}.reason must be a string.`);
 	if (value.criteria !== undefined && !Array.isArray(value.criteria)) errors.push(`${pathLabel}.criteria must be an array.`);
 	if (Array.isArray(value.criteria)) {
@@ -189,11 +311,11 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 				criterionIds.add(normalizedId);
 			}
 			if (typeof gate.must !== "string" || !gate.must.trim()) errors.push(`${criterionPath}.must is required.`);
-			if (gate.evidence !== undefined && !Array.isArray(gate.evidence)) errors.push(`${criterionPath}.evidence must be an array.`);
+			if (gate.evidence !== undefined && !Array.isArray(gate.evidence)) errors.push(`${criterionPath}.evidence must be an array. ${ACCEPTANCE_EVIDENCE_HELP}`);
 			if (Array.isArray(gate.evidence)) {
 				for (const [evidenceIndex, item] of gate.evidence.entries()) {
 					if (typeof item !== "string" || !VALID_EVIDENCE.has(item as AcceptanceEvidenceKind)) {
-						errors.push(`${criterionPath}.evidence[${evidenceIndex}] is not a supported evidence kind.`);
+						errors.push(unsupportedEvidenceKindMessage(`${criterionPath}.evidence[${evidenceIndex}]`, item));
 					}
 				}
 			}
@@ -205,13 +327,17 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 	if (Array.isArray(value.evidence)) {
 		for (const [index, item] of value.evidence.entries()) {
 			if (typeof item !== "string" || !VALID_EVIDENCE.has(item as AcceptanceEvidenceKind)) {
-				errors.push(`${pathLabel}.evidence[${index}] is not a supported evidence kind.`);
+				errors.push(unsupportedEvidenceKindMessage(`${pathLabel}.evidence[${index}]`, item));
 			}
 		}
 	} else if (value.evidence !== undefined) {
-		errors.push(`${pathLabel}.evidence must be an array.`);
+		errors.push(`${pathLabel}.evidence must be an array. ${ACCEPTANCE_EVIDENCE_HELP}`);
 	}
-	if (value.verify !== undefined && !Array.isArray(value.verify)) errors.push(`${pathLabel}.verify must be an array.`);
+	if (value.level === "verified" && (!Array.isArray(value.verify) || value.verify.length === 0)) {
+		errors.push(`${pathLabel}.verify must contain at least one runtime command when level is verified. Use level "checked" or provide a non-empty acceptance.verify array.`);
+	} else if (value.verify !== undefined && !Array.isArray(value.verify)) {
+		errors.push(`${pathLabel}.verify must be an array.`);
+	}
 	if (Array.isArray(value.verify)) {
 		for (const [index, command] of value.verify.entries()) {
 			if (!command || typeof command !== "object" || Array.isArray(command)) {
@@ -240,6 +366,11 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 			if (cmd.allowFailure !== undefined && typeof cmd.allowFailure !== "boolean") {
 				errors.push(`${pathLabel}.verify[${index}].allowFailure must be a boolean.`);
 			}
+			if (cmd.output !== undefined && cmd.output !== "json") errors.push(`${pathLabel}.verify[${index}].output must be "json" when present.`);
+			if (cmd.schema !== undefined) {
+				if (cmd.output !== "json") errors.push(`${pathLabel}.verify[${index}].schema requires output: "json".`);
+				if (!cmd.schema || typeof cmd.schema !== "object" || Array.isArray(cmd.schema)) errors.push(`${pathLabel}.verify[${index}].schema must be a JSON Schema object.`);
+			}
 		}
 	}
 	if (value.review !== undefined && value.review !== false) {
@@ -264,14 +395,18 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 	return errors;
 }
 
-export function validateExecutionAcceptance(input: {
+type ExecutionAcceptanceInput = {
 	acceptance?: unknown;
-	tasks?: Array<{ acceptance?: unknown }>;
+	outputSchema?: unknown;
+	tasks?: Array<{ acceptance?: unknown; outputSchema?: unknown }>;
 	chain?: Array<{
 		acceptance?: unknown;
-		parallel?: Array<{ acceptance?: unknown }> | { acceptance?: unknown };
+		outputSchema?: unknown;
+		parallel?: Array<{ acceptance?: unknown; outputSchema?: unknown }> | { acceptance?: unknown; outputSchema?: unknown };
 	}>;
-}): string[] {
+};
+
+export function validateExecutionAcceptancePolicy(input: ExecutionAcceptanceInput): string[] {
 	const errors = validateAcceptanceInput(input.acceptance, "acceptance");
 	for (const [index, task] of (input.tasks ?? []).entries()) {
 		errors.push(...validateAcceptanceInput(task.acceptance, `tasks[${index}].acceptance`));
@@ -289,8 +424,36 @@ export function validateExecutionAcceptance(input: {
 	return errors;
 }
 
+export function validateExecutionAcceptance(input: ExecutionAcceptanceInput): string[] {
+	const errors = validateExecutionAcceptancePolicy(input);
+	errors.push(...validateAcceptanceReportMode(input.acceptance, input.outputSchema, "acceptance"));
+	for (const [index, task] of (input.tasks ?? []).entries()) {
+		errors.push(...validateAcceptanceReportMode(task.acceptance, task.outputSchema, `tasks[${index}].acceptance`));
+	}
+	for (const [stepIndex, step] of (input.chain ?? []).entries()) {
+		errors.push(...validateAcceptanceReportMode(step.acceptance, step.outputSchema, `chain[${stepIndex}].acceptance`));
+		if (Array.isArray(step.parallel)) {
+			for (const [taskIndex, task] of step.parallel.entries()) {
+				errors.push(...validateAcceptanceReportMode(task.acceptance, task.outputSchema, `chain[${stepIndex}].parallel[${taskIndex}].acceptance`));
+			}
+		} else if (step.parallel) {
+			errors.push(...validateAcceptanceReportMode(step.parallel.acceptance, step.parallel.outputSchema, `chain[${stepIndex}].parallel.acceptance`));
+		}
+	}
+	return errors;
+}
+
+function validateAcceptanceReportMode(acceptance: unknown, outputSchema: unknown, pathLabel: string): string[] {
+	const normalized = normalizeAcceptanceValue(acceptance, pathLabel);
+	if (normalized.error) return [];
+	acceptance = normalized.value;
+	if (!acceptance || typeof acceptance !== "object" || Array.isArray(acceptance)) return [];
+	if (!("report" in acceptance)) return [];
+	return outputSchema === undefined || outputSchema === false ? [`${pathLabel}.report requires outputSchema.`] : [];
+}
+
 function normalizeCriteria(criteria: Array<string | { id?: string; must?: string; evidence?: AcceptanceEvidenceKind[]; severity?: "required" | "recommended" }> | undefined, evidence: AcceptanceEvidenceKind[]): ResolvedAcceptanceGate[] {
-	return (criteria ?? []).map((criterion, index) => {
+	return (criteria ?? []).map((criterion, index): ResolvedAcceptanceGate => {
 		if (typeof criterion === "string") {
 			return { id: `criterion-${index + 1}`, must: criterion, evidence, severity: "required" };
 		}
@@ -306,35 +469,58 @@ function normalizeCriteria(criteria: Array<string | { id?: string; must?: string
 export function resolveEffectiveAcceptance(input: {
 	explicit?: AcceptanceInput;
 	agentName: string;
+	acceptanceRole?: AcceptanceRole;
 	task?: string;
 	mode?: SubagentRunMode;
 	async?: boolean;
 	dynamic?: boolean;
 	dynamicGroup?: boolean;
+	agentContract?: AgentContract;
 }): ResolvedAcceptanceConfig {
 	const explicit = normalizeAcceptanceInput(input.explicit);
-	const inferred = inferLevel(input);
 	const explicitLevel = normalizeLevel(explicit.level);
+	if (isAgentContract(input.agentContract)) {
+		const level = explicitAcceptanceCanDisable(explicit) || explicitLevel === "auto"
+			? "none"
+			: explicitLevel;
+		const evidence = unique(explicit.evidence ?? []);
+		const criteria = normalizeCriteria(
+			explicit.criteria as Array<string | { id?: string; must?: string; evidence?: AcceptanceEvidenceKind[]; severity?: "required" | "recommended" }> | undefined,
+			evidence,
+		);
+		return {
+			level,
+			explicit: input.explicit !== undefined,
+			inferredReason: [],
+			criteria,
+			evidence,
+			preserveStagedIndex: explicit.preserveStagedIndex,
+			verify: explicit.verify ?? [],
+			review: explicit.review,
+			stopRules: explicit.stopRules ?? [],
+			reason: explicit.reason,
+		};
+	}
+	const inferred = inferLevel(input);
+	const inferredLevel = inferred.level === "none" && explicitAcceptanceRequestsPolicy(explicit) ? "attested" : inferred.level;
 	const level = explicitAcceptanceCanDisable(explicit)
 		? "none"
 		: explicitLevel === "auto"
-			? inferred.level
-			: (LEVEL_RANK[explicitLevel] >= LEVEL_RANK[inferred.level] ? explicitLevel : inferred.level);
-	const evidence = unique([...(level === inferred.level ? inferred.evidence : requiredEvidenceForLevel(level)), ...(explicit.evidence ?? [])]);
+			? inferredLevel
+			: (LEVEL_RANK[explicitLevel] >= LEVEL_RANK[inferredLevel] ? explicitLevel : inferredLevel);
+	const evidence = unique([...(level === inferredLevel ? inferred.evidence : requiredEvidenceForLevel(level)), ...(explicit.evidence ?? [])]);
 	const criteria = normalizeCriteria(
 		(explicit.criteria?.length ? explicit.criteria : inferred.criteria) as Array<string | { id?: string; must?: string; evidence?: AcceptanceEvidenceKind[]; severity?: "required" | "recommended" }>,
 		evidence,
 	);
-	let review = explicit.review !== undefined ? explicit.review : inferred.review;
-	if (level === "reviewed" && input.explicit !== undefined && explicitLevel !== "reviewed" && explicit.review === undefined && review && review !== false) {
-		review = { ...review, required: false };
-	}
+	const review = explicit.review !== undefined ? explicit.review : inferred.review;
 	return {
 		level,
 		explicit: input.explicit !== undefined,
 		inferredReason: inferred.reasons,
-		criteria,
-		evidence,
+		criteria: level === "none" ? [] : criteria,
+		evidence: level === "none" ? [] : evidence,
+		preserveStagedIndex: explicit.preserveStagedIndex,
 		verify: explicit.verify ?? [],
 		review,
 		stopRules: explicit.stopRules ?? [],
@@ -342,8 +528,19 @@ export function resolveEffectiveAcceptance(input: {
 	};
 }
 
-export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): string {
+function acceptanceRequiresChildReport(acceptance: ResolvedAcceptanceConfig): boolean {
+	return acceptance.criteria.length > 0 || acceptance.evidence.length > 0;
+}
+
+/** Label a declared review gate the same way in prompts and capability summaries. */
+export function formatReviewGateLabel(review: AcceptanceReviewGate): string {
+	const status = review.required === false ? "optional" : "required";
+	return review.agent ? `${status} by ${review.agent}` : status;
+}
+
+export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig, options: { reportOptional?: boolean; structuredOutput?: boolean } = {}): string {
 	if (acceptance.level === "none") return "";
+	if (options.reportOptional && !acceptanceRequiresChildReport(acceptance)) return "";
 	const lines = [
 		"",
 		"## Acceptance Contract",
@@ -355,12 +552,15 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): st
 		"",
 		`Required evidence: ${acceptance.evidence.join(", ") || "none"}`,
 	];
+	if (acceptance.preserveStagedIndex) {
+		lines.push("The host will verify that the staged index is unchanged from launch; report noStagedFiles truthfully even when the preserved index is non-empty.");
+	}
 	if (acceptance.verify.length > 0) {
 		lines.push("", "Runtime verification commands configured by parent:");
 		for (const command of acceptance.verify) lines.push(`- ${command.id}: ${command.command}`);
 	}
-	if (acceptance.review && acceptance.review !== false) {
-		lines.push("", `Review gate: ${acceptance.review.required === false ? "optional" : "required"}${acceptance.review.agent ? ` by ${acceptance.review.agent}` : ""}.`);
+	if (acceptance.review) {
+		lines.push("", `Review gate: ${formatReviewGateLabel(acceptance.review)}.`);
 		if (acceptance.review.focus) lines.push(`Review focus: ${acceptance.review.focus}`);
 	}
 	if (acceptance.stopRules.length > 0) {
@@ -368,11 +568,15 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): st
 	}
 	lines.push(
 		"",
-		"Finish with a fenced JSON block tagged `acceptance-report` in this shape:",
+		options.structuredOutput
+			? "Include an `acceptanceReport` object in your final `structured_output` tool call in this shape:"
+			: "Finish with a fenced JSON block tagged `acceptance-report` in this shape:",
 		"Use empty arrays when no items apply; array fields contain strings unless object entries are shown.",
+		"Empty-string entries (`[\"\"]`) are ignored; use `[]` when nothing applies.",
 		"`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.",
 		"`commandsRun[].result` must be exactly one of: passed, failed, not-run.",
-		"```acceptance-report",
+		"`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.",
+		...(options.structuredOutput ? [] : ["```acceptance-report"]),
 		JSON.stringify({
 			criteriaSatisfied: acceptance.criteria
 				.filter((criterion) => criterion.severity !== "recommended")
@@ -387,7 +591,7 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): st
 			reviewFindings: ["blocker: file.ts:12 - issue found, or no blockers"],
 			manualNotes: "anything else the parent should know",
 		}, null, 2),
-		"```",
+		...(options.structuredOutput ? [] : ["```"]),
 	);
 	return lines.join("\n");
 }
@@ -548,9 +752,17 @@ function normalizeAcceptanceReportValue(value: unknown, pathLabel = ""): { value
 			case "testsAddedOrUpdated":
 			case "validationOutput":
 			case "residualRisks":
-			case "reviewFindings":
-				normalized[canonical] = typeof fieldValue === "string" ? [fieldValue] : fieldValue;
+			case "reviewFindings": {
+				// Tolerate empty-string entries ("[\"\"]"): models write them for "no items"
+				// and a single empty entry must not reject the whole report. Drop them at
+				// parse time; non-string entries are kept so validateStringArrayField still
+				// flags structural garbage.
+				const items = typeof fieldValue === "string" ? [fieldValue] : fieldValue;
+				normalized[canonical] = Array.isArray(items)
+					? items.filter((item) => typeof item !== "string" || item.trim().length > 0)
+					: items;
 				break;
+			}
 			case "noStagedFiles": {
 				const token = typeof fieldValue === "string" ? fieldValue.trim().toLowerCase() : undefined;
 				normalized[canonical] = token === "true" ? true : token === "false" ? false : fieldValue;
@@ -603,7 +815,30 @@ function parseAcceptanceReportBody(body: string): { report?: AcceptanceReport; e
 	return validateAcceptanceReport(parseReportJson(body));
 }
 
-function parseGenericJsonAcceptanceReportBody(body: string): { report?: AcceptanceReport; error?: string } {
+interface AcceptanceReportParseResult {
+	report?: AcceptanceReport;
+	error?: string;
+	/** True when an acceptance-report signal was found but its envelope was invalid. */
+	malformed?: boolean;
+	sourcePath?: string;
+}
+
+function parseUnterminatedAcceptanceReportFence(output: string): AcceptanceReportParseResult {
+	const opener = /```acceptance[-_]report\b[^\n]*\n/gi.exec(output);
+	if (!opener) return {};
+	const bodyStart = opener.index + opener[0].length;
+	if (output.indexOf("```", bodyStart) !== -1) return {};
+	try {
+		const validation = validateAcceptanceReport(JSON.parse(output.slice(bodyStart).trim()) as unknown);
+		return validation.report
+			? { report: validation.report }
+			: { error: `Failed to parse acceptance-report: Invalid acceptance-report: ${validation.errors.join("; ")}`, malformed: true };
+	} catch (error) {
+		return { error: `Failed to parse acceptance-report: ${error instanceof Error ? error.message : String(error)}`, malformed: true };
+	}
+}
+
+function parseGenericJsonAcceptanceReportBody(body: string): AcceptanceReportParseResult {
 	const parsed = parseReportJson(body);
 	const normalized = normalizeAcceptanceReportValue(parsed);
 	const hasCriteriaMarker = normalized.value !== null
@@ -614,12 +849,12 @@ function parseGenericJsonAcceptanceReportBody(body: string): { report?: Acceptan
 	const validation = validateAcceptanceReport(parsed);
 	return validation.report
 		? { report: validation.report }
-		: { error: `Invalid acceptance-report: ${validation.errors.join("; ")}` };
+		: { error: `Invalid acceptance-report: ${validation.errors.join("; ")}`, malformed: true };
 }
 
 export const ACCEPTANCE_REPORT_NOT_FOUND = "Structured acceptance report not found.";
 
-export function parseAcceptanceReport(output: string): { report?: AcceptanceReport; error?: string } {
+export function parseAcceptanceReport(output: string): AcceptanceReportParseResult {
 	const explicitFencePresent = /```acceptance[-_]report\b/i.test(output);
 	const fenced = fencedBlocks(output, "acceptance[-_]report");
 	const parseErrors: string[] = [];
@@ -632,15 +867,17 @@ export function parseAcceptanceReport(output: string): { report?: AcceptanceRepo
 			parseErrors.push(error instanceof Error ? error.message : String(error));
 		}
 	}
-	if (parseErrors.length > 0) return { error: `Failed to parse acceptance-report: ${parseErrors.join("; ")}` };
+	if (parseErrors.length > 0) return { error: `Failed to parse acceptance-report: ${parseErrors.join("; ")}`, malformed: true };
 	if (explicitFencePresent) {
-		return { error: "Failed to parse acceptance-report: Empty or unterminated acceptance-report fence." };
+		const recovered = parseUnterminatedAcceptanceReportFence(output);
+		if (recovered.report || recovered.error) return recovered;
+		return { error: "Failed to parse acceptance-report: Empty or unterminated acceptance-report fence.", malformed: true };
 	}
 	for (const body of fencedBlocks(output, "(?:json|jsonc|json5)")) {
 		try {
 			const parsed = parseGenericJsonAcceptanceReportBody(body);
 			if (parsed.report) return { report: parsed.report };
-			if (parsed.error) return { error: `Failed to parse acceptance-report: ${parsed.error}` };
+			if (parsed.error) return { error: `Failed to parse acceptance-report: ${parsed.error}`, malformed: parsed.malformed };
 		} catch {
 			// Ignore unrelated malformed generic JSON. A recognizable report shape
 			// returns exact validation errors above instead of being mistaken for prose.
@@ -650,20 +887,20 @@ export function parseAcceptanceReport(output: string): { report?: AcceptanceRepo
 	if (markerIndex !== -1) {
 		const jsonStart = output.indexOf("{", markerIndex);
 		if (jsonStart === -1) {
-			return { error: "Failed to parse acceptance-report: Expected a JSON object after ACCEPTANCE_REPORT:." };
+			return { error: "Failed to parse acceptance-report: Expected a JSON object after ACCEPTANCE_REPORT:.", malformed: true };
 		}
 		const json = extractBalancedJson(output, jsonStart);
 		if (!json) {
-			return { error: "Failed to parse acceptance-report: Unterminated JSON object after ACCEPTANCE_REPORT:." };
+			return { error: "Failed to parse acceptance-report: Unterminated JSON object after ACCEPTANCE_REPORT:.", malformed: true };
 		}
 		try {
 			const parsed = JSON.parse(json) as unknown;
 			const validation = validateAcceptanceReport(parsed);
 			if (validation.report) return { report: validation.report };
-			return { error: `Failed to parse acceptance-report: Invalid acceptance-report: ${validation.errors.join("; ")}` };
+			return { error: `Failed to parse acceptance-report: Invalid acceptance-report: ${validation.errors.join("; ")}`, malformed: true };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			return { error: `Failed to parse acceptance-report: ${message}` };
+			return { error: `Failed to parse acceptance-report: ${message}`, malformed: true };
 		}
 	}
 	return { error: ACCEPTANCE_REPORT_NOT_FOUND };
@@ -672,14 +909,18 @@ export function parseAcceptanceReport(output: string): { report?: AcceptanceRepo
 function parseAcceptanceReportSources(
 	output: string,
 	fileOutput: { content: string; path: string; authoritative?: boolean } | undefined,
-): { report?: AcceptanceReport; error?: string } {
+): AcceptanceReportParseResult {
 	const fromText = () => parseAcceptanceReport(output);
 	const fromFile = () => {
 		if (!fileOutput) return { error: ACCEPTANCE_REPORT_NOT_FOUND };
 		const parsed = parseAcceptanceReport(fileOutput.content);
 		return parsed.report || parsed.error === ACCEPTANCE_REPORT_NOT_FOUND
 			? parsed
-			: { error: `${parsed.error} (in configured output ${fileOutput.path})` };
+			: {
+				...parsed,
+				error: `${parsed.error} (in configured output ${fileOutput.path})`,
+				sourcePath: fileOutput.path,
+			};
 	};
 	const [primary, secondary] = fileOutput?.authoritative ? [fromFile, fromText] : [fromText, fromFile];
 	const first = primary();
@@ -747,7 +988,7 @@ function validateStringArrayField(errors: string[], value: unknown, pathLabel: s
 	}
 }
 
-function validateAcceptanceReport(value: unknown, pathLabel = ""): { report?: AcceptanceReport; errors: string[] } {
+export function validateAcceptanceReport(value: unknown, pathLabel = ""): { report?: AcceptanceReport; errors: string[] } {
 	const normalized = normalizeAcceptanceReportValue(value, pathLabel);
 	value = normalized.value;
 	pathLabel = normalized.pathLabel;
@@ -808,8 +1049,8 @@ function validateAcceptanceReport(value: unknown, pathLabel = ""): { report?: Ac
 	if (report.noStagedFiles !== undefined && typeof report.noStagedFiles !== "boolean") pushTypeError(errors, pathFor(pathLabel, "noStagedFiles"), "boolean", report.noStagedFiles);
 	if (report.diffSummary !== undefined && (typeof report.diffSummary !== "string" || !report.diffSummary.trim())) pushTypeError(errors, pathFor(pathLabel, "diffSummary"), "non-empty string", report.diffSummary);
 	if (report.reviewFindings !== undefined) validateStringArrayField(errors, report.reviewFindings, pathFor(pathLabel, "reviewFindings"));
-	if (report.manualNotes !== undefined && (typeof report.manualNotes !== "string" || !report.manualNotes.trim())) pushTypeError(errors, pathFor(pathLabel, "manualNotes"), "non-empty string", report.manualNotes);
-	if (report.notes !== undefined && (typeof report.notes !== "string" || !report.notes.trim())) pushTypeError(errors, pathFor(pathLabel, "notes"), "non-empty string", report.notes);
+	if (report.manualNotes !== undefined && typeof report.manualNotes !== "string") pushTypeError(errors, pathFor(pathLabel, "manualNotes"), "string", report.manualNotes);
+	if (report.notes !== undefined && typeof report.notes !== "string") pushTypeError(errors, pathFor(pathLabel, "notes"), "string", report.notes);
 	if (errors.length > 0) return { errors };
 	const hasReportField = report.criteriaSatisfied !== undefined
 		|| report.changedFiles !== undefined
@@ -856,7 +1097,7 @@ function reportEvidenceStatus(report: AcceptanceReport, kind: AcceptanceEvidence
 }
 
 function checkNoStagedFiles(cwd: string): AcceptanceRuntimeCheck {
-	const result = spawnSync("git", ["status", "--short"], { cwd, encoding: "utf-8" });
+	const result = spawnSync("git", ["status", "--short"], { cwd, encoding: "utf-8", windowsHide: true });
 	if (result.status !== 0) {
 		return { id: "no-staged-files", status: "not-applicable", message: "git status unavailable; no staged-files check skipped" };
 	}
@@ -866,9 +1107,33 @@ function checkNoStagedFiles(cwd: string): AcceptanceRuntimeCheck {
 		: { id: "no-staged-files", status: "failed", message: `Staged files present: ${staged.join(", ")}` };
 }
 
+/** Capture the repository-wide index tree. Throws when Git cannot provide trustworthy evidence. */
+export function captureStagedIndexBaseline(cwd: string): string {
+	const result = spawnSync("git", ["write-tree"], { cwd, encoding: "utf-8", windowsHide: true });
+	const oid = result.stdout.trim();
+	if (result.status !== 0 || !oid) {
+		const detail = result.stderr.trim();
+		throw new Error(`Unable to capture staged index baseline${detail ? `: ${detail}` : "."}`);
+	}
+	return oid;
+}
+
+function checkStagedIndexUnchanged(cwd: string, baseline: string): AcceptanceRuntimeCheck {
+	try {
+		const terminal = captureStagedIndexBaseline(cwd);
+		return terminal === baseline
+			? { id: "staged-index-unchanged", status: "passed", message: "Staged index matches the launch baseline." }
+			: { id: "staged-index-unchanged", status: "failed", message: "Staged index changed after launch." };
+	} catch (error) {
+		return { id: "staged-index-unchanged", status: "failed", message: error instanceof Error ? error.message : String(error) };
+	}
+}
+
 function runStructuralChecks(acceptance: ResolvedAcceptanceConfig, report: AcceptanceReport, cwd: string): AcceptanceRuntimeCheck[] {
 	const checks: AcceptanceRuntimeCheck[] = [];
 	for (const kind of acceptance.evidence) {
+		if (kind === "no-staged-files" && acceptance.preserveStagedIndex) continue;
+		if (kind === "no-staged-files" && report.noStagedFiles === undefined) continue;
 		const status = reportEvidenceStatus(report, kind);
 		checks.push({
 			id: `evidence:${kind}`,
@@ -880,7 +1145,7 @@ function runStructuralChecks(acceptance: ResolvedAcceptanceConfig, report: Accep
 					: `${kind} evidence missing from child report.`,
 		});
 	}
-	if (acceptance.evidence.includes("no-staged-files")) checks.push(checkNoStagedFiles(cwd));
+	if (!acceptance.preserveStagedIndex && acceptance.evidence.includes("no-staged-files")) checks.push(checkNoStagedFiles(cwd));
 	return checks;
 }
 
@@ -890,12 +1155,57 @@ function trimOutput(value: string): string | undefined {
 	return trimmed.length > 12_000 ? `${trimmed.slice(0, 12_000)}\n...[truncated]` : trimmed;
 }
 
+const SENSITIVE_ENV_KEY_PATTERN = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL|COOKIE|SESSION|PRIVATE|API_KEY|ACCESS_KEY)(?:_|$)/i;
+
+function effectiveVerifyEnv(env: Record<string, string> | undefined): Record<string, string> {
+	const inherited = Object.fromEntries(Object.entries(process.env).flatMap(([key, value]) => {
+		return typeof value === "string" ? [[key, value]] : [];
+	}));
+	return { ...inherited, ...(env ?? {}) };
+}
+
+function verifyRedactionEnv(env: Record<string, string> | undefined): Record<string, string> {
+	return Object.fromEntries(Object.entries(effectiveVerifyEnv(env)).filter(([key, value]) => {
+		return value.length >= 4 && SENSITIVE_ENV_KEY_PATTERN.test(key);
+	}));
+}
+
+function verifySecrets(env: Record<string, string> | undefined): string[] {
+	return [...new Set(Object.values(verifyRedactionEnv(env)).filter(Boolean))].sort((left, right) => right.length - left.length);
+}
+
+function redactSecrets(value: string, secrets: readonly string[]): string {
+	let redacted = value;
+	for (const secret of secrets) redacted = redacted.replaceAll(secret, "[REDACTED]");
+	return redacted;
+}
+
+function redactVerifyEnv(value: string, env: Record<string, string> | undefined): string {
+	return redactSecrets(value, verifySecrets(env));
+}
+
+/** Numbers are matched on their source text: parsing rounds or respells them (12345678901234567890, 1.50), which would hide a secret. */
+function parseRedactedVerifyValue(text: string, secrets: readonly string[]): unknown {
+	return JSON.parse(text, (_key: string, value: unknown, context?: { source?: string }) => {
+		if (typeof value === "string") return redactSecrets(value, secrets);
+		if (typeof value === "number" && secrets.length > 0) {
+			// Node 22+ and Bun pass the source text; without it, fail closed.
+			const source = context?.source;
+			return source !== undefined && redactSecrets(source, secrets) === source ? value : "[REDACTED]";
+		}
+		if (value && typeof value === "object" && !Array.isArray(value)) {
+			return Object.fromEntries(Object.entries(value).map(([key, item]) => [redactSecrets(key, secrets), item]));
+		}
+		return value;
+	});
+}
+
 function uniqueStrings(items: Array<string | undefined>): string[] {
 	return unique(items.map((item) => item?.trim()).filter((item): item is string => Boolean(item)));
 }
 
 export function aggregateAcceptanceReport(input: {
-	results: Array<Pick<SingleResult, "agent" | "acceptance" | "error" | "exitCode">>;
+	results: Array<Pick<SingleResult, "agent" | "acceptance" | "error"> & { exitCode: number | null }>;
 	notes?: string;
 }): AcceptanceReport {
 	const childReports = input.results.map((result) => result.acceptance?.childReport).filter((report): report is AcceptanceReport => Boolean(report));
@@ -905,7 +1215,7 @@ export function aggregateAcceptanceReport(input: {
 		criteriaSatisfied: [
 			{ id: "criterion-1", status: successfulChildren ? "satisfied" : "not-satisfied", evidence: successfulChildren ? `All ${input.results.length} dynamic child run(s) completed without child or acceptance blockers.` : "Dynamic fanout produced no accepted child evidence." },
 			{ id: "criterion-2", status: successfulChildren ? "satisfied" : "not-satisfied", evidence: successfulChildren ? "Collected child acceptance evidence for aggregate review." : "Dynamic fanout produced no aggregate review evidence." },
-			...input.results.map((result, index) => ({
+			...input.results.map((result, index): { id?: string; status: "satisfied" | "not-satisfied" | "not-applicable"; evidence: string } => ({
 				id: `child-${index + 1}`,
 				status: result.exitCode === 0 && result.acceptance?.status !== "rejected" ? "satisfied" : "not-satisfied",
 				evidence: `${result.agent}: acceptance ${result.acceptance?.status ?? "unreported"}${result.error ? ` (${result.error})` : ""}`,
@@ -926,7 +1236,212 @@ export function aggregateAcceptanceReport(input: {
 	};
 }
 
-function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, options: { signal?: AbortSignal; abortMessage?: string } = {}): Promise<AcceptanceVerifyResult> {
+const DEFAULT_VERIFY_TIMEOUT_MS = 120_000;
+
+function hash(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
+interface VerifyWorkspaceState {
+	kind: "git-tracked";
+	repoRoot: string;
+	cwdRelative: string;
+	head: string;
+	diffHash: string;
+}
+
+function readVerifyWorkspaceState(cwd: string): VerifyWorkspaceState | undefined {
+	const repo = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf-8", windowsHide: true });
+	if (repo.status !== 0 || !repo.stdout.trim()) return undefined;
+	const repoRoot = fs.realpathSync(repo.stdout.trim());
+	const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf-8", windowsHide: true });
+	const diff = spawnSync("git", ["diff", "--binary", "--full-index", "HEAD", "--"], { cwd: repoRoot, encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, windowsHide: true });
+	if (head.status !== 0 || diff.status !== 0 || !head.stdout.trim()) return undefined;
+	return {
+		kind: "git-tracked",
+		repoRoot,
+		cwdRelative: path.relative(repoRoot, fs.realpathSync(cwd)) || ".",
+		head: head.stdout.trim(),
+		diffHash: hash(diff.stdout),
+	};
+}
+
+function isCachedVerifyResult(value: unknown): value is AcceptanceVerifyResult {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const result = value as Partial<AcceptanceVerifyResult>;
+	return typeof result.id === "string"
+		&& typeof result.command === "string"
+		&& (typeof result.exitCode === "number" || result.exitCode === null)
+		&& (result.status === "passed" || result.status === "failed" || result.status === "timed-out" || result.status === "allowed-failure")
+		&& typeof result.durationMs === "number";
+}
+
+const TYPED_VERIFY_OUTPUT_MAX_BYTES = 12_000;
+
+/**
+ * A passing `output: "json"` command must print one JSON document on stdout.
+ * The parsed value becomes the run's structured output; anything else turns
+ * the passing run into a failed one so acceptance rejects rather than
+ * silently dropping the verdict. The raw stdout is parsed, because the stored
+ * stdout is redacted and redaction can hit JSON syntax (`true` in KDE_FULL_SESSION).
+ * The schema checks the raw value so a redacted string cannot fail a correct
+ * gate. Error messages quote parts of their input (a parse error quotes ~10
+ * chars, schema paths escape `/` and `~`), so each one is built from the
+ * redacted text or value, never the raw one.
+ */
+async function applyTypedVerifyOutput(command: AcceptanceVerifyCommand, run: AcceptanceVerifyResult, rawStdout: string): Promise<void> {
+	if (run.status !== "passed") return;
+	const secrets = verifySecrets(command.env);
+	const stdout = rawStdout.trim();
+	const fail = (message: string): void => {
+		run.status = "failed";
+		run.structuredOutputError = redactSecrets(message, secrets);
+	};
+	if (!stdout) return fail("output: \"json\" command printed nothing on stdout.");
+	if (stdout.length > TYPED_VERIFY_OUTPUT_MAX_BYTES) return fail(`output: "json" stdout exceeded ${TYPED_VERIFY_OUTPUT_MAX_BYTES} characters and was truncated.`);
+	let value: unknown;
+	try {
+		value = JSON.parse(stdout);
+	} catch {
+		let reason = "parse failed";
+		try {
+			JSON.parse(redactSecrets(stdout, secrets));
+		} catch (error) {
+			reason = error instanceof Error ? error.message : String(error);
+		}
+		return fail(`output: "json" stdout is not valid JSON: ${reason}`);
+	}
+	const redactedValue = parseRedactedVerifyValue(stdout, secrets);
+	if (command.schema) {
+		const validation = await validateStructuredOutputValue(command.schema, value);
+		if (validation.status === "invalid") {
+			const redactedValidation = await validateStructuredOutputValue(command.schema, redactedValue);
+			return fail(`output: "json" stdout does not match gate.schema${redactedValidation.status === "invalid" ? `: ${redactedValidation.message}` : "."}`);
+		}
+	}
+	run.structuredOutput = redactedValue;
+}
+
+/** The first typed verify result on a ledger, if any command produced one. */
+export function typedVerifyOutput(ledger: AcceptanceLedger | undefined): { value: unknown } | undefined {
+	const run = ledger?.verifyRuns?.find((entry) => entry.structuredOutput !== undefined);
+	return run ? { value: run.structuredOutput } : undefined;
+}
+
+async function runMemoizedVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, options: {
+	signal?: AbortSignal;
+	abortMessage?: string;
+	artifactsDir?: string;
+	runId?: string;
+} = {}): Promise<AcceptanceVerifyResult> {
+	// Typed gates read inputs (a report file, a log) that can change without
+	// the tracked tree changing, so their verdicts are never reused.
+	if (command.output === "json") {
+		const { run, rawStdout } = await runVerifyCommand(command, defaultCwd, options);
+		await applyTypedVerifyOutput(command, run, rawStdout);
+		return run;
+	}
+	const cwd = command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd;
+	let workspaceState: VerifyWorkspaceState | undefined;
+	try {
+		workspaceState = readVerifyWorkspaceState(cwd);
+	} catch {
+		workspaceState = undefined;
+	}
+	if (!workspaceState || !options.artifactsDir || !options.runId) {
+		return (await runVerifyCommand(command, defaultCwd, options)).run;
+	}
+	const envKeys = Object.keys(command.env ?? {}).sort();
+	const envHash = hash(JSON.stringify(Object.fromEntries(Object.entries(effectiveVerifyEnv(command.env)).sort(([left], [right]) => left.localeCompare(right)))));
+	const timeoutMs = command.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
+	const cacheKey = hash(JSON.stringify({
+		version: 1,
+		command: command.command,
+		cwdRelative: workspaceState.cwdRelative,
+		envKeys,
+		envHash,
+		timeoutMs,
+		allowFailure: command.allowFailure === true,
+		head: workspaceState.head,
+		diffHash: workspaceState.diffHash,
+	}));
+	const artifactPath = path.join(options.artifactsDir, "acceptance", "verify", options.runId, `${cacheKey}.json`);
+	try {
+		const cached = JSON.parse(fs.readFileSync(artifactPath, "utf-8")) as { cacheKey?: unknown; result?: unknown };
+		if (cached.cacheKey === cacheKey && isCachedVerifyResult(cached.result)) {
+			return { ...cached.result, id: command.id, command: command.command, cwd, artifactPath, cacheKey, memoized: true, envKeys, envHash, workspaceState };
+		}
+	} catch {
+		// A cache miss or unreadable artifact must not prevent host verification.
+	}
+	const { run: result } = await runVerifyCommand(command, defaultCwd, options);
+	const evidenced: AcceptanceVerifyResult = { ...result, artifactPath, cacheKey, memoized: false, envKeys, envHash, workspaceState };
+	try {
+		fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+		fs.writeFileSync(artifactPath, JSON.stringify({
+			version: 1,
+			cacheKey,
+			command: command.command,
+			cwdRelative: workspaceState.cwdRelative,
+			envKeys,
+			envHash,
+			timeoutMs,
+			allowFailure: command.allowFailure === true,
+			workspaceState,
+			result: evidenced,
+		}, null, 2), "utf-8");
+	} catch (error) {
+		evidenced.artifactError = error instanceof Error ? error.message : String(error);
+		delete evidenced.artifactPath;
+	}
+	return evidenced;
+}
+
+/**
+ * On Windows with `shell: true`, cmd.exe parses the command line itself and an
+ * unquoted executable path containing spaces (e.g. `C:\Program Files\...\tool.exe`)
+ * is split at the first space, so cmd tries to run `C:\Program` and fails.
+ *
+ * The command line is ambiguous, so only an unquoted absolute drive path with
+ * a space in a directory component is safe to identify as an executable. That
+ * path is quoted; everything after it is preserved as arguments.
+ *
+ * Commands that already start with a quote, single-token commands, and commands
+ * whose first token already ends in an executable extension are returned
+ * unchanged. Non-Windows platforms pass the command through untouched.
+ */
+export function quoteExecutableForShell(command: string, platform: string = process.platform): string {
+	if (platform !== "win32") return command;
+	const trimmed = command.trimStart();
+	if (trimmed.startsWith("\"")) return command;
+	const firstToken = trimmed.match(/^\S+/)?.[0];
+	if (/\.(?:exe|bat|cmd|com|ps1)$/i.test(firstToken ?? "")) return command;
+	const match = trimmed.match(/^([A-Za-z]:\\[^"<>|&*?\r\n]*?\s[^"<>|&*?\r\n]*?\\[^"<>|&*?\r\n]*?\.(?:exe|bat|cmd|com|ps1))(?=\s|$)/i);
+	const executable = match?.[1];
+	if (executable && /\s/.test(executable) && !/[A-Za-z]:\\/.test(executable.slice(3))) {
+		const rest = trimmed.slice(executable.length);
+		const leading = command.slice(0, command.length - trimmed.length);
+		return `${leading}"${executable}"${rest}`;
+	}
+	const extensionlessSpacedFilenameMatch = trimmed.match(/^([A-Za-z]:\\[^"<>|&*?\r\n]*?\s[^"<>|&*?\r\n]*?)(?=\s+--|$)/i);
+	const extensionlessSpacedFilename = extensionlessSpacedFilenameMatch?.[1];
+	if (extensionlessSpacedFilename && /\s/.test(extensionlessSpacedFilename.slice(0, extensionlessSpacedFilename.lastIndexOf("\\"))) && !/[A-Za-z]:\\/.test(extensionlessSpacedFilename.slice(3))) {
+		const rest = trimmed.slice(extensionlessSpacedFilename.length);
+		const leading = command.slice(0, command.length - trimmed.length);
+		return `${leading}"${extensionlessSpacedFilename}"${rest}`;
+	}
+	const extensionlessMatch = trimmed.match(/^([A-Za-z]:\\[^"<>|&*?\r\n]*?\s[^"<>|&*?\r\n]*?\\[^"<>|&*?\s\r\n]+)(?=\s|$)/i);
+	const extensionlessExecutable = extensionlessMatch?.[1];
+	if (extensionlessExecutable && /\s/.test(extensionlessExecutable) && !/[A-Za-z]:\\/.test(extensionlessExecutable.slice(3)) && !/\s/.test(extensionlessExecutable.slice(extensionlessExecutable.lastIndexOf("\\") + 1))) {
+		const rest = trimmed.slice(extensionlessExecutable.length);
+		const leading = command.slice(0, command.length - trimmed.length);
+		return `${leading}"${extensionlessExecutable}"${rest}`;
+	}
+	return command;
+}
+
+/** `rawStdout` is unredacted and never stored; only typed output parsing reads it. */
+function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, options: { signal?: AbortSignal; abortMessage?: string } = {}): Promise<{ run: AcceptanceVerifyResult; rawStdout: string }> {
 	return new Promise((resolve) => {
 		const startedAt = Date.now();
 		const cwd = command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd;
@@ -935,9 +1450,9 @@ function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, 
 		let timedOut = false;
 		let settled = false;
 		let hardKill: NodeJS.Timeout | undefined;
-		const child = spawn(command.command, {
+		const child = spawn(quoteExecutableForShell(command.command), {
 			cwd,
-			env: { ...process.env, ...(command.env ?? {}) },
+			env: effectiveVerifyEnv(command.env),
 			shell: true,
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
@@ -949,11 +1464,14 @@ function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, 
 			if (hardKill) clearTimeout(hardKill);
 			options.signal?.removeEventListener("abort", abortVerification);
 			resolve({
-				id: command.id,
-				command: command.command,
-				cwd,
-				durationMs: Date.now() - startedAt,
-				...result,
+				run: {
+					id: command.id,
+					command: command.command,
+					cwd,
+					durationMs: Date.now() - startedAt,
+					...result,
+				},
+				rawStdout: stdout,
 			});
 		};
 		const abortVerification = () => {
@@ -965,13 +1483,13 @@ function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, 
 				finish({
 					exitCode: null,
 					status: "timed-out",
-					stdout: trimOutput(stdout),
-					stderr: trimOutput(stderr || options.abortMessage || "Acceptance verification timed out."),
+					stdout: trimOutput(redactVerifyEnv(stdout, command.env)),
+					stderr: trimOutput(redactVerifyEnv(stderr || options.abortMessage || "Acceptance verification timed out.", command.env)),
 				});
 			}, 1000);
 			hardKill.unref?.();
 		};
-		const timeout = setTimeout(abortVerification, command.timeoutMs ?? 120_000);
+		const timeout = setTimeout(abortVerification, command.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS);
 		timeout.unref?.();
 		if (options.signal?.aborted) abortVerification();
 		else options.signal?.addEventListener("abort", abortVerification, { once: true });
@@ -986,15 +1504,17 @@ function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, 
 			finish({
 				exitCode,
 				status: timedOut ? "timed-out" : passed ? "passed" : command.allowFailure ? "allowed-failure" : "failed",
-				stdout: trimOutput(stdout),
-				stderr: trimOutput(stderr || (timedOut ? options.abortMessage ?? "" : "")),
+				stdout: trimOutput(redactVerifyEnv(stdout, command.env)),
+				stderr: trimOutput(redactVerifyEnv(stderr || (timedOut ? options.abortMessage ?? "" : ""), command.env)),
 			});
 		});
 		child.on("error", (error) => {
 			finish({
 				exitCode: timedOut ? null : 1,
 				status: timedOut ? "timed-out" : command.allowFailure ? "allowed-failure" : "failed",
-				stderr: timedOut ? trimOutput(stderr || options.abortMessage || "Acceptance verification timed out.") : error instanceof Error ? error.message : String(error),
+				stderr: timedOut
+					? trimOutput(redactVerifyEnv(stderr || options.abortMessage || "Acceptance verification timed out.", command.env))
+					: redactVerifyEnv(error instanceof Error ? error.message : String(error), command.env),
 			});
 		});
 	});
@@ -1004,21 +1524,30 @@ export async function evaluateAcceptance(input: {
 	acceptance: ResolvedAcceptanceConfig;
 	output: string;
 	cwd: string;
+	/** Host-captured launch index tree; required by preserveStagedIndex. */
+	stagedIndexBaseline?: string;
 	/**
 	 * Content the child sent to its configured output file (from its own write
 	 * tool calls, not from disk, so a concurrent writer to the same path cannot
 	 * be misattributed). Searched for the acceptance report; searched before
 	 * the assistant output when `authoritative` (outputMode "file-only").
 	 */
-	fileOutput?: { content: string; path: string; authoritative?: boolean };
+	fileOutput?: { content: string; path: string; authoritative?: boolean; durable?: boolean };
 	report?: AcceptanceReport;
+	reportError?: string;
 	reviewResult?: AcceptanceReviewResult;
 	signal?: AbortSignal;
 	abortMessage?: string;
+	reportOptional?: boolean;
+	artifactsDir?: string;
+	runId?: string;
+	watchdog?: ChildWatchdogProgress;
 }): Promise<AcceptanceLedger> {
 	const acceptance = input.acceptance;
+	const initialStatus = acceptance.level === "none" ? "not-required" : "claimed";
 	const ledger: AcceptanceLedger = {
-		status: acceptance.level === "none" ? "not-required" : "claimed",
+		status: initialStatus,
+		evidenceStatus: initialStatus,
 		explicit: acceptance.explicit,
 		effectiveAcceptance: acceptance,
 		inferredReason: acceptance.inferredReason,
@@ -1028,69 +1557,125 @@ export async function evaluateAcceptance(input: {
 	};
 	if (acceptance.level === "none") return ledger;
 
-	const parsed = input.report
+	if (input.watchdog) {
+		const unresolved = unresolvedChildWatchdogBlockers(input.watchdog);
+		ledger.runtimeChecks.push(unresolved.length
+			? { id: "watchdog-blocker", status: "failed", message: "Unresolved watchdog blocker (details are available in child watchdog status)." }
+			: { id: "watchdog-blocker", status: "passed", message: "No unresolved watchdog blockers." });
+	}
+
+	const parsed: AcceptanceReportParseResult = input.reportError
+		? { error: input.reportError }
+		: input.report !== undefined
 		? (() => {
 			const validation = validateAcceptanceReport(input.report);
 			return validation.report
 				? { report: validation.report }
-				: { error: `Failed to parse acceptance-report: Invalid acceptance-report: ${validation.errors.join("; ")}` };
+				: { error: `Failed to parse acceptance-report: Invalid acceptance-report: ${validation.errors.join("; ")}`, malformed: true };
 		})()
 		: parseAcceptanceReportSources(input.output, input.fileOutput);
+	const durableFileOutput = input.fileOutput?.authoritative && input.fileOutput.durable ? input.fileOutput : undefined;
+	if (parsed.malformed && parsed.sourcePath && durableFileOutput) {
+		ledger.recovery = {
+			status: "available-for-review",
+			reason: "acceptance-metadata-rejected",
+			reportPath: parsed.sourcePath,
+			reportHash: hash(durableFileOutput.content),
+		};
+	}
+	const needsReport = acceptanceRequiresChildReport(acceptance);
 	if (parsed.report) {
 		ledger.childReport = parsed.report;
 		ledger.status = "attested";
-	} else {
+		ledger.evidenceStatus = "attested";
+	} else if (!input.reportOptional || needsReport || parsed.error !== ACCEPTANCE_REPORT_NOT_FOUND) {
 		ledger.childReportParseError = parsed.error;
 		ledger.runtimeChecks.push({ id: "attestation", status: "failed", message: parsed.error ?? "Structured acceptance report missing." });
-		ledger.status = "rejected";
-		return ledger;
+		if (ledger.recovery) {
+			ledger.status = "rejected";
+			ledger.evidenceStatus = "rejected";
+		}
+		if (!input.reportOptional) {
+			ledger.status = "rejected";
+			ledger.evidenceStatus = "rejected";
+			return ledger;
+		}
+	} else {
+		ledger.childReportParseError = parsed.error;
 	}
 
-	if (LEVEL_RANK[acceptance.level] >= LEVEL_RANK.checked) {
+	if (parsed.report && LEVEL_RANK[acceptance.level] >= LEVEL_RANK.checked) {
 		ledger.runtimeChecks = [
+			...ledger.runtimeChecks,
 			...checkCriteriaSatisfied(acceptance.criteria, parsed.report),
 			...runStructuralChecks(acceptance, parsed.report, input.cwd),
 		];
-		if (ledger.runtimeChecks.some((check) => check.status === "failed")) {
-			ledger.status = "rejected";
-			return ledger;
+		if (!ledger.runtimeChecks.some((check) => check.status === "failed")) {
+			ledger.status = "checked";
+			ledger.evidenceStatus = "checked";
 		}
-		ledger.status = "checked";
 	}
 
 	if (LEVEL_RANK[acceptance.level] >= LEVEL_RANK.verified && (acceptance.level === "verified" || acceptance.verify.length > 0)) {
 		if (acceptance.level === "verified" && acceptance.verify.length === 0) {
 			ledger.runtimeChecks.push({ id: "verification-config", status: "failed", message: "verified acceptance requires runtime verify commands." });
 			ledger.status = "rejected";
-			return ledger;
+			ledger.evidenceStatus = "rejected";
+		} else {
+			ledger.verifyRuns = [];
+			for (const command of acceptance.verify) {
+				const run = await runMemoizedVerifyCommand(command, input.cwd, {
+					signal: input.signal,
+					abortMessage: input.abortMessage,
+					artifactsDir: input.artifactsDir,
+					runId: input.runId,
+				});
+				ledger.verifyRuns.push(run);
+				if (input.signal?.aborted) break;
+			}
+			if (ledger.verifyRuns.some((run) => run.status === "failed" || run.status === "timed-out")) {
+				ledger.status = "rejected";
+				ledger.evidenceStatus = "rejected";
+			} else if (!ledger.runtimeChecks.some((check) => check.status === "failed")) {
+				ledger.status = "verified";
+				ledger.evidenceStatus = "verified";
+			}
 		}
-		ledger.verifyRuns = [];
-		for (const command of acceptance.verify) {
-			ledger.verifyRuns.push(await runVerifyCommand(command, input.cwd, { signal: input.signal, abortMessage: input.abortMessage }));
-			if (input.signal?.aborted) break;
-		}
-		if (ledger.verifyRuns.some((run) => run.status === "failed" || run.status === "timed-out")) {
-			ledger.status = "rejected";
-			return ledger;
-		}
-		ledger.status = "verified";
 	}
 
-	if (acceptance.level === "reviewed") {
-		if (input.reviewResult) {
+	if (acceptance.preserveStagedIndex) {
+		ledger.runtimeChecks.push(input.stagedIndexBaseline
+			? checkStagedIndexUnchanged(input.cwd, input.stagedIndexBaseline)
+			: { id: "staged-index-unchanged", status: "failed", message: "Staged index launch baseline is unavailable." });
+	}
+
+	if (ledger.status === "rejected" || ledger.runtimeChecks.some((check) => check.status === "failed")) {
+		ledger.status = "rejected";
+		ledger.evidenceStatus = "rejected";
+		return ledger;
+	}
+	if (ledger.status === "claimed") {
+		ledger.status = acceptance.level === "verified" ? "verified" : acceptance.level;
+		ledger.evidenceStatus = ledger.status;
+	}
+
+	if (acceptance.review) {
+		if (input.reviewResult?.status === "reviewed") {
 			ledger.reviewResult = input.reviewResult;
-			ledger.status = input.reviewResult.status === "no-blockers" ? "reviewed" : "rejected";
-		} else {
-			const optionalReview = acceptance.review && acceptance.review !== false && acceptance.review.required === false;
-			ledger.reviewResult = {
-				status: "needs-parent-decision",
+			ledger.status = "reviewed";
+		} else if (input.reviewResult?.status === "blockers") {
+			ledger.reviewResult = input.reviewResult;
+			ledger.status = "rejected";
+		} else if (acceptance.review.required !== false) {
+			ledger.reviewResult = input.reviewResult ?? {
+				status: "review-required",
 				findings: [{
-					severity: acceptance.explicit && !optionalReview ? "blocker" : "non-blocking",
-					issue: "Reviewed acceptance requires an independent reviewer result.",
+					severity: "non-blocking",
+					issue: "Independent review has not been supplied.",
 					rationale: "The run cannot be marked reviewed from child evidence alone.",
 				}],
 			};
-			if (acceptance.review === false || (acceptance.explicit && !optionalReview)) ledger.status = "rejected";
+			ledger.status = "review-required";
 		}
 	}
 
@@ -1098,8 +1683,10 @@ export async function evaluateAcceptance(input: {
 }
 
 export function buildSkippedAcceptanceLedger(acceptance: ResolvedAcceptanceConfig, input: { id: string; message: string }): AcceptanceLedger {
+	const status = acceptance.level === "none" ? "not-required" : "rejected";
 	return {
-		status: acceptance.level === "none" ? "not-required" : "rejected",
+		status,
+		evidenceStatus: status,
 		explicit: acceptance.explicit,
 		effectiveAcceptance: acceptance,
 		inferredReason: acceptance.inferredReason,
@@ -1116,8 +1703,8 @@ export function acceptanceFailureMessage(ledger: AcceptanceLedger): string | und
 	const failedCheck = ledger.runtimeChecks.find((check) => check.status === "failed");
 	if (failedCheck) return `Acceptance rejected: ${failedCheck.message}`;
 	const failedVerify = ledger.verifyRuns.find((run) => run.status === "failed" || run.status === "timed-out");
+	if (failedVerify?.structuredOutputError) return `Acceptance verification '${failedVerify.id}' failed: ${failedVerify.structuredOutputError}`;
 	if (failedVerify) return `Acceptance verification '${failedVerify.id}' ${failedVerify.status}.`;
-	if (ledger.reviewResult?.status === "needs-parent-decision") return "Acceptance review required but no automatic reviewer result is available.";
 	if (ledger.reviewResult?.status === "blockers") return "Acceptance review found blockers.";
 	return "Acceptance rejected.";
 }

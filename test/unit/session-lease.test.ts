@@ -105,9 +105,22 @@ describe("session revival leases", () => {
 					&& error.owner?.runId === "revive-a"
 					&& /already owned by run 'revive-a'/.test(error.message),
 			);
-			first.release();
+			assert.equal(first.release(), true);
 			const second = acquireSessionLease(request(sessionFile, "revive-b"), { rootDir: leases, token: () => "token-b" });
-			second.release();
+			assert.equal(second.release(), true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("acquires a lease without a ps start probe when the platform has none", {
+		skip: process.platform === "linux" || process.platform === "win32" ? "platform has a native start probe" : undefined,
+	}, () => {
+		const { root, leases, sessionFile } = fixture("pi-session-lease-no-ps-");
+		try {
+			const lease = acquireSessionLease(request(sessionFile, "no-ps"), { rootDir: leases });
+			assert.match(lease.owner.processStartIdentity ?? "", /^runtime:/);
+			lease.release();
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

@@ -1,17 +1,17 @@
 /**
  * Cross-OS control channel for async subagent runs.
  *
- * Background runs are detached OS processes. The original control path delivered
- * an interrupt with `process.kill(pid, SIGUSR2|SIGBREAK)`, but Windows cannot
+ * Background runs use a detached runner process. Unix detaches it from the parent process.
+ * The original control path delivered an interrupt with
+ * `process.kill(pid, SIGUSR2|SIGBREAK)`, but Windows cannot
  * deliver those signals cross-process via `process.kill` and throws `ENOSYS`,
  * which left async runs uninterruptible (no stop, no live steer) on Windows.
  *
  * This module adds a portable, file-based control inbox inside the run directory.
  * The parent drops an interrupt request file; the runner watches the inbox and
  * routes the request into its existing graceful `interruptRunner()` (pause +
- * resumable), identically on every platform. The OS signal is kept only as an
- * opportunistic fast-path; its failure is non-fatal because the file inbox is
- * authoritative.
+ * resumable), identically on every platform. The file inbox is authoritative and
+ * avoids signaling a PID that the extension cannot prove belongs to the runner.
  */
 
 import { randomUUID } from "node:crypto";
@@ -19,17 +19,23 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { POLL_INTERVAL_MS } from "../../shared/types.ts";
+import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { resolveWatchPath } from "../../shared/utils.ts";
 
-/**
- * Opportunistic fast-path interrupt signal. On Unix `SIGUSR2` is trapped by the
- * runner; on Windows `process.kill(pid, "SIGBREAK")` is not deliverable
- * cross-process and throws `ENOSYS`, so the file inbox below is the real channel.
- */
-export const INTERRUPT_SIGNAL: NodeJS.Signals = process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
-
 export type ControlChannelFs = Pick<typeof fs, "mkdirSync" | "existsSync" | "rmSync" | "watch" | "readdirSync" | "readFileSync" | "realpathSync">;
+
+function writeJsonToExistingDir(filePath: string, payload: object): void {
+	const tempPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
+	try {
+		fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2), { encoding: "utf-8", flag: "wx" });
+		fs.renameSync(tempPath, filePath);
+	} finally {
+		fs.rmSync(tempPath, { force: true });
+	}
+}
 export type ControlChannelTimers = { setInterval: typeof setInterval; clearInterval: typeof clearInterval };
+const CONTROL_SAFETY_POLL_INTERVAL_MS = 5000;
+const REPEATED_SCAN_ERROR_SUMMARY_MS = 60_000;
 type KillFn = (pid: number, signal?: NodeJS.Signals | 0) => unknown;
 
 export interface InterruptRequest {
@@ -51,57 +57,166 @@ export interface StopRequest {
 	ts?: number;
 	source?: string;
 	reason?: string;
+	targetIndex?: number;
+	childId?: string;
 }
+
+export type SteerDeliveryMode = "steer" | "follow_up" | "auto";
+export type SteerDeliveryStatus = "delivered" | "queued";
 
 export interface SteerRequest {
 	type: "steer";
 	id: string;
 	ts: number;
 	message: string;
+	mode?: SteerDeliveryMode;
 	targetIndex?: number;
+	targetIndexes?: number[];
 	source?: string;
 }
 
-const STEER_REQUESTS_DIR = "steer-requests";
-const STEER_TARGETS_DIR = "steer-targets";
+export interface CommandRequest {
+	type: "command";
+	id: string;
+	ownerId: string;
+	operation: "status" | "yield" | "cancel";
+	toolCallId?: string;
+	deadlineAt: number;
+}
 
-/** Control inbox directory inside an async run dir. */
+function validCommandRequest(raw: unknown): raw is CommandRequest {
+	if (!raw || typeof raw !== "object") return false;
+	const value = raw as Partial<CommandRequest>;
+	return value.type === "command" && typeof value.id === "string" && /^[a-f0-9-]{36}$/.test(value.id)
+		&& typeof value.ownerId === "string" && /^[a-f0-9-]{36}$/.test(value.ownerId)
+		&& (value.operation === "status" || value.operation === "yield" || value.operation === "cancel")
+		&& Number.isSafeInteger(value.deadlineAt) && value.deadlineAt! > 0
+		&& (value.toolCallId === undefined ? value.operation === "status" : typeof value.toolCallId === "string" && value.toolCallId.length > 0 && value.toolCallId.length <= 256);
+}
+
+function commandRequestsDir(dir: string): string { return path.join(controlInboxDir(dir), "command-requests"); }
+export function requestAsyncCommand(dir: string, request: CommandRequest): void {
+	if (!validCommandRequest(request)) throw new Error("Malformed command request.");
+	writeAtomicJson(path.join(commandRequestsDir(dir), `${request.id}.json`), request);
+}
+function consumeCommandRequests(dir: string, fsImpl: ControlChannelFs): CommandRequest[] {
+	const requests: CommandRequest[] = [];
+	for (const name of fsImpl.readdirSync(commandRequestsDir(dir)).filter((entry) => entry.endsWith(".json")).sort()) {
+		const file = path.join(commandRequestsDir(dir), name);
+		let value: unknown;
+		try { value = JSON.parse(fsImpl.readFileSync(file, "utf8")); }
+		catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; }
+		try { fsImpl.rmSync(file); }
+		catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+		if (validCommandRequest(value)) requests.push(value);
+	}
+	return requests;
+}
+
+const STEER_REQUESTS_DIR = "steer-requests";
+const STOP_REQUESTS_DIR = "stop-requests";
+const REVIVAL_BRIEFS_DIR = "revival-briefs";
+export const MAX_STEER_QUEUE_SIZE = 20;
+const STEER_INBOX_CLOSED_FILE = "steer-inbox-closed.json";
+const STOP_INBOX_CLOSED_FILE = "stop-inbox-closed.json";
+const STOP_INBOX_CLOSED_MESSAGE = "Runner stop inbox is closed. Retry stop after runner shutdown is observed.";
+const MAX_STEER_MESSAGE_BYTES = 128 * 1024;
+const MAX_STEER_REQUEST_ID_LENGTH = 256;
+
 export function controlInboxDir(asyncDir: string): string {
 	return path.join(asyncDir, "control");
 }
 
-/** Path of the portable interrupt request file. */
 export function interruptRequestPath(asyncDir: string): string {
 	return path.join(controlInboxDir(asyncDir), "interrupt.json");
 }
 
-/** Path of the portable timeout request file. */
 export function timeoutRequestPath(asyncDir: string): string {
 	return path.join(controlInboxDir(asyncDir), "timeout.json");
 }
 
-/** Path of the portable manual stop request file. */
 export function stopRequestPath(asyncDir: string): string {
 	return path.join(controlInboxDir(asyncDir), "stop.json");
 }
 
-/** Directory of parent-to-runner steering requests. */
+export function stopRequestsDir(asyncDir: string): string {
+	return path.join(controlInboxDir(asyncDir), STOP_REQUESTS_DIR);
+}
+
 export function steerRequestsDir(asyncDir: string): string {
 	return path.join(controlInboxDir(asyncDir), STEER_REQUESTS_DIR);
 }
 
-/** Per-child inbox consumed by the child prompt runtime inside the Pi process. */
-export function stepSteerInboxDir(asyncDir: string, index: number): string {
-	return path.join(controlInboxDir(asyncDir), STEER_TARGETS_DIR, String(index));
+export function steerInboxClosedPath(asyncDir: string): string {
+	return path.join(controlInboxDir(asyncDir), STEER_INBOX_CLOSED_FILE);
+}
+
+export function stopInboxClosedPath(asyncDir: string): string {
+	return path.join(controlInboxDir(asyncDir), STOP_INBOX_CLOSED_FILE);
+}
+
+export function closeStopInbox(asyncDir: string): void {
+	writeAtomicJson(stopInboxClosedPath(asyncDir), { version: 1, closedAt: Date.now() });
+}
+
+export function closeSteerInbox(asyncDir: string, state: string, write: (filePath: string, payload: object) => void = writeAtomicJson): void {
+	write(steerInboxClosedPath(asyncDir), { version: 1, closedAt: Date.now(), state });
+}
+
+function assertChildIndex(index: number): void {
+	if (!Number.isInteger(index) || index < 0 || index > 1_000_000) throw new Error("child index must be a non-negative integer.");
+}
+
+function validStopChildId(childId: unknown): childId is string {
+	return typeof childId === "string"
+		&& Boolean(childId.trim())
+		&& childId.length <= 256
+		&& !/[\r\n]/.test(childId);
 }
 
 function steerRequestFileName(request: SteerRequest): string {
 	return `${String(request.ts).padStart(13, "0")}-${Buffer.from(request.id).toString("base64url")}.json`;
 }
 
+function stopRequestFileName(request: StopRequest): string {
+	return `${String(request.ts ?? 0).padStart(13, "0")}-${randomUUID()}.json`;
+}
+
+function validSteerRequest(request: Partial<SteerRequest>): request is SteerRequest {
+	return request.type === "steer"
+		&& typeof request.id === "string"
+		&& /^[^\s]+$/.test(request.id)
+		&& request.id.length <= MAX_STEER_REQUEST_ID_LENGTH
+		&& typeof request.ts === "number"
+		&& Number.isFinite(request.ts)
+		&& request.ts > 0
+		&& typeof request.message === "string"
+		&& Boolean(request.message.trim())
+		&& Buffer.byteLength(request.message, "utf8") <= MAX_STEER_MESSAGE_BYTES
+		&& (request.mode === undefined || request.mode === "steer" || request.mode === "follow_up" || request.mode === "auto")
+		&& (request.targetIndex === undefined || (Number.isInteger(request.targetIndex) && request.targetIndex >= 0 && request.targetIndex <= 1_000_000))
+		&& (request.targetIndexes === undefined || (
+			request.targetIndex === undefined
+			&& Array.isArray(request.targetIndexes)
+			&& request.targetIndexes.length > 0
+			&& request.targetIndexes.length <= 1_000
+			&& request.targetIndexes.every((index) => Number.isInteger(index) && index >= 0 && index <= 1_000_000)
+			&& new Set(request.targetIndexes).size === request.targetIndexes.length
+		))
+		&& (request.source === undefined || (typeof request.source === "string" && Boolean(request.source.trim()) && request.source.length <= 256));
+}
+
 export function writeSteerRequestToDir(dir: string, request: SteerRequest): string {
+	if (!validSteerRequest(request)) throw new Error("steer request is malformed or exceeds transport limits.");
 	const requestPath = path.join(dir, steerRequestFileName(request));
 	writeAtomicJson(requestPath, request);
+	return requestPath;
+}
+
+export function writeSteerRequestToExistingDir(dir: string, request: SteerRequest): string {
+	if (!validSteerRequest(request)) throw new Error("steer request is malformed or exceeds transport limits.");
+	const requestPath = path.join(dir, steerRequestFileName(request));
+	writeJsonToExistingDir(requestPath, request);
 	return requestPath;
 }
 
@@ -134,73 +249,111 @@ export function requestAsyncTimeout(
 export function requestAsyncStop(
 	asyncDir: string,
 	payload: Omit<StopRequest, "type"> = {},
-	deps: { now?: () => number } = {},
+	deps: { now?: () => number; write?: typeof writeAtomicJson } = {},
 ): string {
-	const requestPath = stopRequestPath(asyncDir);
+	if (payload.targetIndex !== undefined) assertChildIndex(payload.targetIndex);
+	if (payload.childId !== undefined && !validStopChildId(payload.childId)) {
+		throw new Error("stop childId must be a non-empty string without newlines and at most 256 characters.");
+	}
+	const closedPath = stopInboxClosedPath(asyncDir);
+	if (fs.existsSync(closedPath)) throw new Error(STOP_INBOX_CLOSED_MESSAGE);
 	const request: StopRequest = { ...payload, ts: payload.ts ?? deps.now?.() ?? Date.now(), type: "stop" };
-	writeAtomicJson(requestPath, request);
+	const requestPath = path.join(stopRequestsDir(asyncDir), stopRequestFileName(request));
+	(deps.write ?? writeAtomicJson)(requestPath, request);
+	if (fs.existsSync(closedPath)) {
+		fs.rmSync(requestPath, { force: true });
+		throw new Error(STOP_INBOX_CLOSED_MESSAGE);
+	}
 	return requestPath;
 }
 
 export function requestAsyncSteer(
 	asyncDir: string,
-	payload: { message: string; targetIndex?: number; source?: string; id?: string; ts?: number },
+	payload: { message: string; mode?: SteerDeliveryMode; targetIndex?: number; targetIndexes?: number[]; source?: string; id?: string; ts?: number },
 	deps: { now?: () => number; randomId?: () => string } = {},
 ): string {
 	const message = payload.message.trim();
 	if (!message) throw new Error("steer message must not be empty.");
-	if (payload.targetIndex !== undefined && (!Number.isInteger(payload.targetIndex) || payload.targetIndex < 0)) {
-		throw new Error("steer targetIndex must be a non-negative integer.");
+	if (Buffer.byteLength(message, "utf8") > MAX_STEER_MESSAGE_BYTES) throw new Error(`steer message exceeds ${MAX_STEER_MESSAGE_BYTES} UTF-8 bytes.`);
+	if (payload.targetIndex !== undefined && (!Number.isInteger(payload.targetIndex) || payload.targetIndex < 0 || payload.targetIndex > 1_000_000)) {
+		throw new Error("steer targetIndex must be an integer between 0 and 1000000.");
 	}
+	if (payload.targetIndexes !== undefined && (
+		!Array.isArray(payload.targetIndexes)
+		|| payload.targetIndex !== undefined
+		|| payload.targetIndexes.length === 0
+		|| payload.targetIndexes.length > 1_000
+		|| payload.targetIndexes.some((index) => !Number.isInteger(index) || index < 0 || index > 1_000_000)
+		|| new Set(payload.targetIndexes).size !== payload.targetIndexes.length
+	)) {
+		throw new Error("steer targetIndexes must contain 1-1000 unique non-negative integers and cannot be combined with targetIndex.");
+	}
+	const closedPath = steerInboxClosedPath(asyncDir);
+	if (fs.existsSync(closedPath)) throw new Error("Async run no longer accepts steering requests.");
 	const request: SteerRequest = {
 		type: "steer",
 		id: payload.id ?? deps.randomId?.() ?? randomUUID(),
 		ts: payload.ts ?? deps.now?.() ?? Date.now(),
 		message,
+		...(payload.mode && payload.mode !== "steer" ? { mode: payload.mode } : {}),
 		...(payload.targetIndex !== undefined ? { targetIndex: payload.targetIndex } : {}),
+		...(payload.targetIndexes !== undefined ? { targetIndexes: [...payload.targetIndexes] } : {}),
 		...(payload.source ? { source: payload.source } : {}),
 	};
-	return writeSteerRequestToDir(steerRequestsDir(asyncDir), request);
-}
-
-export function enqueueStepSteer(asyncDir: string, index: number, request: SteerRequest): string {
-	if (!Number.isInteger(index) || index < 0) throw new Error("steer child index must be a non-negative integer.");
-	return writeSteerRequestToDir(stepSteerInboxDir(asyncDir, index), { ...request, targetIndex: index, type: "steer" });
+	const requestPath = writeSteerRequestToDir(steerRequestsDir(asyncDir), request);
+	if (fs.existsSync(closedPath)) {
+		fs.rmSync(requestPath, { force: true });
+		throw new Error("Async run stopped accepting steering before the request was committed.");
+	}
+	return requestPath;
 }
 
 function parseSteerRequest(raw: unknown): SteerRequest | undefined {
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
 	const input = raw as Partial<SteerRequest>;
-	if (input.type !== "steer") return undefined;
-	if (typeof input.id !== "string" || !input.id.trim()) return undefined;
-	if (typeof input.ts !== "number" || !Number.isFinite(input.ts)) return undefined;
-	if (typeof input.message !== "string" || !input.message.trim()) return undefined;
-	if (input.targetIndex !== undefined && (!Number.isInteger(input.targetIndex) || input.targetIndex < 0)) return undefined;
+	if (!validSteerRequest(input)) return undefined;
 	return {
 		type: "steer",
 		id: input.id.trim(),
 		ts: input.ts,
 		message: input.message.trim(),
+		...(input.mode ? { mode: input.mode } : {}),
 		...(input.targetIndex !== undefined ? { targetIndex: input.targetIndex } : {}),
+		...(input.targetIndexes !== undefined ? { targetIndexes: [...input.targetIndexes] } : {}),
 		...(typeof input.source === "string" && input.source.trim() ? { source: input.source } : {}),
 	};
 }
 
-export function consumeSteerRequestsFromDir(dir: string, fsImpl: Pick<typeof fs, "existsSync" | "rmSync" | "readdirSync" | "readFileSync"> = fs): SteerRequest[] {
-	if (!fsImpl.existsSync(dir)) return [];
+export function consumeSteerRequestsFromDir(dir: string, fsImpl: Pick<typeof fs, "existsSync" | "rmSync" | "readdirSync" | "readFileSync"> = fs, onError: (error: unknown) => void = () => {}): SteerRequest[] {
+	let entries: string[];
+	try {
+		entries = fsImpl.readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
+	} catch (error) {
+		// Leave requests in place so the periodic poll can retry the scan.
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") onError(error);
+		return [];
+	}
 	const requests: SteerRequest[] = [];
-	for (const entry of fsImpl.readdirSync(dir).filter((name) => name.endsWith(".json")).sort()) {
+	for (const entry of entries) {
 		const requestPath = path.join(dir, entry);
 		let parsed: SteerRequest | undefined;
+		let text: string;
 		try {
-			parsed = parseSteerRequest(JSON.parse(fsImpl.readFileSync(requestPath, "utf-8")));
+			text = fsImpl.readFileSync(requestPath, "utf-8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") onError(error);
+			continue;
+		}
+		try {
+			parsed = parseSteerRequest(JSON.parse(text));
 		} catch {
 			parsed = undefined;
 		}
 		try {
 			fsImpl.rmSync(requestPath, { recursive: true });
-		} catch {
+		} catch (error) {
 			// Already removed by a concurrent check — do not execute it twice.
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") onError(error);
 			continue;
 		}
 		if (parsed) requests.push(parsed);
@@ -208,8 +361,29 @@ export function consumeSteerRequestsFromDir(dir: string, fsImpl: Pick<typeof fs,
 	return requests.sort((left, right) => left.ts - right.ts || left.id.localeCompare(right.id));
 }
 
-export function consumeSteerRequests(asyncDir: string, fsImpl: Pick<typeof fs, "existsSync" | "rmSync" | "readdirSync" | "readFileSync"> = fs): SteerRequest[] {
-	return consumeSteerRequestsFromDir(steerRequestsDir(asyncDir), fsImpl);
+export function consumeSteerRequests(asyncDir: string, fsImpl: Pick<typeof fs, "existsSync" | "rmSync" | "readdirSync" | "readFileSync"> = fs, onError?: (error: unknown) => void): SteerRequest[] {
+	return consumeSteerRequestsFromDir(steerRequestsDir(asyncDir), fsImpl, onError);
+}
+
+export function queueRevivalBrief(asyncDir: string, request: SteerRequest): string {
+	const dir = path.join(controlInboxDir(asyncDir), REVIVAL_BRIEFS_DIR);
+	const queued = fs.existsSync(dir) ? fs.readdirSync(dir).filter((entry) => entry.endsWith(".json")).length : 0;
+	if (queued >= MAX_STEER_QUEUE_SIZE) throw new Error(`Follow-up queue is full (${MAX_STEER_QUEUE_SIZE} messages).`);
+	return writeSteerRequestToDir(dir, { ...request, mode: "follow_up" });
+}
+
+export function readRevivalBriefs(asyncDir: string): Array<{ request: SteerRequest; path: string }> {
+	const dir = path.join(controlInboxDir(asyncDir), REVIVAL_BRIEFS_DIR);
+	if (!fs.existsSync(dir)) return [];
+	return fs.readdirSync(dir).filter((entry) => entry.endsWith(".json")).sort().flatMap((entry) => {
+		const filePath = path.join(dir, entry);
+		try {
+			const request = parseSteerRequest(JSON.parse(fs.readFileSync(filePath, "utf-8")));
+			return request ? [{ request, path: filePath }] : [];
+		} catch {
+			return [];
+		}
+	});
 }
 
 /**
@@ -246,50 +420,98 @@ export function consumeTimeoutRequest(
 
 export function consumeStopRequest(
 	asyncDir: string,
-	fsImpl: Pick<typeof fs, "existsSync" | "rmSync"> = fs,
+	fsImpl: Pick<typeof fs, "existsSync" | "rmSync" | "readdirSync" | "readFileSync"> = fs,
 ): boolean {
-	const requestPath = stopRequestPath(asyncDir);
-	if (!fsImpl.existsSync(requestPath)) return false;
-	try {
-		fsImpl.rmSync(requestPath, { force: true, recursive: true });
-	} catch {
-		// Already removed by a concurrent check — still counts as consumed.
-	}
-	return true;
+	return consumeStopRequestPayload(asyncDir, fsImpl) !== undefined;
 }
 
-/**
- * Parent side: portable interrupt = authoritative file request + best-effort OS
- * signal. The signal is only a latency optimization on Unix; ENOSYS on Windows
- * is swallowed because the file inbox is authoritative there. Other signal
- * failures are surfaced because they usually mean the runner is not alive to
- * consume the request.
- */
+function parseStopRequest(raw: unknown): StopRequest | undefined {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const parsed = raw as Partial<StopRequest>;
+	if (parsed.type !== "stop") return undefined;
+	if (Object.hasOwn(parsed, "targetIndex") && !(Number.isInteger(parsed.targetIndex) && parsed.targetIndex! >= 0 && parsed.targetIndex! <= 1_000_000)) return undefined;
+	if (Object.hasOwn(parsed, "childId") && !validStopChildId(parsed.childId)) return undefined;
+	return {
+		type: "stop",
+		...(typeof parsed.ts === "number" ? { ts: parsed.ts } : {}),
+		...(typeof parsed.source === "string" ? { source: parsed.source } : {}),
+		...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}),
+		...(parsed.targetIndex !== undefined ? { targetIndex: parsed.targetIndex } : {}),
+		...(validStopChildId(parsed.childId) ? { childId: parsed.childId } : {}),
+	};
+}
+
+function consumeStopRequestFile(
+	requestPath: string,
+	fsImpl: Pick<typeof fs, "rmSync" | "readFileSync">,
+	onError?: (error: unknown) => void,
+): StopRequest | undefined {
+	let text: string;
+	try {
+		text = fsImpl.readFileSync(requestPath, "utf-8");
+	} catch (error) {
+		if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) onError?.(error);
+		return undefined;
+	}
+	let request: StopRequest | undefined;
+	try {
+		request = parseStopRequest(JSON.parse(text));
+	} catch {
+		request = undefined;
+	}
+	try {
+		fsImpl.rmSync(requestPath, { force: true, recursive: true });
+	} catch (error) {
+		// Execute only after successful removal.
+		if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) onError?.(error);
+		return undefined;
+	}
+	return request;
+}
+
+export function consumeStopRequestPayloads(
+	asyncDir: string,
+	fsImpl: Pick<typeof fs, "existsSync" | "rmSync" | "readdirSync" | "readFileSync"> = fs,
+	onError?: (error: unknown) => void,
+): StopRequest[] {
+	const dir = stopRequestsDir(asyncDir);
+	const requests: StopRequest[] = [];
+	if (fsImpl.existsSync(dir)) {
+		let entries: string[];
+		try {
+			entries = fsImpl.readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
+		} catch (error) {
+			if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) onError?.(error);
+			entries = [];
+		}
+		for (const entry of entries) {
+			const request = consumeStopRequestFile(path.join(dir, entry), fsImpl, onError);
+			if (request) requests.push(request);
+		}
+	}
+
+	const legacyPath = stopRequestPath(asyncDir);
+	if (fsImpl.existsSync(legacyPath)) {
+		const request = consumeStopRequestFile(legacyPath, fsImpl, onError);
+		if (request) requests.push(request);
+	}
+	return requests.sort((left, right) => (left.ts ?? 0) - (right.ts ?? 0));
+}
+
+export function consumeStopRequestPayload(
+	asyncDir: string,
+	fsImpl: Pick<typeof fs, "existsSync" | "rmSync" | "readdirSync" | "readFileSync"> = fs,
+): StopRequest | undefined {
+	return consumeStopRequestPayloads(asyncDir, fsImpl)[0];
+}
+
+/** Parent side: write the authoritative portable interrupt request. */
 export function deliverInterruptRequest(input: {
 	asyncDir: string;
-	pid?: number;
-	kill?: KillFn;
-	signal?: NodeJS.Signals;
 	now?: () => number;
 	source?: string;
 }): void {
-	const requestPath = requestAsyncInterrupt(input.asyncDir, input.source ? { source: input.source } : {}, { now: input.now });
-	if (typeof input.pid === "number" && input.pid > 0) {
-		try {
-			(input.kill ?? process.kill)(input.pid, input.signal ?? INTERRUPT_SIGNAL);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOSYS") {
-				// File inbox is authoritative when custom cross-process signals are unavailable.
-				return;
-			}
-			try {
-				fs.rmSync(requestPath, { force: true });
-			} catch {
-				// Best effort cleanup; the caller still gets the signal failure.
-			}
-			throw error;
-		}
-	}
+	requestAsyncInterrupt(input.asyncDir, input.source ? { source: input.source } : {}, { now: input.now });
 }
 
 export function deliverTimeoutRequest(input: {
@@ -310,74 +532,145 @@ export function deliverStopRequest(input: {
 	signal?: NodeJS.Signals;
 	now?: () => number;
 	source?: string;
+	targetIndex?: number;
+	childId?: string;
 }): void {
-	requestAsyncStop(input.asyncDir, input.source ? { source: input.source } : {}, { now: input.now });
+	requestAsyncStop(input.asyncDir, { ...(input.source ? { source: input.source } : {}), ...(input.targetIndex !== undefined ? { targetIndex: input.targetIndex } : {}), ...(input.childId ? { childId: input.childId } : {}) }, { now: input.now });
 }
 
+
 /**
- * Runner side: watch the control inbox and route interrupt requests into
- * `onInterrupt`. Uses `fs.watch` when available plus an interval poll as a
- * portable safety net (covers filesystems/platforms where `fs.watch` is
- * unreliable). Fires once per distinct request. Returns a disposer.
+ * Active owner: watch and consume only kinds with installed handlers.
+ * Uses `fs.watch` when available and starts interval polling
+ * only when native watching is unavailable or fails. Fires once per distinct
+ * request. Returns a disposer.
  */
 export function watchAsyncControlInbox(
 	asyncDir: string,
 	opts: {
-		onInterrupt: () => void;
+		onInterrupt?: () => void;
 		onTimeout?: () => void;
-		onStop?: () => void;
+		onStop?: (request: StopRequest) => void;
 		onSteer?: (request: SteerRequest) => void;
+		onCommand?: (request: CommandRequest) => void;
+		onError?: (error: unknown, phase: "install" | "scan" | "callback", request?: SteerRequest) => void;
 		pollIntervalMs?: number;
+		safetyPollIntervalMs?: number;
+		platform?: NodeJS.Platform;
 		fs?: ControlChannelFs;
 		timers?: ControlChannelTimers;
+		now?: () => number;
 	},
 ): () => void {
 	const fsImpl = opts.fs ?? fs;
 	const timers = opts.timers ?? { setInterval, clearInterval };
 	const dir = controlInboxDir(asyncDir);
+	const report = (error: unknown, phase: "install" | "scan" | "callback", request?: SteerRequest): void => {
+		try {
+			if (opts.onError) opts.onError(error, phase, request);
+			else console.error(`Control inbox ${phase} failed:`, error);
+		} catch (reportError) {
+			console.error("Control inbox error reporter failed:", reportError);
+		}
+	};
+	// A scan failing the same way (a Windows EPERM wrote gigabytes of identical traces) is reported once, then one count per interval, until a clean scan.
+	const repeatedScanErrors = new Map<string, { suppressed: number; since: number }>();
+	let scanFailed = false;
+	const reportScan = (error: unknown): void => {
+		scanFailed = true;
+		const text = error instanceof Error ? error.message : String(error);
+		const now = (opts.now ?? Date.now)();
+		const repeated = repeatedScanErrors.get(text);
+		if (!repeated) {
+			repeatedScanErrors.set(text, { suppressed: 0, since: now });
+			report(error, "scan");
+			return;
+		}
+		repeated.suppressed++;
+		if (now - repeated.since < REPEATED_SCAN_ERROR_SUMMARY_MS) return;
+		report(`${repeated.suppressed} more identical failures in the last ${Math.round((now - repeated.since) / 1000)}s: ${text}`, "scan");
+		repeated.suppressed = 0;
+		repeated.since = now;
+	};
+	const dirs = [
+		...(opts.onInterrupt || opts.onTimeout || opts.onStop ? [dir] : []),
+		...(opts.onStop ? [stopRequestsDir(asyncDir)] : []),
+		...(opts.onSteer ? [steerRequestsDir(asyncDir)] : []),
+		...(opts.onCommand ? [commandRequestsDir(asyncDir)] : []),
+	];
+	if (dirs.length === 0) return () => {};
 	try {
-		fsImpl.mkdirSync(dir, { recursive: true });
-	} catch {
-		// Best effort — the poll/watch below tolerates a missing dir.
+		for (const target of dirs) fsImpl.mkdirSync(target, { recursive: true });
+	} catch (error) {
+		report(error, "install");
 	}
 
 	let disposed = false;
 	const check = (): void => {
 		if (disposed) return;
+		scanFailed = false;
 		try {
-			if (consumeStopRequest(asyncDir, fsImpl)) opts.onStop?.();
-			if (consumeTimeoutRequest(asyncDir, fsImpl)) opts.onTimeout?.();
-			if (consumeInterruptRequest(asyncDir, fsImpl)) opts.onInterrupt();
-			for (const request of consumeSteerRequests(asyncDir, fsImpl)) opts.onSteer?.(request);
-		} catch {
-			// Never let inbox errors crash the runner.
+			if (opts.onCommand) for (const request of consumeCommandRequests(asyncDir, fsImpl)) {
+				try { opts.onCommand(request); } catch (error) { report(error, "callback"); }
+			}
+			if (opts.onStop) for (const request of consumeStopRequestPayloads(asyncDir, fsImpl, reportScan)) {
+				try { opts.onStop(request); } catch (error) { report(error, "callback"); }
+			}
+			if (opts.onTimeout && consumeTimeoutRequest(asyncDir, fsImpl)) {
+				try { opts.onTimeout(); } catch (error) { report(error, "callback"); }
+			}
+			if (opts.onInterrupt && consumeInterruptRequest(asyncDir, fsImpl)) {
+				try { opts.onInterrupt(); } catch (error) { report(error, "callback"); }
+			}
+			if (opts.onSteer) for (const request of consumeSteerRequestsFromDir(steerRequestsDir(asyncDir), fsImpl, reportScan)) {
+				try { opts.onSteer(request); } catch (error) { report(error, "callback", request); }
+			}
+		} catch (error) {
+			reportScan(error);
 		}
+		if (!scanFailed) repeatedScanErrors.clear();
 	};
 
 	// Handle a request that may have arrived before the watcher started.
 	check();
 
-	let watcher: fs.FSWatcher | undefined;
+	const watchers: fs.FSWatcher[] = [];
+	let interval: ReturnType<typeof setInterval> | undefined;
+	let safetyInterval: ReturnType<typeof setInterval> | undefined;
+	const startPolling = (): void => {
+		if (interval || disposed) return;
+		if (safetyInterval) { timers.clearInterval(safetyInterval); safetyInterval = undefined; }
+		interval = timers.setInterval(check, opts.pollIntervalMs ?? POLL_INTERVAL_MS);
+		interval.unref?.();
+	};
 	try {
-		watcher = fsImpl.watch(resolveWatchPath(dir, fsImpl.realpathSync.native), () => check());
-		watcher.on?.("error", () => {
-			// fs.watch can emit on transient FS errors; the interval poll keeps us live.
-		});
+		if (shouldUseNativeFsWatch("runner-control-inbox", opts.platform)) {
+			for (const target of dirs) {
+				const watcher = fsImpl.watch(resolveWatchPath(target, fsImpl.realpathSync.native), check);
+				watcher.on?.("error", startPolling);
+				watchers.push(watcher);
+			}
+			if (!interval) {
+				safetyInterval = timers.setInterval(check, opts.safetyPollIntervalMs ?? CONTROL_SAFETY_POLL_INTERVAL_MS);
+				safetyInterval.unref?.();
+			}
+		} else {
+			startPolling();
+		}
 	} catch {
-		watcher = undefined;
+		startPolling();
 	}
-
-	const interval = timers.setInterval(check, opts.pollIntervalMs ?? POLL_INTERVAL_MS);
-	interval.unref?.();
-
 	return () => {
 		if (disposed) return;
 		disposed = true;
-		try {
-			watcher?.close();
-		} catch {
-			// ignore
+		for (const watcher of watchers) {
+			try {
+				watcher.close();
+			} catch {
+				// ignore
+			}
 		}
-		timers.clearInterval(interval);
+		if (interval) timers.clearInterval(interval);
+		if (safetyInterval) timers.clearInterval(safetyInterval);
 	};
 }

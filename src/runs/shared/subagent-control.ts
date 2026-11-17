@@ -6,6 +6,9 @@ import {
 	type ControlNotificationChannel,
 	type ResolvedControlConfig,
 } from "../../shared/types.ts";
+import { isToolTimeoutExempt } from "./tool-timeout.ts";
+import { createHash } from "node:crypto";
+import { previewDisplayText } from "../../shared/display-text.ts";
 
 const CONTROL_EVENT_TYPES: ControlEventType[] = ["active_long_running", "needs_attention"];
 const CONTROL_NOTIFICATION_CHANNELS: ControlNotificationChannel[] = ["event", "async", "intercom"];
@@ -14,6 +17,7 @@ const DEFAULT_NOTIFY_ON: ControlEventType[] = ["active_long_running", "needs_att
 export const DEFAULT_CONTROL_CONFIG: ResolvedControlConfig = {
 	enabled: true,
 	needsAttentionAfterMs: 60_000,
+	needsAttentionAfterMsIsExplicit: false,
 	activeNoticeAfterMs: 240_000,
 	failedToolAttemptsBeforeAttention: 3,
 	notifyOn: DEFAULT_NOTIFY_ON,
@@ -39,9 +43,14 @@ export function resolveControlConfig(
 	override?: ControlConfig,
 ): ResolvedControlConfig {
 	const enabled = override?.enabled ?? globalConfig?.enabled ?? DEFAULT_CONTROL_CONFIG.enabled;
-	const needsAttentionAfterMs = parsePositiveInt(override?.needsAttentionAfterMs)
-		?? parsePositiveInt(globalConfig?.needsAttentionAfterMs)
+	const overrideNeedsAttentionAfterMs = parsePositiveInt(override?.needsAttentionAfterMs);
+	const globalNeedsAttentionAfterMs = parsePositiveInt(globalConfig?.needsAttentionAfterMs);
+	const globalNeedsAttentionAfterMsIsExplicit = (globalConfig as Partial<ResolvedControlConfig> | undefined)?.needsAttentionAfterMsIsExplicit ?? globalNeedsAttentionAfterMs !== undefined;
+	const needsAttentionAfterMs = overrideNeedsAttentionAfterMs
+		?? globalNeedsAttentionAfterMs
 		?? DEFAULT_CONTROL_CONFIG.needsAttentionAfterMs;
+	const needsAttentionAfterMsIsExplicit = overrideNeedsAttentionAfterMs !== undefined
+		|| globalNeedsAttentionAfterMsIsExplicit;
 	const activeNoticeAfterMs = parsePositiveInt(override?.activeNoticeAfterMs)
 		?? parsePositiveInt(globalConfig?.activeNoticeAfterMs)
 		?? DEFAULT_CONTROL_CONFIG.activeNoticeAfterMs;
@@ -61,6 +70,7 @@ export function resolveControlConfig(
 	return {
 		enabled,
 		needsAttentionAfterMs,
+		needsAttentionAfterMsIsExplicit,
 		activeNoticeAfterMs,
 		activeNoticeAfterTurns,
 		activeNoticeAfterTokens,
@@ -70,17 +80,47 @@ export function resolveControlConfig(
 	};
 }
 
+function scaledNeedsAttentionAfterMs(config: ResolvedControlConfig, thinking?: string | false): number {
+	if (config.needsAttentionAfterMsIsExplicit !== false) return config.needsAttentionAfterMs;
+	switch (thinking) {
+		case "medium":
+			return config.needsAttentionAfterMs * 2;
+		case "high":
+			return config.needsAttentionAfterMs * 5;
+		case "xhigh":
+		case "max":
+			return config.needsAttentionAfterMs * 10;
+		default:
+			return config.needsAttentionAfterMs;
+	}
+}
+
 export function deriveActivityState(input: {
 	config: ResolvedControlConfig;
 	startedAt: number;
 	lastActivityAt?: number;
+	turnCount?: number;
+	currentTool?: string;
+	thinking?: string | false;
 	now?: number;
 }): ActivityState | undefined {
-	if (!input.config.enabled) return undefined;
+	if (!input.config.enabled || input.currentTool || (input.turnCount ?? 0) === 0) return undefined;
 	const now = input.now ?? Date.now();
 	const lastActivity = input.lastActivityAt ?? input.startedAt;
 	const ageMs = Math.max(0, now - lastActivity);
-	return ageMs > input.config.needsAttentionAfterMs ? "needs_attention" : undefined;
+	return ageMs > scaledNeedsAttentionAfterMs(input.config, input.thinking) ? "needs_attention" : undefined;
+}
+
+export function shouldEmitOpenToolAttention(input: {
+	config: ResolvedControlConfig;
+	currentTool?: string;
+	currentToolStartedAt?: number;
+	now?: number;
+}): boolean {
+	if (!input.config.enabled || !input.currentTool || input.currentToolStartedAt === undefined) return false;
+	if (isToolTimeoutExempt(input.currentTool)) return false;
+	const now = input.now ?? Date.now();
+	return Math.max(0, now - input.currentToolStartedAt) >= input.config.activeNoticeAfterMs;
 }
 
 export function buildControlEvent(input: {
@@ -98,10 +138,16 @@ export function buildControlEvent(input: {
 	tokens?: number;
 	toolCount?: number;
 	currentTool?: string;
+	toolCallId?: string;
+	hasCommandController?: boolean;
 	currentToolDurationMs?: number;
 	currentPath?: string;
 	elapsedMs?: number;
 	recentFailureSummary?: string;
+	workflowKey?: string;
+	phase?: string;
+	label?: string;
+	taskPreview?: string;
 }): ControlEvent {
 	const ts = input.ts ?? Date.now();
 	const type = input.type ?? (input.to === "active_long_running" ? "active_long_running" : "needs_attention");
@@ -126,10 +172,16 @@ export function buildControlEvent(input: {
 		...(input.tokens !== undefined ? { tokens: input.tokens } : {}),
 		...(input.toolCount !== undefined ? { toolCount: input.toolCount } : {}),
 		...(input.currentTool ? { currentTool: input.currentTool } : {}),
+		...(input.toolCallId ? { toolCallId: input.toolCallId } : {}),
+		...(input.hasCommandController !== undefined ? { hasCommandController: input.hasCommandController } : {}),
 		...(input.currentToolDurationMs !== undefined ? { currentToolDurationMs: input.currentToolDurationMs } : {}),
 		...(input.currentPath ? { currentPath: input.currentPath } : {}),
 		...(elapsedMs !== undefined ? { elapsedMs } : {}),
 		...(input.recentFailureSummary ? { recentFailureSummary: input.recentFailureSummary } : {}),
+		...(input.workflowKey ? { workflowKey: input.workflowKey } : {}),
+		...(input.phase ? { phase: input.phase } : {}),
+		...(input.label ? { label: input.label } : {}),
+		...(input.taskPreview ? { taskPreview: previewDisplayText(input.taskPreview, 160) } : {}),
 	};
 }
 
@@ -139,7 +191,9 @@ export function shouldNotifyControlEvent(config: ResolvedControlConfig, event: C
 
 export function controlNotificationKey(event: ControlEvent, childIntercomTarget?: string): string {
 	const childKey = childIntercomTarget ?? (event.index !== undefined ? `${event.runId}:${event.index}` : event.runId);
-	return `${childKey}:${event.type}:${event.reason ?? "idle"}`;
+	const contextHash = createHash("sha256").update(formatControlNudge(event)).digest("hex").slice(0, 8);
+	const callKey = event.reason === "tool_open_threshold" && event.toolCallId ? `:${event.toolCallId}` : "";
+	return `${childKey}:${event.type}:${event.reason ?? "idle"}${callKey}:${contextHash}`;
 }
 
 export function claimControlNotification(config: ResolvedControlConfig, event: ControlEvent, seenKeys: Set<string>, childIntercomTarget?: string): boolean {
@@ -161,60 +215,80 @@ function formatLongRunningFacts(event: ControlEvent): string | undefined {
 	return facts.length > 0 ? facts.join(" | ") : undefined;
 }
 
-export function formatControlNoticeMessage(event: ControlEvent, childIntercomTarget?: string): string {
-	const runTarget = event.runId;
-	if (event.reason === "completion_guard") {
-		return [
-			`Subagent failed: ${event.agent}`,
-			`Run: ${runTarget}${event.index !== undefined ? ` step ${event.index + 1}` : ""}`,
-			`Signal: ${event.message}`,
-			"Next: read the output artifact or session from the subagent result, then retry with a more explicit implementation prompt or handle the fix directly.",
-			childIntercomTarget ? `Run intercom target (may be inactive): ${childIntercomTarget}` : undefined,
-		].filter((line): line is string => Boolean(line)).join("\n");
+export function formatControlNudge(event: ControlEvent): string {
+	const scope = event.label ?? event.phase ?? event.workflowKey ?? event.taskPreview;
+	if (event.recentFailureSummary) return previewDisplayText(`Resolve the recent failure${scope ? ` for ${scope}` : ""}: ${event.recentFailureSummary}. Report the smallest next step or ask for a decision.`, 160);
+	if (event.currentTool || event.currentPath) {
+		const current = [event.currentTool ? `tool ${event.currentTool}` : undefined, event.currentPath ? `path ${event.currentPath}` : undefined].filter(Boolean).join(" at ");
+		return previewDisplayText(`Check ${current}${scope ? ` for ${scope}` : ""}. Report the smallest next step or ask for a decision.`, 160);
 	}
-
-	const nudgeMessage = "What are you blocked on? Reply with the smallest next step or ask for a decision.";
-	const nudgeCommand = `subagent({ action: "resume", id: "${runTarget}", ${event.index !== undefined ? `index: ${event.index}, ` : ""}message: "${nudgeMessage}" })`;
-	if (event.type === "active_long_running") {
-		const facts = formatLongRunningFacts(event);
-		return [
-			`Subagent active but long-running: ${event.agent}`,
-			`Run: ${runTarget}${event.index !== undefined ? ` step ${event.index + 1}` : ""}`,
-			`Signal: ${event.message}`,
-			facts ? `Facts: ${facts}` : undefined,
-			"Hint: Inspect status, then nudge if the work seems stuck. Live async nudges interrupt the child before sending the follow-up.",
-			`Nudge: ${nudgeCommand}`,
-			childIntercomTarget ? `Direct intercom target: ${childIntercomTarget}` : undefined,
-			`Status: subagent({ action: "status", id: "${runTarget}" })`,
-			`Interrupt: subagent({ action: "interrupt", id: "${runTarget}" })`,
-		].filter((line): line is string => Boolean(line)).join("\n");
-	}
-
-	return [
-		`Subagent needs attention: ${event.agent}`,
-		`Run: ${runTarget}${event.index !== undefined ? ` step ${event.index + 1}` : ""}`,
-		`Signal: ${event.message}`,
-		event.recentFailureSummary ? `Recent failures: ${event.recentFailureSummary}` : undefined,
-		"Hint: Inspect status first unless the run is clearly blocked. Live async nudges interrupt the child before sending the follow-up.",
-		`Nudge: ${nudgeCommand}`,
-		childIntercomTarget ? `Direct intercom target: ${childIntercomTarget}` : undefined,
-		`Status: subagent({ action: "status", id: "${runTarget}" })`,
-		`Interrupt: subagent({ action: "interrupt", id: "${runTarget}" })`,
-	].filter((line): line is string => Boolean(line)).join("\n");
+	if (scope) return previewDisplayText(`Continue ${scope}. Report the smallest next step or ask for a decision.`, 160);
+	return "What are you blocked on? Reply with the smallest next step or ask for a decision.";
 }
 
+export function formatControlNoticeMessage(event: ControlEvent, childIntercomTarget?: string): string {
+	const runTarget = event.runId;
+	const nudgeMessage = formatControlNudge(event);
+	const steerCommand = `subagent({ action: "steer", id: "${runTarget}", message: ${JSON.stringify(nudgeMessage)}${event.index !== undefined ? `, options: { index: ${event.index} }` : ""} })`;
+	const nestedResumeCommand = `subagent({ action: "resume", id: "${runTarget}", message: ${JSON.stringify(nudgeMessage)} })`;
+	const facts = formatLongRunningFacts(event);
+	const head = (title: string) => [
+		`${title}: ${event.agent}`,
+		`Run: ${runTarget}${event.index !== undefined ? ` step ${event.index + 1}` : ""}`,
+		`Signal: ${event.message}`,
+		facts ? `Facts: ${facts}` : undefined,
+	];
+	const status = `Status: subagent({ action: "status", id: "${runTarget}" })`;
+	const lines = (items: Array<string | undefined>) => items.filter((line): line is string => Boolean(line)).join("\n");
+	if (event.type === "active_long_running") {
+		return lines([
+			...head("Subagent active but long-running"),
+			"Hint: Inspect status first. Use steer for a top-level live async child, routed resume for a live nested child, or resume to revive a paused/completed/failed child.",
+			`Top-level live async nudge: ${steerCommand}`,
+			`Routed live nested nudge: ${nestedResumeCommand}`,
+			childIntercomTarget ? `Direct intercom target: ${childIntercomTarget}` : undefined,
+			status,
+			`Interrupt: subagent({ action: "interrupt", id: "${runTarget}" })`,
+		]);
+	}
+
+	if (event.reason === "tool_open_threshold" && event.currentTool === "bash") {
+		const command = (label: string, action: string) => `${label}: subagent(${JSON.stringify({ action, id: runTarget, options: { ...(event.index !== undefined ? { index: event.index } : {}), toolCallId: event.toolCallId } })})`;
+		return lines([
+			...head("Subagent needs attention"),
+			"Hint: Inspect the running command and recent output before nudging. A queued steer does not cancel an in-flight bash call. A dev server or watch command may intentionally never return. Elapsed time alone does not prove the command is stuck.",
+			"Recovery: For a local Pi child explicitly granted subagent_command, yield a needed persistent command or cancel the exact incorrect command, then steer the child. Query command.status to confirm the result. If command controls are unavailable, inspect partial changes and interruption scope before interrupt/resume; interrupt is run-scoped and may affect siblings.",
+			...(event.toolCallId && event.hasCommandController ? [command("Command", "command.status"), command("Yield", "command.yield"), command("Cancel", "command.cancel")] : []),
+			status,
+			`Transcript: subagent({ action: "status", id: "${runTarget}", options: { view: "transcript"${event.index !== undefined ? `, index: ${event.index}` : ""} } })`,
+		]);
+	}
+
+	const supervisorHint = event.reason === "supervisor_request"
+		? "Supervisor request: reply to the pending request. If subagent_supervisor pending is empty, check intercom pending because an external intercom tool may own the request."
+		: undefined;
+	return lines([
+		...head("Subagent needs attention"),
+		event.recentFailureSummary ? `Recent failures: ${event.recentFailureSummary}` : undefined,
+		supervisorHint,
+		"Hint: Inspect status first unless the run is clearly blocked. Use steer for a top-level live async child, routed resume for a live nested child, or resume to revive a paused/completed/failed child.",
+		`Top-level live async nudge: ${steerCommand}`,
+		`Routed live nested nudge: ${nestedResumeCommand}`,
+		childIntercomTarget ? `Direct intercom target: ${childIntercomTarget}` : undefined,
+		status,
+		`Interrupt: subagent({ action: "interrupt", id: "${runTarget}" })`,
+	]);
+}
+
+
 export function formatControlIntercomMessage(event: ControlEvent, childIntercomTarget?: string): string {
-	const statusLabel = event.reason === "completion_guard"
-		? "subagent failed"
-		: event.type === "active_long_running"
+	const statusLabel = event.type === "active_long_running"
 			? "subagent active but long-running"
 			: "subagent needs attention";
 	return [
 		statusLabel,
 		"",
-		event.reason === "completion_guard"
-			? `${event.agent} failed in run ${event.runId}.`
-			: event.type === "active_long_running"
+		event.type === "active_long_running"
 				? `${event.agent} is still active but long-running in run ${event.runId}.`
 				: `${event.agent} needs attention in run ${event.runId}.`,
 		"",

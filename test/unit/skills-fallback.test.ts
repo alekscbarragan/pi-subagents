@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -51,6 +52,13 @@ async function importSkillsFresh() {
 	return await import(`${pathToFileURL(modulePath).href}?bust=${bust}`) as typeof import("../../src/agents/skills.ts");
 }
 
+async function importAgentsFresh() {
+	const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+	const modulePath = path.resolve(projectRoot, "src/agents/agents.ts");
+	const bust = `${Date.now()}-${Math.random()}`;
+	return await import(`${pathToFileURL(modulePath).href}?bust=${bust}`) as typeof import("../../src/agents/agents.ts");
+}
+
 describe("skills filesystem fallback", () => {
 	beforeEach(() => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-skills-fallback-"));
@@ -70,6 +78,29 @@ describe("skills filesystem fallback", () => {
 		assert.ok(discovered, "expected fallback-skill to be discovered");
 		assert.equal(discovered?.source, "project");
 		assert.equal(discovered?.description, "Test description");
+	});
+
+	it("reads block scalar descriptions for discovery and child injection", () => {
+		const cases = [
+			["|", "first line\nsecond line"],
+			["|-", "first line\nsecond line"],
+			[">", "first line second line"],
+			[">-", "first line second line"],
+		] as const;
+
+		for (const [index, [indicator]] of cases.entries()) {
+			makeProjectSkill(tempDir, `block-scalar-${index}`, "Use block scalar metadata.", `${indicator}\n  first line\n  second line`);
+		}
+
+		for (const [index, [, description]] of cases.entries()) {
+			const name = `block-scalar-${index}`;
+			const discovered = discoverAvailableSkills(tempDir).find((skill) => skill.name === name);
+			assert.equal(discovered?.description, description);
+
+			const { resolved, missing } = resolveSkills([name], tempDir);
+			assert.deepEqual(missing, []);
+			assert.match(buildSkillInjection(resolved), new RegExp(`<description>${description.replace("\n", "\\n")}</description>`));
+		}
 	});
 
 	it("discovers project skills nested below grouping directories", () => {
@@ -273,6 +304,21 @@ describe("skills filesystem fallback", () => {
 		assert.equal(resolved[0]?.source, "project-package");
 	});
 
+	it("skips settings package entries that name a single extension file", () => {
+		fs.mkdirSync(path.join(tempDir, ".pi", "extensions"), { recursive: true });
+		fs.writeFileSync(path.join(tempDir, ".pi", "extensions", "my-extension.ts"), "export default () => {};\n", "utf-8");
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["./extensions/my-extension.ts"] }, null, 2),
+			"utf-8",
+		);
+		makeProjectSkill(tempDir, "project-skill", "Project skill.");
+
+		const { resolved, missing } = resolveSkills(["project-skill"], tempDir);
+		assert.deepEqual(missing, []);
+		assert.equal(resolved.length, 1);
+	});
+
 	it("discovers skills from project settings npm package sources", () => {
 		const packageRoot = path.join(tempDir, ".pi", "npm", "node_modules", "@scope", "skill-package");
 		makePackageSkill(
@@ -301,6 +347,223 @@ describe("skills filesystem fallback", () => {
 		assert.deepEqual(missing, []);
 		assert.equal(resolved.length, 1);
 		assert.equal(resolved[0]?.source, "project-package");
+	});
+
+	it("skips optional global npm discovery in offline mode", () => {
+		const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+		const binDir = path.join(tempDir, "bin");
+		const fakeHome = path.join(tempDir, "home");
+		const marker = path.join(tempDir, "npm-calls.txt");
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.mkdirSync(fakeHome, { recursive: true });
+		fs.writeFileSync(
+			path.join(binDir, "npm"),
+			"#!/bin/sh\nprintf 'npm-root-called\\n' >> \"$PI_DISCOVERY_MARKER\"\nexit 1\n",
+			{ encoding: "utf-8", mode: 0o755 },
+		);
+		fs.writeFileSync(
+			path.join(binDir, "npm.cmd"),
+			"@echo off\r\n>>\"%PI_DISCOVERY_MARKER%\" echo npm-root-called\r\nexit /b 1\r\n",
+			"utf-8",
+		);
+
+		const script = `
+			import fs from "node:fs";
+			const [{ clearSkillCache, discoverAvailableSkills }, { discoverAgents }] = await Promise.all([
+				import("./src/agents/skills.ts"),
+				import("./src/agents/agents.ts"),
+			]);
+			discoverAvailableSkills(process.cwd());
+			discoverAgents(process.cwd(), "both");
+			if (fs.existsSync(process.env.PI_DISCOVERY_MARKER)) {
+				throw new Error("npm was invoked while PI_OFFLINE was enabled");
+			}
+			delete process.env.PI_OFFLINE;
+			clearSkillCache();
+			discoverAvailableSkills(process.cwd());
+			discoverAgents(process.cwd(), "both");
+		`;
+		execFileSync(
+			process.execPath,
+			["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script],
+			{
+				cwd: projectRoot,
+				env: {
+					...process.env,
+					HOME: fakeHome,
+					USERPROFILE: fakeHome,
+					PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+					PI_DISCOVERY_MARKER: marker,
+					PI_OFFLINE: "1",
+				},
+				stdio: "pipe",
+			},
+		);
+		assert.deepEqual(fs.readFileSync(marker, "utf-8").trim().split(/\r?\n/), ["npm-root-called", "npm-root-called"]);
+	});
+
+	it("keeps optional global discovery silent when no package manager is available", () => {
+		const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+		const emptyBinDir = path.join(tempDir, "empty-bin");
+		fs.mkdirSync(emptyBinDir, { recursive: true });
+
+		const script = `
+			const [{ discoverAvailableSkills }, { discoverAgents }] = await Promise.all([
+				import("./src/agents/skills.ts"),
+				import("./src/agents/agents.ts"),
+			]);
+			discoverAvailableSkills(process.cwd());
+			discoverAgents(process.cwd(), "both");
+		`;
+		const result = spawnSync(process.execPath, [
+			"--experimental-strip-types",
+			"--import",
+			"./test/support/isolated-temp-root.mjs",
+			"--input-type=module",
+			"--eval",
+			script,
+		], {
+			cwd: projectRoot,
+			env: {
+				...process.env,
+				PATH: emptyBinDir,
+				PI_OFFLINE: "",
+			},
+			encoding: "utf-8",
+		});
+		assert.equal(result.status, 0, result.stderr);
+		assert.equal(result.stderr, "", `optional global discovery leaked stderr: ${result.stderr}`);
+	});
+
+	it("uses the Windows APPDATA npm root without invoking npm", async () => {
+		const appData = path.join(tempDir, "appdata");
+		const packageRoot = path.join(appData, "npm", "node_modules", "windows-global-package");
+		const marker = path.join(tempDir, "npm-called");
+		const binDir = path.join(tempDir, "bin");
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(binDir, "npm"),
+			`#!/bin/sh\ntouch "${marker}"\nexit 1\n`,
+			{ encoding: "utf-8", mode: 0o755 },
+		);
+		writeSkillFile(path.join(packageRoot, "skills", "windows-global-skill"), "Use the Windows global skill.");
+		fs.writeFileSync(
+			path.join(packageRoot, "package.json"),
+			JSON.stringify({
+				name: "windows-global-package",
+				pi: { skills: ["./skills"] },
+				"pi-subagents": { agents: ["./agents"] },
+			}, null, 2),
+			"utf-8",
+		);
+		fs.mkdirSync(path.join(packageRoot, "agents"), { recursive: true });
+		fs.writeFileSync(path.join(packageRoot, "agents", "windows-global-agent.md"), `---
+name: windows-global-agent
+description: Loaded from the Windows global npm root.
+---
+
+Windows global agent.
+`, "utf-8");
+
+		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		const previousAppData = process.env.APPDATA;
+		const previousPath = process.env.PATH;
+		try {
+			Object.defineProperty(process, "platform", { value: "win32" });
+			process.env.APPDATA = appData;
+			process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+
+			const skills = await importSkillsFresh();
+			assert.ok(skills.discoverAvailableSkills(tempDir).some((skill) => skill.name === "windows-global-skill"));
+
+			const agents = await importAgentsFresh();
+			assert.ok(agents.discoverAgents(tempDir, "both").agents.some((agent) => agent.name === "windows-global-agent"));
+			assert.equal(fs.existsSync(marker), false, "npm root -g should not run when APPDATA has a global root");
+		} finally {
+			if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+			if (previousAppData === undefined) delete process.env.APPDATA;
+			else process.env.APPDATA = previousAppData;
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+		}
+	});
+
+	it("falls back to npm when the Windows APPDATA npm root is invalid", async () => {
+		const appData = path.join(tempDir, "appdata-file");
+		const fallbackRoot = path.join(tempDir, "fallback-global-root");
+		const packageRoot = path.join(fallbackRoot, "fallback-global-package");
+		const marker = path.join(tempDir, "npm-called");
+		const binDir = path.join(tempDir, "bin");
+		fs.mkdirSync(path.join(appData, "npm"), { recursive: true });
+		fs.writeFileSync(path.join(appData, "npm", "node_modules"), "not a directory", "utf-8");
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(binDir, "npm"),
+			`#!/bin/sh\ntouch "$PI_TEST_NPM_MARKER"\nprintf '%s\\n' "$PI_TEST_FALLBACK_ROOT"\n`,
+			{ encoding: "utf-8", mode: 0o755 },
+		);
+		fs.writeFileSync(
+			path.join(binDir, "npm.cmd"),
+			`@echo off\r\necho called > "%PI_TEST_NPM_MARKER%"\r\necho %PI_TEST_FALLBACK_ROOT%\r\n`,
+			"utf-8",
+		);
+		fs.writeFileSync(
+			path.join(binDir, "cmd.exe"),
+			`#!/bin/sh\nexec sh -c "npm root -g"\n`,
+			{ encoding: "utf-8", mode: 0o755 },
+		);
+		writeSkillFile(path.join(packageRoot, "skills", "fallback-global-skill"), "Use the fallback global skill.");
+		fs.writeFileSync(
+			path.join(packageRoot, "package.json"),
+			JSON.stringify({
+				name: "fallback-global-package",
+				pi: { skills: ["./skills"] },
+				"pi-subagents": { agents: ["./agents"] },
+			}, null, 2),
+			"utf-8",
+		);
+		fs.mkdirSync(path.join(packageRoot, "agents"), { recursive: true });
+		fs.writeFileSync(path.join(packageRoot, "agents", "fallback-global-agent.md"), `---
+name: fallback-global-agent
+description: Loaded from npm fallback global root.
+---
+
+Fallback global agent.
+`, "utf-8");
+
+		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		const previousAppData = process.env.APPDATA;
+		const previousPath = process.env.PATH;
+		const previousComSpec = process.env.ComSpec;
+		const previousMarkerEnv = process.env.PI_TEST_NPM_MARKER;
+		const previousFallbackRootEnv = process.env.PI_TEST_FALLBACK_ROOT;
+		try {
+			Object.defineProperty(process, "platform", { value: "win32" });
+			process.env.APPDATA = appData;
+			process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+			if (os.platform() !== "win32") process.env.ComSpec = path.join(binDir, "cmd.exe");
+			process.env.PI_TEST_NPM_MARKER = marker;
+			process.env.PI_TEST_FALLBACK_ROOT = fallbackRoot;
+
+			const skills = await importSkillsFresh();
+			assert.ok(skills.discoverAvailableSkills(tempDir).some((skill) => skill.name === "fallback-global-skill"));
+
+			const agents = await importAgentsFresh();
+			assert.ok(agents.discoverAgents(tempDir, "both").agents.some((agent) => agent.name === "fallback-global-agent"));
+			assert.equal(fs.existsSync(marker), true, "npm root -g should run when APPDATA root is invalid");
+		} finally {
+			if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+			if (previousAppData === undefined) delete process.env.APPDATA;
+			else process.env.APPDATA = previousAppData;
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			if (previousComSpec === undefined) delete process.env.ComSpec;
+			else process.env.ComSpec = previousComSpec;
+			if (previousMarkerEnv === undefined) delete process.env.PI_TEST_NPM_MARKER;
+			else process.env.PI_TEST_NPM_MARKER = previousMarkerEnv;
+			if (previousFallbackRootEnv === undefined) delete process.env.PI_TEST_FALLBACK_ROOT;
+			else process.env.PI_TEST_FALLBACK_ROOT = previousFallbackRootEnv;
+		}
 	});
 
 	it("falls back to the runtime cwd when the execution cwd lacks the skill", () => {

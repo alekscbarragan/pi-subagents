@@ -123,30 +123,34 @@ describe("dynamic fanout helpers", () => {
 		}
 	});
 
-	it("accepts a runner-injected parentSessionId on the parallel template but keeps it out of user-facing validation", () => {
+	it("preserves runner-injected parent authority without admitting it in user-facing validation", () => {
 		// Regression: the async runner threads parentSessionId onto the dynamic parallel
 		// template for permission-system forwarding. It must pass runner-internal validation
 		// (allowRunnerFields) without leaking into the user-facing dynamic field whitelist.
 		const runnerStep = {
 			expand: { from: { output: "targets", path: "/items" }, maxItems: 4 },
-			parallel: { agent: "reviewer", task: "Review {item.path}", parentSessionId: "session-parent" },
+			parallel: { agent: "reviewer", task: "Review {item.path}", parentSessionId: "session-parent", requiredExtensions: [{ id: "provider", path: "/private/provider.mjs" }] },
 			collect: { as: "reviews" },
-		} as unknown as Parameters<typeof validateDynamicStepShape>[0];
+		};
 		assert.doesNotThrow(() => validateDynamicStepShape(runnerStep, 1, { allowRunnerFields: true }));
+		const materialized = materializeDynamicParallelStep(runnerStep, outputs, 1, { allowRunnerFields: true });
+		assert.ok(materialized.parallel[0] && "requiredExtensions" in materialized.parallel[0]);
+		assert.deepEqual(materialized.parallel[0].requiredExtensions, [{ id: "provider", path: "/private/provider.mjs" }]);
 		assert.throws(
 			() => validateDynamicStepShape(runnerStep, 1),
 			(error: unknown) => error instanceof DynamicFanoutError && /parentSessionId/.test(error.message),
 		);
 	});
 
-	it("accepts toolBudget on dynamic parallel templates", () => {
+	it("accepts fast and toolBudget on dynamic parallel templates", () => {
 		const step = {
 			expand: { from: { output: "targets", path: "/items" }, maxItems: 4 },
-			parallel: { agent: "reviewer", task: "Review {item.path}", toolBudget: { hard: 3 } },
+			parallel: { agent: "reviewer", task: "Review {item.path}", fast: true, toolBudget: { hard: 3 } },
 			collect: { as: "reviews" },
 		} as unknown as Parameters<typeof validateDynamicStepShape>[0];
 
 		assert.doesNotThrow(() => validateDynamicStepShape(step, 1));
+		assert.deepEqual(materializeDynamicParallelStep(step, outputs, 1).parallel.map((item) => item.fast), [true, true]);
 	});
 
 	it("validates source ordering and collect name collisions", () => {
@@ -190,7 +194,7 @@ describe("dynamic fanout helpers", () => {
 		], {}, { priorOutputNames: ["targets"], startStepIndex: 2 }));
 	});
 
-	it("collects ordered child result records and validates aggregate schema", () => {
+	it("collects ordered child result records and validates aggregate schema", async () => {
 		const step: ChainStep = {
 			expand: { from: { output: "targets", path: "/items" }, key: "/path", maxItems: 4 },
 			parallel: { agent: "reviewer", task: "Review {item.path}" },
@@ -200,6 +204,7 @@ describe("dynamic fanout helpers", () => {
 		const result = (agent: string, structuredOutput: unknown): SingleResult => ({
 			agent,
 			task: "t",
+			index: 0,
 			exitCode: 0,
 			messages: [],
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
@@ -211,7 +216,7 @@ describe("dynamic fanout helpers", () => {
 		assert.deepEqual(collected.map((item) => item.key), ["src/a.ts", "src/b.ts"]);
 		assert.deepEqual(collected.map((item) => item.structured), [{ ok: "a" }, { ok: "b" }]);
 		assert.equal(collected[1]?.timedOut, true);
-		assert.doesNotThrow(() => validateDynamicCollection({ type: "array", minItems: 2 }, collected));
-		assert.throws(() => validateDynamicCollection({ type: "object" }, collected), DynamicFanoutError);
+		await assert.doesNotReject(validateDynamicCollection({ type: "array", minItems: 2 }, collected));
+		await assert.rejects(validateDynamicCollection({ type: "object" }, collected), DynamicFanoutError);
 	});
 });

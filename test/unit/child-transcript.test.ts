@@ -61,7 +61,7 @@ describe("createChildTranscriptWriter", () => {
 		assert.equal(record.source, "async");
 	});
 
-	it("writes message records for message_end and tool_result_end events", () => {
+	it("writes message records for assistant and toolResult message_end events", () => {
 		const dir = tmpDir();
 		const transcriptPath = path.join(dir, "transcript.jsonl");
 		const writer = createChildTranscriptWriter({
@@ -83,8 +83,8 @@ describe("createChildTranscriptWriter", () => {
 			},
 		});
 		writer.writeChildEvent({
-			type: "tool_result_end",
-			message: { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "ok" }] },
+			type: "message_end",
+			message: { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false },
 		});
 
 		const records = readRecords(transcriptPath);
@@ -97,8 +97,19 @@ describe("createChildTranscriptWriter", () => {
 		assert.equal(records[0]!.stopReason, "end_turn");
 		assert.deepEqual(records[0]!.usage, { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.01 });
 		assert.equal(records[1]!.recordType, "message");
-		assert.equal(records[1]!.sourceEventType, "tool_result_end");
+		assert.equal(records[1]!.sourceEventType, "message_end");
 		assert.equal(records[1]!.role, "toolResult");
+		assert.equal(records[1]!.toolCallId, "call-1");
+		assert.equal(records[1]!.toolName, "bash");
+		assert.equal(records[1]!.isError, false);
+		assert.equal(records[1]!.text, "ok");
+		assert.deepEqual(records[1]!.message, {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "bash",
+			isError: false,
+			content: [{ type: "text", text: "ok" }],
+		});
 	});
 
 	it("writes tool_start and tool_end records and ignores unhandled event types", () => {
@@ -111,22 +122,53 @@ describe("createChildTranscriptWriter", () => {
 			agent: "worker",
 			cwd: "/repo",
 		});
-		writer.writeChildEvent({ type: "tool_execution_start", toolName: "bash", args: { command: "ls" } });
-		writer.writeChildEvent({ type: "tool_execution_start", toolName: "read" });
-		writer.writeChildEvent({ type: "tool_execution_end", toolName: "bash" });
+		writer.writeChildEvent({ type: "tool_execution_start", toolCallId: "call-1", toolName: "bash", args: { command: "ls" } });
+		writer.writeChildEvent({ type: "tool_execution_start", toolCallId: "call-2", toolName: "read" });
+		writer.writeChildEvent({ type: "tool_execution_end", toolCallId: "call-1", toolName: "bash", isError: false });
 		writer.writeChildEvent({ type: "some_unhandled_event" });
 
 		const records = readRecords(transcriptPath);
 		assert.equal(records.length, 3);
 		assert.equal(records[0]!.recordType, "tool_start");
 		assert.equal(records[0]!.sourceEventType, "tool_execution_start");
+		assert.equal(records[0]!.toolCallId, "call-1");
 		assert.equal(records[0]!.toolName, "bash");
 		assert.equal(typeof records[0]!.argsPreview, "string");
 		assert.ok(String(records[0]!.argsPreview).length > 0);
+		assert.equal(records[0]!.argsPayload, JSON.stringify({ command: "ls" }, null, 2));
 		assert.equal(records[1]!.recordType, "tool_start");
+		assert.equal(records[1]!.toolCallId, "call-2");
 		assert.equal(Object.prototype.hasOwnProperty.call(records[1]!, "argsPreview"), false);
 		assert.equal(records[2]!.recordType, "tool_end");
+		assert.equal(records[2]!.toolCallId, "call-1");
 		assert.equal(records[2]!.toolName, "bash");
+		assert.equal(records[2]!.isError, false);
+	});
+
+	it("bounds persisted tool arguments and successful output", () => {
+		const dir = tmpDir();
+		const transcriptPath = path.join(dir, "transcript.jsonl");
+		const writer = createChildTranscriptWriter({
+			transcriptPath,
+			source: "foreground",
+			runId: "run-bounded",
+			agent: "worker",
+			cwd: "/repo",
+		});
+		writer.writeChildEvent({ type: "tool_execution_start", toolCallId: "large", toolName: "bash", args: { command: "🧪".repeat(10_000) } });
+		writer.writeChildEvent({
+			type: "message_end",
+			message: { role: "toolResult", toolCallId: "large", toolName: "bash", content: [{ type: "text", text: "🧪".repeat(10_000) }], isError: false },
+		});
+
+		const records = readRecords(transcriptPath);
+		assert.ok(Buffer.byteLength(String(records[0]!.argsPayload), "utf-8") <= 32 * 1024);
+		assert.match(String(records[0]!.argsPayload), /… payload truncated$/);
+		assert.doesNotMatch(String(records[0]!.argsPayload), /�/);
+		assert.ok(Buffer.byteLength(String(records[1]!.text), "utf-8") <= 32 * 1024);
+		assert.match(String(records[1]!.text), /… payload truncated$/);
+		assert.doesNotMatch(String(records[1]!.text), /�/);
+		assert.equal(records[1]!.outputTruncated, true);
 	});
 
 	it("skips blank stdout/stderr lines and splits multi-line stderr text", () => {

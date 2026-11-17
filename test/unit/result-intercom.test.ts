@@ -12,6 +12,16 @@ import {
 } from "../../src/intercom/result-intercom.ts";
 
 describe("result intercom formatter", () => {
+	it("does not promote running children to grouped completion", () => {
+		assert.equal(resolveSubagentResultStatus({ state: "running" }), "running");
+		assert.equal(resolveSubagentResultStatus({ state: "running", success: true }), "running");
+		const payload = buildSubagentResultIntercomPayload({ to: "parent", runId: "workflow", mode: "workflow", source: "async", children: [
+			{ agent: "finished", status: "completed", summary: "done", outputState: "present" },
+			{ agent: "launched", status: "running", summary: "", outputState: "absent" },
+		] });
+		assert.equal(payload.status, "running");
+		assert.equal(payload.summary, "1 running, 1 completed");
+	});
 	it("builds one grouped intercom payload with status counts and child sections", () => {
 		const payload = buildSubagentResultIntercomPayload({
 			to: "subagent-chat-main",
@@ -43,13 +53,14 @@ describe("result intercom formatter", () => {
 		assert.match(payload.message, /^subagent results/m);
 		assert.match(payload.message, /Run: run-123/);
 		assert.match(payload.message, /Mode: chain/);
-		assert.match(payload.message, /Status: failed/);
+		assert.match(payload.message, /Process status: failed/);
 		assert.match(payload.message, /Children: 1 completed, 1 failed/);
+		assert.match(payload.message, /Outputs: 2 unknown \(semantic adequacy unassessed\)/);
 		assert.match(payload.message, /Chain steps: 4/);
 		assert.match(payload.message, /Intercom targets below identify child sessions used while they were running/);
-		assert.match(payload.message, /1\. reviewer-a — completed/);
+		assert.match(payload.message, /1\. reviewer-a — process completed · output unknown/);
 		assert.match(payload.message, /Run intercom target: subagent-reviewer-a-run-123-1/);
-		assert.match(payload.message, /2\. reviewer-b — failed/);
+		assert.match(payload.message, /2\. reviewer-b — process failed · output unknown/);
 		assert.match(payload.message, /Output artifact: \/tmp\/a\.md/);
 		assert.match(payload.message, /Session: \/tmp\/a-session\.jsonl/);
 	});
@@ -94,7 +105,7 @@ describe("result intercom formatter", () => {
 				],
 			});
 
-			assert.match(payload.message, /Revive child: subagent\(\{ action: "resume", id: "run-multi", index: 0, message: "\.\.\." \}\)/);
+			assert.match(payload.message, /Revive child: subagent\(\{ action: "resume", id: "run-multi", message: "\.\.\.", options: \{ index: 0 \} \}\)/);
 			assert.doesNotMatch(payload.message, /unsupported for multi-child/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
@@ -132,7 +143,10 @@ describe("result intercom formatter", () => {
 				path: [{ runId: "root-run", stepIndex: 1 }],
 				state: "complete",
 				agent: "reviewer",
+				model: "provider/gpt-5.6-luna:medium",
+				thinking: "medium",
 				sessionFile: path.join(os.tmpdir(), "nested-a.jsonl"),
+				steps: [{ agent: "leaf", status: "complete", model: "provider/leaf", thinking: "low" }],
 				controlInbox: "/tmp/should-not-leak",
 				capabilityToken: "secret-token",
 				children: [{
@@ -152,6 +166,10 @@ describe("result intercom formatter", () => {
 		const grandchild = nested?.children?.[0];
 		assert.equal(payload.children[0]?.children, undefined);
 		assert.equal(nested?.id, "nested-a");
+		assert.equal(nested?.model, "provider/gpt-5.6-luna:medium");
+		assert.equal(nested?.thinking, "medium");
+		assert.equal(nested?.steps?.[0]?.model, "provider/leaf");
+		assert.equal(nested?.steps?.[0]?.thinking, "low");
 		assert.equal(Object.hasOwn(nested ?? {}, "controlInbox"), false);
 		assert.equal(Object.hasOwn(nested ?? {}, "capabilityToken"), false);
 		assert.equal(grandchild?.id, "nested-grandchild");
@@ -159,6 +177,27 @@ describe("result intercom formatter", () => {
 		assert.equal(Object.hasOwn(grandchild ?? {}, "capabilityToken"), false);
 		assert.match(payload.message, /Nested subagents:/);
 		assert.match(payload.message, /↳ reviewer — complete \[nested-a\]/);
+	});
+
+	it("separates process failure from output presence and gives salvage guidance", () => {
+		const payload = buildSubagentResultIntercomPayload({
+			to: "chat",
+			runId: "run-salvage",
+			mode: "parallel",
+			source: "foreground",
+			children: [
+				{ agent: "a", status: "completed", outputState: "present", summary: "answer a" },
+				{ agent: "b", status: "failed", outputState: "present", summary: "runner crashed after answer b" },
+				{ agent: "c", status: "failed", outputState: "absent", summary: "startup failed" },
+			],
+		});
+
+		assert.equal(payload.status, "failed");
+		assert.equal(payload.children[1]?.outputState, "present");
+		assert.match(payload.message, /Process status: failed/);
+		assert.match(payload.message, /Outputs: 2 present, 1 absent \(semantic adequacy unassessed\)/);
+		assert.match(payload.message, /Inspect that output before retrying/);
+		assert.match(payload.message, /2\. b — process failed · output present/);
 	});
 
 	it("keeps full child summaries inside grouped payloads", () => {
@@ -217,9 +256,12 @@ describe("result intercom formatter", () => {
 		assert.equal(stripped.results[0]?.truncation, undefined);
 	});
 
-	it("resolves paused and detached statuses", () => {
+	it("resolves paused, detached, and signal-terminated statuses", () => {
 		assert.equal(resolveSubagentResultStatus({ interrupted: true }), "paused");
 		assert.equal(resolveSubagentResultStatus({ detached: true }), "detached");
+		assert.equal(resolveSubagentResultStatus({ processSignal: "SIGTERM", exitCode: 1 }), "stopped");
+		assert.equal(resolveSubagentResultStatus({ processSignal: "SIGTERM", exitCode: 1, timedOut: true }), "failed");
+		assert.equal(resolveSubagentResultStatus({ processSignal: "SIGTERM", exitCode: 0, success: true }), "completed");
 		assert.equal(resolveSubagentResultStatus({ success: true }), "completed");
 		assert.equal(resolveSubagentResultStatus({ exitCode: 1 }), "failed");
 	});

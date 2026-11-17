@@ -6,10 +6,11 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { discoverAgentsAll } from "../../src/agents/agents.ts";
 import { handleCreate } from "../../src/agents/agent-management.ts";
 import { clearSkillCache, discoverAvailableSkills, resolveSkillPath } from "../../src/agents/skills.ts";
-import { loadConfig } from "../../src/extension/config.ts";
+import { loadConfig, updateConfig } from "../../src/extension/config.ts";
 import { diagnoseIntercomBridge, resolveIntercomBridge } from "../../src/intercom/intercom-bridge.ts";
-import { loadRunsForAgent, recordRun } from "../../src/runs/shared/run-history.ts";
-import { cleanupAllArtifactDirs } from "../../src/shared/artifacts.ts";
+import { cleanupAllArtifactDirs, getArtifactsDir, getProjectArtifactsDir } from "../../src/shared/artifacts.ts";
+import { ASYNC_DIR, TEMP_ARTIFACTS_DIR } from "../../src/shared/types.ts";
+import { acquireSessionLease } from "../../src/runs/shared/session-lease.ts";
 import { getAgentDir, getConfigDirName, getProjectConfigDir, resolveConfigDirName } from "../../src/shared/utils.ts";
 
 let tempDir = "";
@@ -79,11 +80,23 @@ describe("PI_CODING_AGENT_DIR runtime paths", () => {
 
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
-		writeFile(configPath, JSON.stringify({ asyncByDefault: true, maxSubagentDepth: 3 }));
+		writeFile(configPath, JSON.stringify({ asyncByDefault: true, defaultSubagentContext: "fresh", maxSubagentDepth: 3, artifactDir: "session", artifactConfig: { cleanupDays: 9007199254740991 } }));
 
 		const config = loadConfig();
 		assert.equal(config.asyncByDefault, true);
+		assert.equal(config.defaultSubagentContext, "fresh");
 		assert.equal(config.maxSubagentDepth, 3);
+		assert.equal(config.artifactDir, "session");
+		assert.equal(config.artifactConfig?.cleanupDays, Number.MAX_SAFE_INTEGER);
+	});
+
+	it("requires a pruning model when pruned fork mode is enabled", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ forkContext: { mode: "pruned" } }));
+		assert.throws(() => loadConfig(), /forkContext\.model is required/);
+
+		writeFile(configPath, JSON.stringify({ forkContext: { mode: "pruned", model: "openai-codex/gpt-5.6-luna:max" } }));
+		assert.deepEqual(loadConfig().forkContext, { mode: "pruned", model: "openai-codex/gpt-5.6-luna:max" });
 	});
 
 	it("discovers user agents, chains, and settings under the configured agent dir", () => {
@@ -133,6 +146,41 @@ Inspect env.
 		assert.equal(fs.existsSync(path.join(agentDir, "agents", `${createdName}.md`)), true);
 	});
 
+	it("ignores nested .pi and sync-backups agent definitions", () => {
+		const userAgentsDir = path.join(agentDir, "agents");
+		const rootAgentPath = path.join(userAgentsDir, "root-agent.md");
+		writeFile(rootAgentPath, `---
+name: root-agent
+description: Root agent
+---
+
+Use the configured root agent.
+`);
+		const nestedBackupAgentPath = path.join(userAgentsDir, ".pi", "agent", "sync-backups", "20260712-163714", "agents", "stale.md");
+		writeFile(nestedBackupAgentPath, `---
+name: stale
+model: nonexistent/model
+description: Stale backup agent
+---
+
+This definition must not be executable.
+`);
+		const directBackupAgentPath = path.join(userAgentsDir, "sync-backups", "20260712-163714", "agents", "also-stale.md");
+		writeFile(directBackupAgentPath, `---
+name: also-stale
+description: Another stale backup agent
+---
+
+This definition must not be executable either.
+`);
+
+		const discovered = discoverAgentsAll(cwd);
+		assert.ok(discovered.user.find((agent) => agent.name === "root-agent" && agent.filePath === rootAgentPath));
+		assert.equal(discovered.user.some((agent) => agent.name === "stale"), false);
+		assert.equal(discovered.user.some((agent) => agent.name === "also-stale"), false);
+		assert.equal(discovered.user.some((agent) => agent.filePath === nestedBackupAgentPath || agent.filePath === directBackupAgentPath), false);
+	});
+
 	it("resolves user skills, settings skills, and package skills from the configured agent dir", () => {
 		writeFile(path.join(agentDir, "skills", "env-skill", "SKILL.md"), `---
 description: Env skill
@@ -167,22 +215,266 @@ Package skill content.
 		assert.ok(available.find((skill) => skill.name === "package-skill" && skill.source === "user-package"));
 	});
 
-	it("records run history and cleans session artifacts under the configured agent dir", () => {
-		recordRun("env-agent", "Inspect", 0, 42);
-		const historyPath = path.join(agentDir, "run-history.jsonl");
-		assert.equal(fs.existsSync(historyPath), true);
-		const history = loadRunsForAgent("env-agent");
-		assert.equal(history.length, 1);
-		assert.equal(history[0]?.task, "Inspect");
-		assert.equal(history[0]?.status, "ok");
-
+	it("cleans session artifacts under the configured agent dir", () => {
 		const artifactPath = path.join(agentDir, "sessions", "session-1", "subagent-artifacts", "old_output.md");
 		writeFile(artifactPath, "old output");
 		const oldTime = new Date(Date.now() - 60_000);
 		fs.utimesSync(artifactPath, oldTime, oldTime);
 
 		cleanupAllArtifactDirs(0);
+		assert.equal(fs.existsSync(artifactPath), true);
+
+		cleanupAllArtifactDirs(1 / 24 / 60 / 60 / 1000);
 		assert.equal(fs.existsSync(artifactPath), false);
+	});
+
+	it("cleans nested session artifacts but keeps worktree handoffs and patches", () => {
+		const artifactsDir = path.join(agentDir, "sessions", "session-2", "subagent-artifacts");
+		const oldOutput = path.join(artifactsDir, "outputs", "run-old", "report.md");
+		const newOutput = path.join(artifactsDir, "outputs", "run-new", "report.md");
+		const handoff = path.join(artifactsDir, "handoffs", "run-old.json");
+		const patch = path.join(artifactsDir, "worktree-diffs", "run-old", "worker.patch");
+		for (const file of [oldOutput, newOutput, handoff, patch]) writeFile(file, "x");
+		const oldTime = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+		for (const entry of [oldOutput, path.dirname(oldOutput), handoff, patch, path.dirname(patch)]) fs.utimesSync(entry, oldTime, oldTime);
+
+		cleanupAllArtifactDirs(1);
+
+		assert.equal(fs.existsSync(path.dirname(oldOutput)), false);
+		assert.equal(fs.existsSync(newOutput), true);
+		assert.equal(fs.existsSync(handoff), true);
+		assert.equal(fs.existsSync(patch), true);
+	});
+
+	it("deletes old fork copies of finished runs and keeps recent, active or resumed ones", () => {
+		const forksDir = path.join(agentDir, "sessions", "--project--", "2026-11-01T00-00-00-000Z_parent", "forks");
+		const copy = (runId: string) => path.join(forksDir, runId, "child.jsonl");
+		const runIds = { finished: `fork-finished-${process.pid}`, recent: `fork-recent-${process.pid}`, active: `fork-active-${process.pid}`, resumed: `fork-resumed-${process.pid}` };
+		for (const runId of Object.values(runIds)) writeFile(copy(runId), "{}\n");
+		const oldTime = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+		for (const runId of [runIds.finished, runIds.active, runIds.resumed]) {
+			fs.utimesSync(copy(runId), oldTime, oldTime);
+			fs.utimesSync(path.dirname(copy(runId)), oldTime, oldTime);
+		}
+		const activeStatus = path.join(ASYNC_DIR, runIds.active, "status.json");
+		writeFile(activeStatus, JSON.stringify({ runId: runIds.active, mode: "single", state: "running", startedAt: 1, lastUpdate: 1, steps: [] }));
+		// A resumed run keeps writing to its old copy under a new run id and holds that copy's session lease.
+		const lease = acquireSessionLease({ sessionFile: copy(runIds.resumed), runId: `resumed-${process.pid}`, sourceRunId: runIds.resumed });
+		try {
+			cleanupAllArtifactDirs(0);
+			assert.equal(fs.existsSync(copy(runIds.finished)), true);
+
+			cleanupAllArtifactDirs(1);
+			assert.equal(fs.existsSync(path.dirname(copy(runIds.finished))), false);
+			assert.equal(fs.existsSync(copy(runIds.recent)), true);
+			assert.equal(fs.existsSync(copy(runIds.active)), true);
+			assert.equal(fs.existsSync(copy(runIds.resumed)), true);
+		} finally {
+			lease.release();
+			fs.rmSync(path.dirname(activeStatus), { recursive: true, force: true });
+		}
+	});
+
+	it("resolves configured artifact directory preferences", () => {
+		const sessionFile = path.join(agentDir, "sessions", "session-1", "session.jsonl");
+
+		assert.equal(getArtifactsDir(sessionFile, cwd), path.join(path.dirname(sessionFile), "subagent-artifacts"));
+		assert.equal(getArtifactsDir(sessionFile, cwd, "project"), getProjectArtifactsDir(cwd));
+		assert.equal(getArtifactsDir(sessionFile, cwd, "session"), path.join(path.dirname(sessionFile), "subagent-artifacts"));
+		assert.equal(getArtifactsDir(sessionFile, cwd, "temp"), TEMP_ARTIFACTS_DIR);
+		assert.equal(getArtifactsDir(null, cwd, "session"), TEMP_ARTIFACTS_DIR);
+		assert.throws(() => getArtifactsDir(sessionFile, cwd, "workspace" as never), /Unsupported artifactDir/);
+	});
+
+	it("validates default subagent context values", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ defaultSubagentContext: "fresh" }));
+		assert.equal(loadConfig().defaultSubagentContext, "fresh");
+
+		writeFile(configPath, JSON.stringify({ asyncWidgetCollapsed: true }));
+		assert.equal(loadConfig().asyncWidgetCollapsed, true);
+		writeFile(configPath, JSON.stringify({ asyncWidgetCollapsed: "true" }));
+		assert.deepEqual(loadConfig(), {});
+		for (const asyncWidgetLayout of ["adaptive", "rows"]) {
+			writeFile(configPath, JSON.stringify({ asyncWidgetLayout }));
+			assert.equal(loadConfig().asyncWidgetLayout, asyncWidgetLayout);
+		}
+		writeFile(configPath, JSON.stringify({ asyncWidgetLayout: "compact" }));
+		assert.deepEqual(loadConfig(), {});
+		assert.throws(() => updateConfig((config) => config), /config\.asyncWidgetLayout must be "adaptive" or "rows"/);
+		writeFile(configPath, JSON.stringify({ programStatus: false }));
+		assert.equal(loadConfig().programStatus, false);
+		writeFile(configPath, JSON.stringify({ programStatus: "off" }));
+		assert.throws(() => updateConfig((config) => config), /config\.programStatus must be a boolean/);
+		writeFile(configPath, JSON.stringify({ autoResume: false }));
+		assert.equal(loadConfig().autoResume, false);
+		writeFile(configPath, JSON.stringify({ autoResume: "off" }));
+		assert.throws(() => updateConfig((config) => config), /config\.autoResume must be a boolean/);
+
+		writeFile(configPath, JSON.stringify({ defaultSubagentContext: "other" }));
+		assert.throws(() => updateConfig((config) => config), /config\.defaultSubagentContext must be "fresh" or "fork"/);
+	});
+
+	it("accepts valid global checkpoint offsets and rejects invalid config before execution", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		for (const checkpointBeforeDeadlineMs of [undefined, 1, 300_000, 2_147_483_647]) {
+			writeFile(configPath, JSON.stringify({ checkpointBeforeDeadlineMs }));
+			assert.equal(loadConfig().checkpointBeforeDeadlineMs, checkpointBeforeDeadlineMs);
+		}
+		for (const checkpointBeforeDeadlineMs of [0, -1, 1.5, 2_147_483_648, null, false, "300000", [], {}]) {
+			writeFile(configPath, JSON.stringify({ checkpointBeforeDeadlineMs }));
+			assert.throws(() => loadConfig(), /config\.checkpointBeforeDeadlineMs must be a positive integer no larger than 2147483647/);
+		}
+		writeFile(configPath, "{}");
+		assert.throws(() => updateConfig(() => ({ checkpointBeforeDeadlineMs: Infinity })), /config\.checkpointBeforeDeadlineMs must be a positive integer no larger than 2147483647/);
+		assert.deepEqual(loadConfig(), {});
+	});
+
+	it("fails config load for invalid disabled features instead of falling back to defaults", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ disabledFeatures: ["watchdogs"] }));
+		assert.throws(() => loadConfig(), /config\.disabledFeatures entry "watchdogs" is not one of:/);
+	});
+
+	it("loads a positive integer globalConcurrencyLimit and fails config load on any other value", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ globalConcurrencyLimit: 4 }));
+		assert.equal(loadConfig().globalConcurrencyLimit, 4);
+		for (const globalConcurrencyLimit of [0, 2.5, "4"]) {
+			writeFile(configPath, JSON.stringify({ globalConcurrencyLimit }));
+			assert.throws(() => loadConfig(), /config\.globalConcurrencyLimit must be a positive integer/);
+		}
+	});
+
+	it("loads runnerLaunchers and fails closed on malformed launchers", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		const runnerLaunchers = { net: ["nono", "run", "--profile", " net ", "--"], "subagent-net": ["subagent-net"], "net.v2_x-1": ["wrap"] };
+		writeFile(configPath, JSON.stringify({ runnerLaunchers }));
+		assert.deepEqual(loadConfig().runnerLaunchers, runnerLaunchers);
+		for (const invalid of [[], "nono", { net: [] }, { net: "nono run" }, { net: [""] }, { net: [" "] }, { net: ["nono", 1] }, { net: ["no\u0000no"] }, { "": ["nono"] }, { "'net'": ["nono"] }, { "a b": ["nono"] }, { "-x": ["nono"] }, { ["n".repeat(129)]: ["nono"] }]) {
+			writeFile(configPath, JSON.stringify({ runnerLaunchers: invalid }));
+			assert.throws(() => loadConfig(), /config\.runnerLaunchers.*(?:letters, digits|argv array|JSON object)/);
+		}
+	});
+
+	it("fails config load for invalid scheduledRuns because it controls the tool schema", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ scheduledRuns: { enabled: "false" } }));
+		assert.throws(() => loadConfig(), /config\.scheduledRuns\.enabled must be a boolean/);
+	});
+
+	it("loads exact model response aliases and preserves them during config updates", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		const modelResponseAliases = {
+			"databricks-bedrock/ias-claude-opus-5": ["claude-opus-5", "exact/Response:high"],
+			"gateway/owner/model": [],
+		};
+		writeFile(configPath, JSON.stringify({ modelResponseAliases }));
+		assert.deepEqual(loadConfig().modelResponseAliases, modelResponseAliases);
+		updateConfig((config) => ({ ...config, asyncByDefault: false }));
+		assert.deepEqual(loadConfig(), { modelResponseAliases, asyncByDefault: false });
+		writeFile(configPath, JSON.stringify({ modelResponseAliases: {} }));
+		assert.deepEqual(loadConfig().modelResponseAliases, {});
+	});
+
+	it("fails config load for malformed model response aliases with useful diagnostics", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		for (const modelResponseAliases of [null, [], "alias", { "": [] }, { model: [] }, { "/model": [] }, { "provider/ ": [] }, { " /model": [] }]) {
+			writeFile(configPath, JSON.stringify({ modelResponseAliases }));
+			assert.throws(() => loadConfig(), /config\.modelResponseAliases.*(?:JSON object|provider\/model ID)/);
+		}
+		for (const aliases of [null, "response", [""], [" "], [1], ["valid", false]]) {
+			writeFile(configPath, JSON.stringify({ modelResponseAliases: { "provider/model": aliases } }));
+			assert.throws(() => loadConfig(), /config\.modelResponseAliases\["provider\/model"\].*array of non-empty response ID strings/);
+		}
+	});
+
+	it("rejects removed model exclusion config without creating a store", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		const exclusionPath = path.join(tempDir, "model-exclusions.json");
+		writeFile(configPath, JSON.stringify({ modelExclusions: { defaultTtlMs: 300_000 } }));
+		assert.throws(() => updateConfig((current) => current), /modelExclusions was removed/);
+		assert.equal(fs.existsSync(exclusionPath), false);
+	});
+
+	it("fails closed when loadConfig reads removed model exclusion config", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ modelExclusions: { defaultTtlMs: 300_000 }, asyncByDefault: false }));
+		assert.throws(() => loadConfig(), /config\.modelExclusions was removed/);
+	});
+
+	it("fails closed instead of dropping restrictions when another config value is invalid", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		for (const restriction of [{ authorityPolicy: { stopRun: "forbid" } }, { permissions: { rules: { write: "deny" } } }, { toolBudget: { hard: 5 } }, { runnerLaunchers: { net: ["nono"] } }]) {
+			writeFile(configPath, JSON.stringify({ resultScanLogging: "bogus", ...restriction }));
+			assert.throws(() => loadConfig(), /config\.resultScanLogging must be/);
+		}
+	});
+
+	it("rejects invalid artifactDir config values", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ artifactDir: "workspace" }));
+
+		assert.throws(() => updateConfig((config) => config), /config\.artifactDir must be "project", "session", or "temp"/);
+	});
+
+	it("loads and validates abandoned async capacity cleanup policy", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ capacity: { abandonedSlotReleaseAfterMs: 600_000 } }));
+		assert.equal(loadConfig().capacity?.abandonedSlotReleaseAfterMs, 600_000);
+
+		writeFile(configPath, JSON.stringify({ capacity: { abandonedSlotReleaseAfterMs: false } }));
+		assert.equal(loadConfig().capacity?.abandonedSlotReleaseAfterMs, false);
+
+		for (const invalid of [299_999, 86_400_001, 0, "600000", null]) {
+			writeFile(configPath, JSON.stringify({ capacity: { abandonedSlotReleaseAfterMs: invalid } }));
+			assert.throws(() => updateConfig((config) => config), /config\.capacity\.abandonedSlotReleaseAfterMs must be false or an integer/);
+		}
+	});
+
+	it("loads and validates Fleet keybinding config", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ fleetKeybindings: { pageUp: ["u"], pageDown: ["d"] } }));
+		assert.deepEqual(loadConfig().fleetKeybindings, { pageUp: ["u"], pageDown: ["d"] });
+
+		writeFile(configPath, JSON.stringify({ fleetKeybindings: { missing: ["m"] } }));
+		assert.throws(() => updateConfig((config) => config), /config\.fleetKeybindings\.missing is not a supported Fleet action/);
+
+		writeFile(configPath, JSON.stringify({ fleetKeybindings: { pageUp: [""] } }));
+		assert.throws(() => updateConfig((config) => config), /config\.fleetKeybindings\.pageUp entries must be non-empty strings/);
+	});
+
+	it("loads and validates the foreground detach shortcut", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ foregroundDetachShortcut: "ctrl+b" }));
+		assert.equal(loadConfig().foregroundDetachShortcut, "ctrl+b");
+
+		writeFile(configPath, JSON.stringify({ foregroundDetachShortcut: "banana" }));
+		assert.throws(() => updateConfig((config) => config), /config\.foregroundDetachShortcut must be a valid keybinding string/);
+	});
+
+	it("loads and validates main-window renderer density config", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ mainWindowRenderer: { horizontalSpacing: 0, compactResultMaxLines: 4 } }));
+		assert.deepEqual(loadConfig().mainWindowRenderer, { horizontalSpacing: 0, compactResultMaxLines: 4 });
+
+		writeFile(configPath, JSON.stringify({ mainWindowRenderer: { horizontalSpacing: -1 } }));
+		assert.throws(() => updateConfig((config) => config), /config\.mainWindowRenderer\.horizontalSpacing must be an integer from 0 to 4/);
+
+		writeFile(configPath, JSON.stringify({ mainWindowRenderer: { compactResultMaxLines: 0 } }));
+		assert.throws(() => updateConfig((config) => config), /config\.mainWindowRenderer\.compactResultMaxLines must be a positive integer/);
+	});
+
+	it("loads and validates experimental Orca progress-tab config", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ orcaProgressTabs: { enabled: true } }));
+		assert.deepEqual(loadConfig().orcaProgressTabs, { enabled: true });
+
+		writeFile(configPath, JSON.stringify({ orcaProgressTabs: { enabled: "yes" } }));
+		assert.throws(() => updateConfig((config) => config), /config\.orcaProgressTabs\.enabled must be a boolean/);
+
+		writeFile(configPath, JSON.stringify({ orcaProgressTabs: { enabled: true, focus: true } }));
+		assert.throws(() => updateConfig((config) => config), /config\.orcaProgressTabs\.focus is not supported/);
 	});
 
 	it("uses the configured agent dir for subagent bridge instruction files", () => {

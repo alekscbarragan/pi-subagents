@@ -17,9 +17,15 @@ function parseStepBody(agent: string, sectionBody: string): ChainStepConfig {
 	for (const line of configLines) {
 		const match = line.match(/^([\w-]+):\s*(.*)$/);
 		if (!match) continue;
-		const key = match[1].trim().toLowerCase();
-		const rawValue = match[2].trim();
+		const [keyValue, rawValueValue] = match.slice(1);
+		if (keyValue === undefined || rawValueValue === undefined) continue;
+		const key = keyValue.trim().toLowerCase();
+		const rawValue = rawValueValue.trim();
 
+		if (key === "machine") {
+			if (rawValue) step.machine = rawValue;
+			continue;
+		}
 		if (key === "output") {
 			if (rawValue === "false") step.output = false;
 			else if (rawValue) step.output = rawValue;
@@ -91,7 +97,8 @@ function parseStepBody(agent: string, sectionBody: string): ChainStepConfig {
 			}
 			const validation = validateToolBudgetConfig(parsed, `toolBudget for step '${agent}'`);
 			if (validation.error) throw new Error(validation.error);
-			step.toolBudget = parsed as ChainStepConfig["toolBudget"];
+			const toolBudget = parsed as ChainStepConfig["toolBudget"];
+			if (toolBudget !== undefined) step.toolBudget = toolBudget;
 		}
 	}
 
@@ -130,12 +137,12 @@ export function parseChain(content: string, source: AgentSource, filePath: strin
 	return {
 		name: buildRuntimeName(localName, packageName),
 		localName,
-		packageName,
+		...(packageName !== undefined ? { packageName } : {}),
 		description: frontmatter.description,
 		source,
 		filePath,
 		steps,
-		extraFields: Object.keys(extraFields).length > 0 ? extraFields : undefined,
+		...(Object.keys(extraFields).length > 0 ? { extraFields } : {}),
 	};
 }
 
@@ -213,12 +220,12 @@ export function parseJsonChain(content: string, source: AgentSource, filePath: s
 	return {
 		name: buildRuntimeName(input.name.trim(), parsedPackage.packageName),
 		localName: input.name.trim(),
-		packageName: parsedPackage.packageName,
+		...(parsedPackage.packageName !== undefined ? { packageName: parsedPackage.packageName } : {}),
 		description: input.description.trim(),
 		source,
 		filePath,
 		steps: input.chain as ChainStepConfig[],
-		extraFields: Object.keys(extraFields).length > 0 ? extraFields : undefined,
+		...(Object.keys(extraFields).length > 0 ? { extraFields } : {}),
 	};
 }
 
@@ -254,6 +261,7 @@ export function serializeChain(config: ChainConfig): string {
 	for (let i = 0; i < config.steps.length; i++) {
 		const step = config.steps[i]!;
 		lines.push(`## ${step.agent}`);
+		if (step.machine) lines.push(`machine: ${step.machine}`);
 		if (step.output === false) lines.push("output: false");
 		else if (step.output) lines.push(`output: ${step.output}`);
 		if (step.phase) lines.push(`phase: ${step.phase}`);

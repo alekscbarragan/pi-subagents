@@ -85,18 +85,17 @@ export interface CompletionBatcherOptions<T> {
 }
 
 export interface CompletionBatcher<T> {
-	/** Add a batchable item. Emits immediately when batching is disabled. */
+	/** Emits immediately when batching is disabled. */
 	push(item: T): void;
 	/** Emit any held items immediately as a single group. */
 	flush(): void;
-	/** Clear timers without emitting. */
-	dispose(): void;
+	/** Clear timers and return items that were never emitted. */
+	dispose(): T[];
 }
 
 /**
- * Create a completion batcher. The batcher is single-use per registration: it
- * holds at most one open group. `flush` forces emission; `dispose` tears down
- * timers for reload/shutdown without emitting.
+ * The batcher is single-use per registration: it holds at most one open group.
+ * `flush` forces emission; `dispose` tears down timers for reload/shutdown without emitting.
  */
 export function createCompletionBatcher<T>(options: CompletionBatcherOptions<T>): CompletionBatcher<T> {
 	const timers = options.timers ?? defaultTimers;
@@ -109,7 +108,7 @@ export function createCompletionBatcher<T>(options: CompletionBatcherOptions<T>)
 				options.emit([item]);
 			},
 			flush() {},
-			dispose() {},
+			dispose() { return []; },
 		};
 	}
 
@@ -160,7 +159,9 @@ export function createCompletionBatcher<T>(options: CompletionBatcherOptions<T>)
 		flush: emitGroup,
 		dispose() {
 			clearTimers();
+			const abandoned = pending;
 			pending = [];
-		},
+			return abandoned;
+		}
 	};
 }

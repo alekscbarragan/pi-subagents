@@ -2,8 +2,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { BUILTIN_AGENT_NAMES } from "../agents/agents.ts";
+import { BUILTIN_AGENT_NAMES, validateOptionalMachine } from "../agents/agents.ts";
+import { getPiSpawnCommand } from "../runs/shared/pi-spawn.ts";
 import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo } from "../shared/model-info.ts";
+import { withSettingsFileLease } from "../shared/settings-file-lease.ts";
 import { getAgentDir } from "../shared/utils.ts";
 
 export const DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS = 7;
@@ -18,11 +20,15 @@ export type RecommendedRoleTier = "cheap" | "medium" | "strong";
 
 interface ProfileAgentOverride {
 	model?: string;
+	thinking?: string | false;
+	machine?: string | false;
 }
 
 export interface SubagentProfileFile {
 	subagents: {
 		agentOverrides: Record<string, ProfileAgentOverride>;
+		disableBuiltins?: boolean;
+		[key: string]: unknown;
 	};
 }
 
@@ -130,10 +136,23 @@ function validateSubagentProfile(filePath: string, parsed: Record<string, unknow
 		if (!value || typeof value !== "object" || Array.isArray(value)) {
 			throw new Error(`Profile '${filePath}' has invalid override '${name}'; expected an object.`);
 		}
-		const model = (value as Record<string, unknown>).model;
+		const override = value as Record<string, unknown>;
+		const model = override.model;
 		if (model !== undefined && typeof model !== "string") {
 			throw new Error(`Profile '${filePath}' has invalid model for '${name}'; expected a string.`);
 		}
+		const thinking = override.thinking;
+		if (thinking !== undefined && thinking !== false && typeof thinking !== "string") {
+			throw new Error(`Profile '${filePath}' has invalid thinking for '${name}'; expected a string or false.`);
+		}
+		if (override.machine !== undefined && override.machine !== false) {
+			override.machine = validateOptionalMachine(override.machine, `Profile '${filePath}' has invalid machine for '${name}'`);
+		}
+		if ((override as Record<string, unknown>).fallbackModels !== undefined) throw new Error(`Profile '${filePath}' uses removed field fallbackModels for '${name}'; configure one model instead.`);
+	}
+	const disableBuiltins = (subagents as Record<string, unknown>).disableBuiltins;
+	if (disableBuiltins !== undefined && typeof disableBuiltins !== "boolean") {
+		throw new Error(`Profile '${filePath}' has invalid subagents.disableBuiltins; expected a boolean.`);
 	}
 	return parsed as unknown as SubagentProfileFile;
 }
@@ -243,7 +262,7 @@ function qualityTierToRoleTier(quality: QualityTier, cost: CostTier): Recommende
 
 function agentsForRoleTier(roleTier: RecommendedRoleTier): BuiltinAgentName[] {
 	if (roleTier === "cheap") return ["scout", "delegate"];
-	if (roleTier === "medium") return ["planner", "context-builder", "researcher"];
+	if (roleTier === "medium") return ["researcher", "reviewer"];
 	return ["worker", "reviewer", "oracle"];
 }
 
@@ -317,13 +336,13 @@ function resolveProbeStatus(text: string, timedOut: boolean): ProbeStatus {
 
 async function probeModel(
 	pi: Pick<ExtensionAPI, "exec"> | { exec?: ExtensionAPI["exec"] },
-	ctx: Pick<ExtensionContext, "cwd">,
 	fullId: string,
 ): Promise<{ status: ProbeStatus; message?: string }> {
 	if (typeof pi.exec !== "function") {
 		return { status: "skipped", message: "pi.exec is unavailable in this runtime." };
 	}
-	const result = await pi.exec("pi", ["-p", "--model", fullId, "--no-tools", 'Reply with exactly "OK".'], {
+	const spawnSpec = getPiSpawnCommand(["-p", "--model", fullId, "--no-tools", 'Reply with exactly "OK".']);
+	const result = await pi.exec(spawnSpec.command, spawnSpec.args, {
 		cwd: os.tmpdir(),
 		timeout: 45_000,
 	} as Record<string, unknown>);
@@ -382,14 +401,12 @@ function filterDominatedModels(models: ProviderModelCatalogModel[]): ProviderMod
 	return models.filter((candidate, index) => !models.some((other, otherIndex) => otherIndex !== index && dominatesModel(other, candidate)));
 }
 
-function buildProfileFile(kind: ProfileKind, models: { cheap: string; medium: string; strong: string }): SubagentProfileFile {
+function buildProfileFile(models: { cheap: string; medium: string; strong: string }): SubagentProfileFile {
 	return {
 		subagents: {
 			agentOverrides: {
 				scout: { model: models.cheap },
 				delegate: { model: models.cheap },
-				planner: { model: models.medium },
-				"context-builder": { model: models.medium },
 				researcher: { model: models.medium },
 				worker: { model: models.strong },
 				reviewer: { model: models.strong },
@@ -467,9 +484,29 @@ export function readSubagentProfile(name: string): { filePath: string; profile: 
 export function applySubagentProfile(name: string): { filePath: string; settingsPath: string } {
 	const { filePath, profile } = readSubagentProfile(name);
 	const settingsPath = getUserSettingsPath();
-	const settings = readSettingsFile(settingsPath);
-	settings.subagents = profile.subagents;
-	writeJsonFile(settingsPath, settings);
+	withSettingsFileLease(settingsPath, () => {
+		const settings = readSettingsFile(settingsPath);
+		const existing = settings.subagents && typeof settings.subagents === "object" && !Array.isArray(settings.subagents)
+			? settings.subagents as Record<string, unknown>
+			: {};
+		// A profile owns the complete agent mapping, but unrelated subagent settings
+		// (notably disableBuiltins, modelScope, watchdog, etc.) survive profile switches.
+		// Machine placement is not a model choice, so an existing pin survives a profile switch too.
+		const agentOverrides: Record<string, ProfileAgentOverride> = { ...profile.subagents.agentOverrides };
+		const existingOverrides = existing.agentOverrides && typeof existing.agentOverrides === "object" && !Array.isArray(existing.agentOverrides)
+			? existing.agentOverrides as Record<string, unknown>
+			: {};
+		for (const [name, value] of Object.entries(existingOverrides)) {
+			const machine = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>).machine : undefined;
+			if (typeof machine === "string" && agentOverrides[name]?.machine === undefined) agentOverrides[name] = { ...agentOverrides[name], machine };
+		}
+		settings.subagents = {
+			...existing,
+			...profile.subagents,
+			agentOverrides,
+		};
+		writeJsonFile(settingsPath, settings);
+	});
 	return { filePath, settingsPath };
 }
 
@@ -514,11 +551,11 @@ export async function refreshProviderModelCatalog(
 		probe: { status: ProbeStatus; message?: string };
 	}>;
 	for (const rawModel of availableModels) {
-		const modelRecord = rawModel as Record<string, unknown> & { provider: string; id: string; name?: string };
+		const modelRecord = rawModel as unknown as Record<string, unknown> & { provider: string; id: string; name?: string };
 		const fullId = `${modelRecord.provider}/${modelRecord.id}`;
 		const probe = options.probe === false
 			? { status: "skipped" as const, message: "Live probing disabled." }
-			: await probeModel(pi, ctx, fullId);
+			: await probeModel(pi, fullId);
 		observedModels.push({ rawModel, modelRecord, fullId, probe });
 	}
 	const classificationContext = buildClassificationContext(observedModels.map(({ modelRecord }) => ({
@@ -598,8 +635,8 @@ export async function generateProfilesForProvider(
 	const dir = ensureSubagentProfilesDir();
 	const quotaPath = path.join(dir, `${normalizedProvider}.quota.json`);
 	const qualityPath = path.join(dir, `${normalizedProvider}.quality.json`);
-	writeJsonFile(quotaPath, buildProfileFile("quota", quotaModels));
-	writeJsonFile(qualityPath, buildProfileFile("quality", qualityModels));
+	writeJsonFile(quotaPath, buildProfileFile(quotaModels));
+	writeJsonFile(qualityPath, buildProfileFile(qualityModels));
 	const selectedModels = new Set([...Object.values(quotaModels), ...Object.values(qualityModels)]);
 	const selectedHeuristicFallbackCount = profileModels.filter((model) => selectedModels.has(model.fullId) && modelUsesHeuristicClassification(model)).length;
 	return { quotaPath, qualityPath, catalogPath, quotaModels, qualityModels, heuristicFallbackCount, selectedHeuristicFallbackCount };
@@ -623,7 +660,7 @@ export async function checkSubagentProfile(
 		const probeModelId = modelInfo ? `${modelInfo.fullId}${thinkingSuffix}` : entry.model;
 		let probe = probeCache.get(probeModelId);
 		if (!probe) {
-			probe = await probeModel(pi, ctx, probeModelId);
+			probe = await probeModel(pi, probeModelId);
 			probeCache.set(probeModelId, probe);
 		}
 		results.push({

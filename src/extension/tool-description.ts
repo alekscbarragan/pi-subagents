@@ -2,97 +2,74 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionConfig, ToolDescriptionMode } from "../shared/types.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
+import { resolveDisabledFeatureSurface, type DisabledFeatureSurface, type SubagentSurfaceFeature } from "../shared/disabled-features.ts";
+import { DEFAULT_WAIT_TOOL_NAME, waitToolName } from "../shared/wait-tool-name.ts";
 
 const CUSTOM_TOOL_DESCRIPTION_FILE = "subagent-tool-description.md";
 const CUSTOM_TOOL_DESCRIPTION_MAX_BYTES = 50 * 1024;
 
+type FeatureText = (feature: SubagentSurfaceFeature, text: string, disabledText?: string) => string;
+
+function featureText(disabled: DisabledFeatureSurface): FeatureText {
+	return (feature, text, disabledText = "") => disabled.features.has(feature) ? disabledText : text;
+}
+
+// Part of every built-in description and appended to custom ones, so it is sent on every request.
 export const SUBAGENT_SAFETY_GUIDANCE = `SAFETY-CRITICAL SUBAGENT GUIDANCE:
-• Use { action: "list" } before execution and only run executable/non-disabled agents or chains.
-• Keep execution and management separate: omit action for SINGLE/PARALLEL/CHAIN execution; use action only for list/get/models/create/update/delete/status/interrupt/stop/resume/append-step/doctor.
-• Async/background runs: launch with async:true only when work can proceed independently. Do not sleep or poll status just to wait; if this turn must block, use subagent_wait. Otherwise continue useful work or respond and let completion notifications arrive.
-• Child-safety boundary: ordinary child subagents are not orchestrators and must not run subagents. Only explicitly configured fanout children may use the child-safe subagent tool, still bounded by depth/session limits.
-• Writing/review safety: keep one writer for the same cwd/worktree. Use fresh-context read-only reviewers/validators for independent review, then have the parent synthesize and apply fixes as the sole writer unless an isolated worktree was intentionally requested.
-• Artifacts/status essentials: chain outputs live under {chain_dir}; async runs expose asyncId/asyncDir with status.json, events.jsonl, output logs, and status via { action: "status", id }. Include output paths and residual risks when reporting results.`;
+- Delegate only when the operator asked, directly or through applicable user/project instructions; size, complexity or risk alone is not authorization.
+- Native async completion wakes this session: return control; do not sleep, poll or call bg_wait for it.
+- One writer per cwd/worktree; isolate concurrent writers.
+- After a launch or runtime failure, stop and report it; never silently switch to interactive_shell, pi -ne or another CLI.`;
 
-export const FULL_SUBAGENT_TOOL_DESCRIPTION = `Delegate to subagents or manage agent definitions.
+const scriptCalls = "One child: {agent,task}. Independent parallel children: {workflow:\"parallel\",args:{tasks:[{agent,task,cwd?,model?},...]}}. Dependent multi-step work: exactly one top-level subagent workflow call with async:true; write one ```js workflow block in this reply, then call subagent({workflow:true}); children launch only inside it.";
+const structuredCalls = "One child: {agent,task}. Parallel: tasks:[{agent,task,cwd?,model?},...]. In order: chain:[{agent,task?,as?,cwd?,model?} or {parallel:[{agent,task,cwd?,model?},...]}]; step tasks can use {task}, {previous} and {outputs.name}. Use exactly one top-level subagent chain or tasks call with async:true.";
 
-EXECUTION (use exactly ONE mode):
-• Before executing, use { action: "list" } to inspect configured agents/chains. Only execute agents listed as executable/non-disabled.
-• SINGLE: { agent, task? } - one task; omit task for self-contained agents
-• CHAIN: { chain: [{agent:"agent-a"}, {parallel:[{agent:"agent-b",count:3}]}] } - sequential pipeline with optional parallel fan-out
-• PARALLEL: { tasks: [{agent,task,count?,output?,reads?,progress?}, ...], concurrency?: number, worktree?: true } - concurrent execution (worktree: isolate each task in a git worktree)
-• Optional context: { context: "fresh" | "fork" } (explicit value overrides every child; when omitted, each requested agent uses its own defaultContext, otherwise "fresh"; inspect agent defaults via { action: "list" })
-• Optional timeout: { timeoutMs } or { maxRuntimeMs } sets a run-level max runtime for foreground and async/background runs
-• If { action: "list" } shows proactive skill subagent suggestions, consider a small fresh-context fanout for broad tasks where one of those skills would materially help
-
-CHAIN TEMPLATE VARIABLES (use in task strings):
-• {task} - The original task/request from the user
-• {previous} - Text response from the previous step (empty for first step)
-• {chain_dir} - Shared directory for chain files (e.g., <tmpdir>/pi-subagents-<scope>/chain-runs/abc123/)
-
-CHAIN EXAMPLES (quick reference for the nested schema):
-• Sequential: { chain: [{agent:"agent-a", task:"Analyze {task}"}, {agent:"agent-b", task:"Plan based on {previous}"}] }
-• Parallel fan-out: { chain: [{parallel: [{agent:"agent-a", task:"Check part of {task}", count: 3}]}] }
-• Mixed: { chain: [{agent:"agent-a", task:"Research {task}"}, {parallel: [{agent:"agent-b", task:"Review {previous}", count: 2}]}, {agent:"agent-c", task:"Summarize {previous}"}] }
-
-MANAGEMENT (use action field, omit agent/task/chain/tasks):
-• { action: "list" } - discover executable agents/chains
-• { action: "get", agent: "name" } - full detail; packaged agents use dotted runtime names like "package.agent"
-• { action: "models", agent?: "name" } - show the runtime-loaded builtin subagent model mapping, optionally filtered to one builtin
-• { action: "watchdog.status" | "watchdog.check" | "watchdog.recommend-model" } - inspect the opt-in subagent watchdog and its strong complementary model recommendation
-• { action: "watchdog.configure", model: "recommended" | "inherit" | "provider/model[:thinking]", scope?: "session" | "user" | "project", target?: "main" | "children" | "child", agent?: "name", thinking?: "inherit" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" } - configure watchdog model selection; default scope is session, use persistent scopes only when the user asks
-• { action: "create", config: { name: "custom-agent", package: "code-analysis", systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext, acceptance, ... } }
-• { action: "update", agent: "code-analysis.custom-agent", config: { package: "analysis", ... } } - merge
-• { action: "delete", agent: "code-analysis.custom-agent" }
-• { action: "eject", agent: "reviewer", agentScope?: "user" | "project" } - copy a bundled/package agent to user/project scope as an editable custom file that shadows the original (default scope: user)
-• { action: "disable", agent: "reviewer", agentScope?: "user" | "project" } - hide any agent from runtime discovery via a reversible settings override (default scope: user)
-• { action: "enable", agent: "reviewer", agentScope?: "user" | "project" } - remove a disabled override and restore discovery
-• { action: "reset", agent: "reviewer", agentScope?: "user" | "project" } - delete the scope's custom agent file and/or settings override, restoring the bundled default
-• Use chainName for chain operations; packaged chains also use dotted runtime names
-
-CONTROL:
-• { action: "status", id: "..." } - inspect an async/background run by id or prefix
-• { action: "status", view: "fleet" } - read-only active foreground/async fleet view with transcript commands
-• { action: "status", id: "...", view: "transcript", index?: 0, lines?: 80 } - tail a run or child output/session transcript
-• { action: "interrupt", id?: "..." } - soft-interrupt the current child turn and leave the run paused
-• { action: "stop", id: "..." } - stop a current-session top-level async run; stopped runs finish with state "stopped"
-• { action: "resume", id: "...", message: "...", index?: 0 } - interrupt then follow up with a live async child, or revive a completed async/foreground child from its session
-• { action: "steer", id: "...", message: "...", index?: 0 } - queue non-terminal guidance for a live/queued async Pi child when supported
-• { action: "append-step", id: "...", chain: [{agent:"agent-c", task:"Use {previous}"}] } - append one step to the tail of a running async chain
-
-SCHEDULE (opt-in; requires { "scheduledRuns": { "enabled": true } } in config.json):
-• { action: "schedule", agent, task?, schedule: "+10m" | "2030-01-01T09:00:00Z", scheduleName? } - defer a subagent launch until a future time. Also accepts tasks[] or chain[]. Scheduled runs always launch async with fresh context; they become normal tracked async runs once they fire. Only schedule explicit delayed runs the user asked for.
-• { action: "schedule-list" } - list scheduled runs for this session
-• { action: "schedule-status", id: "..." } - inspect one scheduled run
-• { action: "schedule-cancel", id: "..." } - cancel a scheduled run before it fires
-
-DIAGNOSTICS:
-• { action: "doctor" } - read-only report for runtime paths, discovery, sessions, and intercom
+const essentials = (on: FeatureText) => `${on("workflow-scripts", scriptCalls, structuredCalls)}
+Management: {action,id?,options:{...}}; fields not in this schema go in options.
+Launch agents by name and pass models as exact provider/id; an unknown agent or model returns the valid choices.
+Details: guide workflows/recommended-orchestration-pattern (async, review, failure recovery), ${on("workflow-scripts", "guide workflows/scripted-workflows, ")}guide tool-reference/retained-children, guide tool-reference/external-cli-agent-profiles.
 
 ${SUBAGENT_SAFETY_GUIDANCE}`;
 
-export const COMPACT_SUBAGENT_TOOL_DESCRIPTION = `Delegate to subagents or manage definitions. Use exactly one mode per call.
+const managementDiscovery = (on: FeatureText) => [
+	["list/get/models/guide"],
+	[on("agent-management", "create/update/delete/eject/disable/enable/reset/refine")],
+	[on("missions", "mission.*"), on("schedules", "schedule.*"), on("watchdog", "watchdog.*"), on("panes", "inspector.*, project.*"), on("lane-management", "lane.status/recordMerge/recordSupersession")],
+	[on("lane-management", "worktree.discard and reviewed worktree.cleanup")],
+	[`doctor${on("spawn-budget-grants", " and grant-spawn-budget")}`],
+].map((group) => group.filter(Boolean).join(", ")).filter(Boolean).join("; ");
 
-EXECUTE:
-• Before execution, call { action: "list" }; run only executable/non-disabled configured agents/chains.
-• SINGLE {agent, task?}; PARALLEL {tasks:[{agent,task,count?,output?,reads?,progress?}], concurrency?, worktree?}; CHAIN {chain:[{agent,task?},{parallel:[...]}]}.
-• context can be "fresh" or "fork"; omitted uses each agent defaultContext, otherwise fresh. timeoutMs/maxRuntimeMs apply to foreground and async/background runs.
-• Chain templates may use {task}, {previous}, {chain_dir}, and named outputs. Parallel worktree isolation requires a clean git repo.
-• Chain example: { chain: [{agent:"agent-a", task:"Analyze {task}"}, {parallel: [{agent:"agent-b", task:"Check {previous}", count: 3}]}] }
-• If list shows proactive skill subagent suggestions, use a small fresh-context fanout only when the task is broad enough.
+const scriptDetails = `• Scripts: JavaScript statement bodies with explicit return, top-level await, plain helpers/Promise chains; nested async function/arrow/method helpers are rejected. Await runs.run('key',{agent,task}) before .output; await runs.all([{key,agent,task},...]) for an ordered array, not a key map. Observe every stored run promise with direct await, Promise.race or Promise.all. Await/return runs.steer(key,message,options?) for a prior key, never raw run ids; queued/delivered/missed/failed receipts are not compliance proof.
+• workflow:'./path.js' (any value with '/') loads a file from request cwd; other strings name a resource, such as {workflow:'review',args:{task:'...'}}. agent/task exclude workflow; task excludes action; validate accepts workflow:true or a path without launching. Raw-script sandboxes add deeply frozen args that persist as evidence, so never include secrets; raw scripts cannot use runs.host. Granted commands/relative outputs use workflow cwd, never per-step cwd.
+• runs.lanes([{key,stages:[{key,agent,task},{key,resume:'previous',task}]}]) runs first stages together, later stages sequentially per lane. Failures stay lane-local; only explicit structuredOutput.verdict === 'blocked' blocks a successful stage, never reviewer prose.
+`;
 
-MANAGE / CONTROL:
-• Use action without execution fields: list, get, models, create, update, delete, eject, disable, enable, reset, doctor, watchdog.status, watchdog.check, watchdog.recommend-model, watchdog.configure.
-• Async control actions: status, interrupt, stop, resume, steer, append-step. Use stop with an id for current-session top-level async runs. Use status view:"fleet" for active-run overview, view:"transcript" to tail child output, and steer for non-terminal live guidance. Use id/runId prefixes carefully; use index for a specific child.
-• Opt-in schedule actions: schedule, schedule-list, schedule-status, schedule-cancel. Schedule only explicit delayed runs the user asked for.
+// Opt-in through toolDescriptionMode "full": the rarer rules the default leaves to guide sections.
+const fullDetails = (on: FeatureText) => `DETAILS:
+${on("workflow-scripts", scriptDetails)}• ${on("workflow-scripts", "Workflow child controls default onto runs.run/runs.all items; child fields override them.", "Top-level child controls apply to every chain/tasks child.")} worktree:true requires clean source, isolates each child and returns handoff artifacts; options.baseRef defaults to HEAD at allocation or a supported named ref, never full 40/64-character commit IDs or revision expressions.${on("usage-budgets", " usageBudget is shared across the workflow; already-running children are not stopped.")}
+• Async follows asyncByDefault (normally true); async:false only to block the parent, not for final reviews/gates. Consume results at dependency barriers. bg_wait is for provider/detached work without native notification that needs a same-turn result.
+• Bind durable output ${on("workflow-scripts", "on runs.run/runs.all", "with output")}, not task filename prose; return actual outputReference/outputPathMapping/artifactPaths, evidence and residual risks.
+• Ordinary child subagents are not orchestrators; only configured fanout within depth/session limits. Use fresh-context read-only reviewers when independent review was requested. Oracle/advisor unknowns use supervisor dialogue; one-shot only when requested.
+• children.list is workflow-only, not an exhaustive list of direct native children: resume only resumable rows. When an intended child's exact run id is known, inspect it with {action:"status",id}; if status identifies the candidate, attempt {action:"resume",id,message}. Resume authoritatively checks eligibility and may reject it. Use a labeled same-role fallback only when no known candidate exists or resume rejects eligibility.${on("workflow-scripts", " Scripts await runs.run(newKey,{resume:runId,task}); continue from the latest returned runId. Each distinct resume pass needs a new stable key; same-key reuse requires identical launch parameters.")}
+• External CLI agents need an installed, authenticated CLI; preflight at launch decides, and passive PATH/PATHEXT/X_OK is not authentication/version/launch proof. They support native options only when their runner declares them: model, structured output, acceptance/agentContract, ${on("tool-budgets", "tool budget, ")}fast, fork context or skills/tools.
+• Model override: copy exact provider/id, not agent names. Thinking uses model suffix${on("watchdog", ", not watchdog-only thinking")}.
+• Missions auto-attach${on("missions", " unless options.mission:false")}; ${on("workflow-scripts", "await state.get(key)/state.set(key,JSONValue) requires a mission. ")}See guide topic missions. Omit acceptance for reviewer/read-only calls; acceptance.review.required requests independent writer review.
+• Inspect asyncId/asyncDir (status.json, events.jsonl, logs) with status/debug.run; control with interrupt/stop/resume/steer. For local Pi children explicitly granted subagent_command, command.status/yield/cancel targets one exact toolCallId without interrupting the child.
+• After a failure, report the exact failure, run/status and repo/cwd/worktree/branch/ref, and verify a clean worktree or capture the partial diff before a same-protocol retry. Governed-workflow fallback to foreground/CLI needs explicit owner approval, not Pi core's generic pi -ne hint.
+• Management discovery: ${managementDiscovery(on)}. Use guide topics agents, ${on("missions", "missions, ")}observability, tool-reference, configuration, models${on("watchdog", ", watchdog")} or extension-api for exact action fields.${on("schedules", on("workflow-scripts", " Schedules take script inputs, not direct children; recipes live in the missions guide."))}`;
 
-ASYNC / WAIT:
-• async:true detaches background work. Do not sleep or poll just to wait; use subagent_wait only when this turn must block. Otherwise continue useful work or respond and let completion notifications arrive.
-• Status and artifacts live under asyncId/asyncDir with status.json, events.jsonl, output logs, session files, and { action:"status", id:"..." }.
+const fullDescription = (on: FeatureText) => `${essentials(on)}\n\n${fullDetails(on)}`;
 
-SAFETY:
-• Ordinary child subagents are not orchestrators and must not run subagents. Only explicit fanout children may use child-safe subagent, still bounded by depth/session limits.
-• Keep one writer per cwd/worktree. Use fresh read-only review/validation fanout, then synthesize and apply fixes from the parent unless isolated worktrees were intentionally requested.`;
+const allEnabled = featureText(resolveDisabledFeatureSurface({}));
+
+export const DEFAULT_SUBAGENT_TOOL_DESCRIPTION = essentials(allEnabled);
+
+export const SUBAGENT_TOOL_PROMPT_SNIPPET = "Delegate focused work to child agents; compose multi-child work in one workflow call.";
+const STRUCTURED_SUBAGENT_TOOL_PROMPT_SNIPPET = "Delegate focused work to child agents; compose multi-child work in one chain or tasks call.";
+
+export const COMPACT_SUBAGENT_TOOL_DESCRIPTION = DEFAULT_SUBAGENT_TOOL_DESCRIPTION;
+
+export const FULL_SUBAGENT_TOOL_DESCRIPTION = fullDescription(allEnabled);
 
 function isToolDescriptionMode(value: unknown): value is ToolDescriptionMode {
 	return value === "full" || value === "compact" || value === "custom";
@@ -106,6 +83,14 @@ export interface ToolDescriptionOptions {
 	cwd?: string;
 	agentDir?: string;
 	warn?: (message: string) => void;
+	/** Removes lines for disabled features from the default and full descriptions, including the ones custom templates insert with placeholders. */
+	disabledFeatures?: DisabledFeatureSurface;
+}
+
+// No promptGuidelines: the description carries the authorization rule, so it is stated once.
+export function buildSubagentToolPromptMetadata(config: Pick<ExtensionConfig, "toolDescriptionMode"> = {}, disabledFeatures?: DisabledFeatureSurface): { promptSnippet?: string } {
+	if (config.toolDescriptionMode !== undefined) return {};
+	return { promptSnippet: disabledFeatures?.features.has("workflow-scripts") ? STRUCTURED_SUBAGENT_TOOL_PROMPT_SNIPPET : SUBAGENT_TOOL_PROMPT_SNIPPET };
 }
 
 export function resolveToolDescriptionMode(config: Pick<ExtensionConfig, "toolDescriptionMode">, options?: ToolDescriptionOptions): ToolDescriptionMode {
@@ -125,15 +110,15 @@ function customDescriptionPaths(options?: ToolDescriptionOptions): string[] {
 	];
 }
 
-function renderCustomTemplate(template: string, options?: ToolDescriptionOptions): string {
+function renderCustomTemplate(template: string, on: FeatureText, options?: ToolDescriptionOptions): string {
 	const cwd = options?.cwd ?? process.cwd();
 	const agentDir = options?.agentDir ?? getAgentDir();
 	const projectConfigDir = getProjectConfigDir(cwd);
 	const variables: Record<string, () => string> = {
-		fullDescription: () => FULL_SUBAGENT_TOOL_DESCRIPTION,
-		full: () => FULL_SUBAGENT_TOOL_DESCRIPTION,
-		compactDescription: () => COMPACT_SUBAGENT_TOOL_DESCRIPTION,
-		compact: () => COMPACT_SUBAGENT_TOOL_DESCRIPTION,
+		fullDescription: () => fullDescription(on),
+		full: () => fullDescription(on),
+		compactDescription: () => essentials(on),
+		compact: () => essentials(on),
 		safetyGuidance: () => SUBAGENT_SAFETY_GUIDANCE,
 		safety: () => SUBAGENT_SAFETY_GUIDANCE,
 		agentDir: () => agentDir,
@@ -147,7 +132,7 @@ function renderCustomTemplate(template: string, options?: ToolDescriptionOptions
 	});
 }
 
-function loadCustomToolDescription(options?: ToolDescriptionOptions): string | undefined {
+function loadCustomToolDescription(on: FeatureText, options?: ToolDescriptionOptions): string | undefined {
 	for (const filePath of customDescriptionPaths(options)) {
 		let stat: fs.Stats;
 		try {
@@ -171,7 +156,7 @@ function loadCustomToolDescription(options?: ToolDescriptionOptions): string | u
 				warn(options, `Ignoring empty custom tool description '${filePath}'.`);
 				continue;
 			}
-			const rendered = renderCustomTemplate(template, options).trim();
+			const rendered = renderCustomTemplate(template, on, options).trim();
 			if (!rendered) {
 				warn(options, `Ignoring custom tool description '${filePath}' because it rendered empty.`);
 				continue;
@@ -196,12 +181,20 @@ function withMandatorySafetyGuidance(description: string): string {
 }
 
 export function buildSubagentToolDescription(config: Pick<ExtensionConfig, "toolDescriptionMode"> = {}, options?: ToolDescriptionOptions): string {
+	const description = describeSubagentTool(config, options);
+	const name = waitToolName();
+	return name === DEFAULT_WAIT_TOOL_NAME ? description : description.replace(/\bbg_wait\b/g, name);
+}
+
+function describeSubagentTool(config: Pick<ExtensionConfig, "toolDescriptionMode">, options?: ToolDescriptionOptions): string {
+	const on = options?.disabledFeatures ? featureText(options.disabledFeatures) : allEnabled;
+	if (config.toolDescriptionMode === undefined) return essentials(on);
 	const mode = resolveToolDescriptionMode(config, options);
-	if (mode === "compact") return COMPACT_SUBAGENT_TOOL_DESCRIPTION;
+	if (mode === "compact") return essentials(on);
 	if (mode === "custom") {
-		const custom = loadCustomToolDescription(options);
+		const custom = loadCustomToolDescription(on, options);
 		if (custom) return withMandatorySafetyGuidance(custom);
 		warn(options, `${CUSTOM_TOOL_DESCRIPTION_FILE} was not found or valid for toolDescriptionMode "custom"; using full description.`);
 	}
-	return FULL_SUBAGENT_TOOL_DESCRIPTION;
+	return fullDescription(on);
 }

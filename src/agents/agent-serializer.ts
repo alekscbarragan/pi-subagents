@@ -1,3 +1,4 @@
+import { stringify as stringifyYaml } from "yaml";
 import type { AgentConfig } from "./agents.ts";
 import { frontmatterNameForConfig } from "./identity.ts";
 
@@ -5,31 +6,46 @@ export const KNOWN_FIELDS = new Set([
 	"name",
 	"package",
 	"description",
+	"advertise",
+	"alias",
+	"aliases",
 	"tools",
+	"excludeTools",
+	"allowNestedSubagents",
+	"allowedAgents",
 	"model",
-	"fallbackModels",
+	"fast",
 	"thinking",
 	"systemPromptMode",
 	"inheritProjectContext",
+	"inheritGlobalContext",
 	"inheritSkills",
 	"defaultContext",
 	"async",
 	"timeoutMs",
-	"turnBudget",
+	"toolTimeoutMs",
 	"acceptance",
+	"acceptanceRole",
 	"skill",
 	"skills",
 	"skillPath",
 	"extensions",
 	"subagentOnlyExtensions",
+	"mutationTools",
+	"machine",
+	"launcher",
 	"output",
+	"outputMode",
+	"outputSchema",
 	"defaultReads",
 	"defaultProgress",
 	"interactive",
 	"maxSubagentDepth",
-	"completionGuard",
 	"toolBudget",
+	"permission",
+	"permissions",
 	"memory",
+	"runner",
 ]);
 
 function joinComma(values: string[] | undefined): string | undefined {
@@ -39,6 +55,8 @@ function joinComma(values: string[] | undefined): string | undefined {
 
 interface SerializeAgentOptions {
 	preserveFrontmatterFields?: ReadonlySet<string>;
+	/** The caller set inheritGlobalContext on create; write it even when false, because an absent field takes settings defaults. */
+	explicitInheritGlobalContext?: boolean;
 }
 
 export function serializeAgent(config: AgentConfig, options: SerializeAgentOptions = {}): string {
@@ -48,7 +66,15 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	lines.push("---");
 	lines.push(`name: ${frontmatterNameForConfig(config)}`);
 	if (config.packageName) lines.push(`package: ${config.packageName}`);
-	lines.push(`description: ${config.description}`);
+	if (config.description.includes("\n")) {
+		lines.push("description: |-");
+		for (const line of config.description.split("\n")) lines.push(`  ${line}`);
+	} else {
+		lines.push(`description: ${config.description}`);
+	}
+	if (config.advertise === true || preserve("advertise")) lines.push(`advertise: ${config.advertise === true ? "true" : "false"}`);
+	const aliasesValue = joinComma(config.aliases);
+	if (aliasesValue || preserve("alias", "aliases")) lines.push(`aliases: ${aliasesValue ?? ""}`);
 
 	const tools = [
 		...(config.tools ?? []),
@@ -56,20 +82,34 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	];
 	const toolsValue = joinComma(tools);
 	if (toolsValue || preserve("tools")) lines.push(`tools: ${toolsValue ?? ""}`);
+	const excludeToolsValue = joinComma(config.excludeTools);
+	if (excludeToolsValue || preserve("excludeTools")) lines.push(`excludeTools: ${excludeToolsValue ?? ""}`);
+	if (config.allowNestedSubagents === true || preserve("allowNestedSubagents")) {
+		lines.push(`allowNestedSubagents: ${config.allowNestedSubagents === undefined ? "" : config.allowNestedSubagents ? "true" : "false"}`);
+	}
+	if (config.allowedAgents !== undefined || preserve("allowedAgents")) {
+		lines.push(`allowedAgents: ${joinComma(config.allowedAgents) ?? ""}`);
+	}
 
 	if (config.model || preserve("model")) lines.push(`model: ${config.model ?? ""}`);
-	const fallbackModelsValue = joinComma(config.fallbackModels);
-	if (fallbackModelsValue || preserve("fallbackModels")) lines.push(`fallbackModels: ${fallbackModelsValue ?? ""}`);
-	if ((config.thinking && (config.thinking !== "off" || preserve("thinking"))) || (!config.thinking && preserve("thinking"))) {
-		lines.push(`thinking: ${config.thinking ?? ""}`);
-	}
+	if (config.fast === true || preserve("fast")) lines.push(`fast: ${config.fast === undefined ? "" : config.fast ? "true" : "false"}`);
+	if (config.thinking || preserve("thinking")) lines.push(`thinking: ${config.thinking ?? ""}`);
 	if (!preservingExistingFrontmatter || preserve("systemPromptMode")) lines.push(`systemPromptMode: ${config.systemPromptMode}`);
 	if (!preservingExistingFrontmatter || preserve("inheritProjectContext")) lines.push(`inheritProjectContext: ${config.inheritProjectContext ? "true" : "false"}`);
+	if (config.inheritGlobalContext || preserve("inheritGlobalContext") || options.explicitInheritGlobalContext) lines.push(`inheritGlobalContext: ${config.inheritGlobalContext ? "true" : "false"}`);
 	if (!preservingExistingFrontmatter || preserve("inheritSkills")) lines.push(`inheritSkills: ${config.inheritSkills ? "true" : "false"}`);
 	if (config.defaultContext || preserve("defaultContext")) lines.push(`defaultContext: ${config.defaultContext ?? ""}`);
+	if (config.runner || preserve("runner")) {
+		if (config.runner) {
+			lines.push("runner:");
+			for (const line of stringifyYaml(config.runner).trimEnd().split("\n")) lines.push(`  ${line}`);
+		} else {
+			lines.push("runner:");
+		}
+	}
 	if (config.defaultAsync !== undefined || preserve("async")) lines.push(`async: ${config.defaultAsync === undefined ? "" : config.defaultAsync ? "true" : "false"}`);
 	if (config.defaultTimeoutMs !== undefined || preserve("timeoutMs")) lines.push(`timeoutMs: ${config.defaultTimeoutMs ?? ""}`);
-	if (config.defaultTurnBudget || preserve("turnBudget")) lines.push(`turnBudget: ${config.defaultTurnBudget ? JSON.stringify(config.defaultTurnBudget) : ""}`);
+	if (config.defaultToolTimeoutMs !== undefined || preserve("toolTimeoutMs")) lines.push(`toolTimeoutMs: ${config.defaultToolTimeoutMs ?? ""}`);
 	if (config.defaultAcceptance !== undefined || preserve("acceptance")) {
 		lines.push(`acceptance: ${config.defaultAcceptance === undefined
 			? ""
@@ -77,6 +117,7 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 				? JSON.stringify(config.defaultAcceptance)
 				: String(config.defaultAcceptance)}`);
 	}
+	if (config.acceptanceRole || preserve("acceptanceRole")) lines.push(`acceptanceRole: ${config.acceptanceRole ?? ""}`);
 
 	const skillsValue = joinComma(config.skills);
 	if (skillsValue || preserve("skill", "skills")) lines.push(`skills: ${skillsValue ?? ""}`);
@@ -91,11 +132,17 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 		const subagentOnlyExtensionsValue = joinComma(config.subagentOnlyExtensions);
 		lines.push(`subagentOnlyExtensions: ${subagentOnlyExtensionsValue ?? ""}`);
 	}
+	const mutationToolsValue = joinComma(config.mutationTools);
+	if (mutationToolsValue || preserve("mutationTools")) lines.push(`mutationTools: ${mutationToolsValue ?? ""}`);
 
-	if (config.output) lines.push(`output: ${config.output}`);
+	if (config.machine || preserve("machine")) lines.push(`machine: ${config.machine ?? ""}`);
+	if (config.launcher) lines.push(`launcher: ${config.launcher}`);
+	if (config.output || preserve("output")) lines.push(`output: ${config.output ?? ""}`);
+	if (config.outputMode || preserve("outputMode")) lines.push(`outputMode: ${config.outputMode ?? ""}`);
+	if (config.outputSchema || preserve("outputSchema")) lines.push(`outputSchema: ${config.outputSchema ? JSON.stringify(config.outputSchema) : ""}`);
 
 	const readsValue = joinComma(config.defaultReads);
-	if (readsValue) lines.push(`defaultReads: ${readsValue}`);
+	if (readsValue || preserve("defaultReads")) lines.push(`defaultReads: ${readsValue ?? ""}`);
 
 	if (config.defaultProgress) lines.push("defaultProgress: true");
 	if (config.interactive) lines.push("interactive: true");
@@ -103,11 +150,15 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	if (typeof maxSubagentDepth === "number" && Number.isInteger(maxSubagentDepth) && maxSubagentDepth >= 0) {
 		lines.push(`maxSubagentDepth: ${maxSubagentDepth}`);
 	}
-	if (config.completionGuard === false || preserve("completionGuard")) {
-		lines.push(`completionGuard: ${config.completionGuard === undefined ? "" : config.completionGuard ? "true" : "false"}`);
-	}
 	if (config.toolBudget || preserve("toolBudget")) {
 		lines.push(`toolBudget: ${config.toolBudget ? JSON.stringify(config.toolBudget) : ""}`);
+	}
+	if (config.permissions || preserve("permission", "permissions")) {
+		const key = preserve("permission") && !preserve("permissions") ? "permission" : "permissions";
+		lines.push(`${key}:`);
+		if (config.permissions) {
+			for (const line of stringifyYaml(config.permissions).trimEnd().split("\n")) lines.push(`  ${line}`);
+		}
 	}
 
 	if (config.memory) {

@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { normalizeModelSegment, resolveModelCandidate } from "../runs/shared/model-fallback.ts";
+import { knownModelProviders, normalizeModelSegment, resolveModelCandidate } from "../runs/shared/model-resolution.ts";
+import type { WatchdogEndpointConfig } from "./types.ts";
 import {
 	getSupportedThinkingLevels,
 	splitKnownThinkingSuffix,
@@ -43,6 +44,7 @@ export interface ResolvedWatchdogModelInput {
 }
 
 export interface WatchdogModelRecommendation {
+	source: "configured" | "suggested";
 	model: string;
 	thinking: ThinkingLevel;
 	label: string;
@@ -81,7 +83,7 @@ export function resolveWatchdogModelInput(ctx: ExtensionContext, rawModel: strin
 	if (!trimmed) throw new Error("Watchdog model must be a non-empty provider/model value.");
 	const availableModels = modelRegistryEntries(ctx);
 	const preferredProvider = typeof ctx.model?.provider === "string" ? ctx.model.provider : undefined;
-	const resolved = resolveModelCandidate(trimmed, availableModels, preferredProvider) ?? trimmed;
+	const resolved = resolveModelCandidate(trimmed, availableModels, preferredProvider, knownModelProviders(ctx.modelRegistry)) ?? trimmed;
 	const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(resolved);
 	const named = splitProviderModel(baseModel);
 	if (!named) throw new Error(`Watchdog model '${rawModel}' did not resolve to provider/model. Use a provider-qualified model such as openai-codex/gpt-5.5:high or anthropic/claude-opus-4-8:high.`);
@@ -132,13 +134,13 @@ function findFamilyMatch(family: StrongWatchdogFamily, availableModels: ModelInf
 function resolveStrongCandidate(ctx: ExtensionContext, family: StrongWatchdogFamily): WatchdogModelRecommendation | undefined {
 	const availableModels = modelRegistryEntries(ctx);
 	const preference = STRONG_WATCHDOG_MODELS[family];
-	const queries = [...preference.queries];
+	const queries: string[] = [...preference.queries];
 	const familyMatch = findFamilyMatch(family, availableModels);
 	if (familyMatch) queries.push(familyMatch);
 	for (const query of queries) {
 		let resolved: ResolvedWatchdogModelInput;
 		try {
-			resolved = resolveWatchdogModelInput(ctx, query);
+			resolved = resolveWatchdogModelInput(ctx, query as Parameters<typeof resolveWatchdogModelInput>[1]);
 		} catch {
 			continue;
 		}
@@ -147,6 +149,7 @@ function resolveStrongCandidate(ctx: ExtensionContext, family: StrongWatchdogFam
 		if (!getSupportedThinkingLevels(modelInfo).includes(STRONG_WATCHDOG_THINKING)) continue;
 		const current = ctx.model ? fullModelId(toModelInfo(ctx.model)) : "no current session model";
 		return {
+			source: "suggested",
 			model: resolved.model,
 			thinking: STRONG_WATCHDOG_THINKING,
 			label: preference.label,
@@ -164,4 +167,21 @@ export function recommendStrongWatchdogModel(ctx: ExtensionContext): WatchdogMod
 	}
 	const current = ctx.model ? fullModelId(toModelInfo(ctx.model)) : "the current session";
 	throw new Error(`No authenticated strong complementary watchdog model was found for ${current}. Configure access to Opus 4.8 or GPT 5.5, then run the recommendation again.`);
+}
+
+export function recommendWatchdogModel(ctx: ExtensionContext, configured: WatchdogEndpointConfig): WatchdogModelRecommendation {
+	if (!configured.model) return recommendStrongWatchdogModel(ctx);
+	const resolved = resolveWatchdogModelInput(ctx, configured.model);
+	const thinking = resolved.thinking ?? parseWatchdogThinkingInput(configured.thinking) ?? "off";
+	return {
+		...resolved,
+		source: "configured",
+		thinking: thinking === false ? "off" : thinking,
+		label: "configured watchdog",
+		reason: "Keep the configured watchdog model and thinking; no replacement recommendation is needed. This is not a strength or independence assessment.",
+	};
+}
+
+export function formatWatchdogRecommendation(recommendation: WatchdogModelRecommendation): string {
+	return `${recommendation.source === "configured" ? "Keep configured watchdog" : "Recommended strong watchdog"}: ${recommendation.model}:${recommendation.thinking}`;
 }

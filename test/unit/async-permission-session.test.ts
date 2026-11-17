@@ -28,6 +28,7 @@ describe("async permission forwarding session identity", () => {
 				cwd: "/tmp/project",
 				currentSessionId,
 				parentSessionId: "session-abc123",
+				permissions: { rules: { write: "ask" } },
 			},
 			maxSubagentDepth: 1,
 			asyncDir: "/tmp/async-run",
@@ -37,6 +38,7 @@ describe("async permission forwarding session identity", () => {
 		const step = built.steps[0];
 		assert.ok(step && !("parallel" in step));
 		assert.equal(step.parentSessionId, "session-abc123");
+		assert.deepEqual(step.permissionRules, { write: "ask" });
 	});
 
 	it("consumes bounded dynamic fanout indexes before later static forked steps", () => {
@@ -74,10 +76,10 @@ describe("async permission forwarding session identity", () => {
 		assert.equal(staticWorker.thinking, "off");
 	});
 
-	it("applies thinking overrides to async fallback candidates", () => {
+	it("applies thinking overrides to the resolved async model", () => {
 		const built = buildAsyncRunnerSteps("run-abc", {
 			chain: [{ agent: "worker", task: "Do work" }],
-			agents: [{ ...makeAgent("worker"), model: "openai/gpt-5-mini:high", fallbackModels: ["anthropic/claude-sonnet-4:low"], thinking: "high" }],
+			agents: [{ ...makeAgent("worker"), model: "openai/gpt-5-mini:high", thinking: "high" }],
 			ctx: {
 				pi: {} as never,
 				cwd: "/tmp/project",
@@ -92,7 +94,7 @@ describe("async permission forwarding session identity", () => {
 		const step = built.steps[0];
 		assert.ok(step && !("parallel" in step));
 		assert.equal(step.model, "openai/gpt-5-mini:off");
-		assert.deepEqual(step.modelCandidates, ["openai/gpt-5-mini:off", "anthropic/claude-sonnet-4:off"]);
+		assert.equal(step.model, "openai/gpt-5-mini:off");
 		assert.equal(step.thinking, "off");
 	});
 });

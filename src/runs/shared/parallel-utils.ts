@@ -1,8 +1,29 @@
+export type ResolvedRunnerConfig = import("../../shared/types.ts").AgentRunnerConfig;
+
 export interface RunnerSubagentStep {
 	/** Session id of the direct parent session for permission-system ask forwarding. */
 	parentSessionId?: string;
+	/** Parent session file, recorded as the new child session's `parentSession` header. */
+	parentSessionFile?: string;
+	/** Resolved opt-in rules for native Pi child tool calls. */
+	permissionRules?: import("./permissions.ts").PermissionRules;
 	agent: string;
+	/** Human-readable display name for the child session, derived internally at launch. */
+	sessionName?: string;
 	task: string;
+	runner?: ResolvedRunnerConfig;
+	/** Herdr saved machine this external-cli step runs on; `cwd` is then the directory on that machine. */
+	machine?: import("../../shared/types.ts").PlacementMachineReference;
+	remoteReads?: string[] | false;
+	machineEnv?: Record<string, string>;
+	externalJobFollowUp?: {
+		sourceRunId: string;
+		sourceStepIndex: number;
+		parentProviderJobId: string;
+		requestId: string;
+		requestDigest: string;
+	};
+	context?: "fresh" | "fork";
 	importAsyncRoot?: {
 		runId: string;
 		asyncDir: string;
@@ -14,33 +35,75 @@ export interface RunnerSubagentStep {
 	outputName?: string;
 	structured?: boolean;
 	cwd?: string;
+	/** Original cwd input retained for launch diagnostics. */
+	requestedCwd?: string;
 	model?: string;
+	contextLimit?: number;
+	fast?: boolean;
 	thinking?: string;
-	modelCandidates?: string[];
+	/** Trailing Claude Code argv for an explicit model/thinking request. */
+	claudeCodeOverrideArgs?: string[];
+	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
+	requestedModel?: string;
+	/** The primary model is inherited from the parent session and should not be verified against the child-reported active registry model. */
+	skipPrimaryModelVerification?: boolean;
+	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string; contextWindow?: number }>;
+	modelResponseAliases?: Record<string, string[]>;
 	tools?: string[];
+	/** Provider of `model` that a parent extension registers; set only when this child loads no ambient extensions. */
+	parentExtensionProvider?: string;
+	excludeTools?: string[];
+	allowNestedSubagents?: boolean;
+	/** Resolved selected-agent policy for launches made by this child. */
+	allowedAgents?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
+	/** Private immutable host policy snapshot serialized to the native runner. */
+	requiredExtensions?: import("../../shared/required-child-extensions.ts").RequiredChildExtensionSnapshot;
 	mcpDirectTools?: string[];
-	completionGuard?: boolean;
+	/** The parent's resolution of `mcpDirectTools` against Pi's built-in MCP; the runner has no host to repeat it. */
+	builtinMcpTools?: import("./mcp-direct-tool-grant.ts").ResolvedMcpDirectToolSelection[];
+	mutationTools?: string[];
 	systemPrompt?: string | null;
 	systemPromptMode?: "append" | "replace";
 	inheritProjectContext: boolean;
+	inheritGlobalContext: boolean;
 	inheritSkills: boolean;
 	skills?: string[];
 	outputPath?: string;
+	outputClaimPath?: string;
 	/** Defer the authoritative output instruction until a dynamic fanout item is materialized. */
 	namespaceOutputPath?: boolean;
 	outputMode?: "inline" | "file-only";
 	sessionFile?: string;
 	maxSubagentDepth?: number;
-	structuredOutput?: {
-		schema: import("../../shared/types.ts").JsonSchemaObject;
-		schemaPath: string;
-		outputPath: string;
-	};
+	timeoutMs?: number;
+	/** Resolved configured hard per-tool-call timeout (ms); fast tools still have a default when undefined. */
+	toolTimeoutMs?: number;
+	waitToolEnabled?: boolean;
+	waitToolDefaultTimeoutMs?: number;
+	structuredOutput?: import("./structured-output.ts").StructuredOutputRuntime;
 	structuredOutputSchema?: import("../../shared/types.ts").JsonSchemaObject;
+	agentContract?: import("../../shared/types.ts").AgentContract;
+	definitionDigest?: string;
+	launchBindingTask?: string;
+	launchContractDigest?: string;
+	extensionBindings?: import("./extension-bindings.ts").ExtensionBindings;
+	launchResolvedExtensions?: import("../../shared/types.ts").LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: import("../../shared/types.ts").RuntimeAcknowledgedChildExtensions;
 	effectiveAcceptance?: import("../../shared/types.ts").ResolvedAcceptanceConfig;
+	acceptanceInput?: import("../../shared/types.ts").AcceptanceInput;
+	acceptanceRole?: import("../../shared/types.ts").AcceptanceRole;
+	gateOn?: import("../../shared/types.ts").ChainGateLayer;
 	toolBudget?: import("../../shared/types.ts").ResolvedToolBudget;
+	capabilityCeiling?: import("./capability-ceiling.ts").ResolvedSubagentCapabilityCeiling;
+	capabilityAudit?: import("./capability-ceiling.ts").SubagentCapabilityAudit;
+	/** Private stable logical-child path for inherited run fan-out accounting. */
+	runFanoutPath?: string;
+	/** Run this single child in one managed worktree. */
+	worktree?: boolean;
+	/** Bounded launch-declared lane metadata; display/triage only. */
+	lane?: import("../../shared/types.ts").WorkflowLaneMetadata;
 }
 
 export interface ParallelStepGroup {
@@ -61,6 +124,13 @@ export interface DynamicRunnerGroup {
 	sessionFiles?: (string | undefined)[];
 	thinkingOverrides?: (string | undefined)[];
 	effectiveAcceptance?: import("../../shared/types.ts").ResolvedAcceptanceConfig;
+	acceptanceInput?: import("../../shared/types.ts").AcceptanceInput;
+	acceptanceRole?: import("../../shared/types.ts").AcceptanceRole;
+	agentContract?: import("../../shared/types.ts").AgentContract;
+	gateOn?: import("../../shared/types.ts").ChainGateLayer;
+	capabilityCeiling?: import("./capability-ceiling.ts").ResolvedSubagentCapabilityCeiling;
+	capabilityAudit?: import("./capability-ceiling.ts").SubagentCapabilityAudit;
+	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
 }
 
 export type RunnerStep = RunnerSubagentStep | ParallelStepGroup | DynamicRunnerGroup;
@@ -128,29 +198,47 @@ export async function mapConcurrent<T, R>(
 	limit: number,
 	fn: (item: T, i: number) => Promise<R>,
 	globalSemaphore?: Semaphore,
+	/** Invoked after every worker has stopped, including workers outliving an early rejection. */
+	onSchedulingSettled?: () => void,
 ): Promise<R[]> {
 	const safeLimit = Math.max(1, Math.floor(limit) || 1);
 	const results: R[] = new Array(items.length);
 	let next = 0;
+	let liveWorkers = Math.min(safeLimit, items.length);
+	const notifySchedulingSettled = () => {
+		try {
+			onSchedulingSettled?.();
+		} catch {
+			// Scheduling lifecycle cleanup must not replace the worker result.
+		}
+	};
 
 	async function worker(_workerIndex: number): Promise<void> {
-		while (next < items.length) {
-			const i = next++;
-			if (globalSemaphore) {
-				await globalSemaphore.acquire();
-				try {
-					results[i] = await fn(items[i], i);
-				} finally {
-					globalSemaphore.release();
+		try {
+			while (next < items.length) {
+				const i = next++;
+				if (!(i in items)) throw new Error(`Missing parallel item at index ${i}`);
+				const item = items[i] as T;
+				if (globalSemaphore) {
+					await globalSemaphore.acquire();
+					try {
+						results[i] = await fn(item, i);
+					} finally {
+						globalSemaphore.release();
+					}
+				} else {
+					results[i] = await fn(item, i);
 				}
-			} else {
-				results[i] = await fn(items[i], i);
 			}
+		} finally {
+			liveWorkers--;
+			if (liveWorkers === 0) notifySchedulingSettled();
 		}
 	}
 
+	if (liveWorkers === 0) notifySchedulingSettled();
 	await Promise.all(
-		Array.from({ length: Math.min(safeLimit, items.length) }, (_, wi) => worker(wi)),
+		Array.from({ length: liveWorkers }, (_, wi) => worker(wi)),
 	);
 	return results;
 }
@@ -163,7 +251,6 @@ export interface ParallelTaskResult {
 	error?: string;
 	timedOut?: boolean;
 	model?: string;
-	attemptedModels?: string[];
 	outputTargetPath?: string;
 	outputTargetExists?: boolean;
 }

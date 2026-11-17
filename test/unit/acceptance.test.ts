@@ -1,15 +1,23 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { Message } from "@earendil-works/pi-ai";
+import { discoverAgentsAll } from "../../src/agents/agents.ts";
 import {
 	acceptanceFailureMessage,
 	aggregateAcceptanceReport,
+	captureStagedIndexBaseline,
 	evaluateAcceptance,
 	formatAcceptancePrompt,
+	normalizeAcceptanceInput,
+	normalizeGateAcceptance,
 	parseAcceptanceReport,
+	quoteExecutableForShell,
+	resolveAcceptanceReportMode,
 	resolveEffectiveAcceptance,
 	stripAcceptanceReport,
 	validateAcceptanceInput,
@@ -46,12 +54,62 @@ function tempRepo(): string {
 	return dir;
 }
 
+function tempGitRepo(): string {
+	const dir = tempRepo();
+	execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+	execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir });
+	execFileSync("git", ["config", "user.name", "Test User"], { cwd: dir });
+	execFileSync("git", ["add", "file.txt"], { cwd: dir });
+	execFileSync("git", ["commit", "-m", "base"], { cwd: dir, stdio: "ignore" });
+	return dir;
+}
+
 describe("acceptance gates", () => {
-	it("infers different policies for reviewer, writer, async writer, and dynamic contexts", () => {
-		assert.equal(resolveEffectiveAcceptance({ agentName: "reviewer", task: "Review-only. Do not edit.", mode: "single" }).level, "attested");
-		assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task: "Implement the fix", mode: "single" }).level, "checked");
-		assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task: "Implement the fix", mode: "single", async: true }).level, "reviewed");
-		assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task: "Fix each item", mode: "chain", dynamic: true }).level, "reviewed");
+	it("applies checked acceptance to declared builtin writer profiles", () => {
+		const builtins = discoverAgentsAll(tempRepo()).builtin;
+		const writerNames = ["worker", "claude-code-writer", "codex-exec-writer", "cursor-agent-writer"];
+		assert.deepEqual(writerNames.map((name) => builtins.find((agent) => agent.name === name)?.acceptanceRole), writerNames.map(() => "writer"));
+		assert.equal(builtins.find((agent) => agent.name === "delegate")?.acceptanceRole, undefined);
+		const worker = builtins.find((agent) => agent.name === "worker");
+		assert.equal(resolveEffectiveAcceptance({ agentName: "worker", acceptanceRole: worker?.acceptanceRole }).level, "checked");
+	});
+	it("needs no acceptance report from the builtin read-only agents unless the caller asks for one", () => {
+		const builtins = discoverAgentsAll(tempRepo()).builtin;
+		for (const name of ["reviewer", "oracle", "evidence-auditor"]) {
+			const agent = builtins.find((candidate) => candidate.name === name);
+			assert.equal(resolveEffectiveAcceptance({ agentName: name, acceptanceRole: agent?.acceptanceRole, task: "Review the diff." }).level, "none", name);
+			assert.equal(resolveEffectiveAcceptance({ agentName: name, acceptanceRole: agent?.acceptanceRole, task: "Review the diff.", explicit: { level: "checked" } }).level, "checked", name);
+		}
+	});
+
+
+	it("infers evidence levels and review requirements from declared roles", () => {
+		assert.equal(resolveEffectiveAcceptance({ agentName: "worker", acceptanceRole: "read-only", task: "Implement the fix", mode: "single" }).level, "none");
+		assert.equal(resolveEffectiveAcceptance({ agentName: "reviewer", acceptanceRole: "writer", task: "Review-only. Do not edit.", mode: "single" }).level, "checked");
+		for (const resolved of [
+			resolveEffectiveAcceptance({ agentName: "worker", acceptanceRole: "writer", task: "Implement the fix", mode: "single", async: true }),
+			resolveEffectiveAcceptance({ agentName: "worker", acceptanceRole: "writer", task: "Fix each item", mode: "chain", dynamic: true }),
+		]) {
+			assert.equal(resolved.level, "checked");
+			assert.equal(resolved.review && resolved.review !== false ? resolved.review.required : undefined, true);
+		}
+	});
+
+	it("task prose and agent names cannot change inferred acceptance", () => {
+		const tasks = [
+			"Review only; do not edit files.",
+			"Implement the destructive security migration and commit it.",
+			"Release fix pass with data-loss risk.",
+		];
+		for (const task of tasks) {
+			for (const agentName of ["worker", "reviewer", "oracle", "release-analyst"]) {
+				assert.equal(resolveEffectiveAcceptance({ agentName, task, async: true, dynamic: true }).level, "attested", `${agentName}: ${task}`);
+				assert.equal(resolveEffectiveAcceptance({ agentName, acceptanceRole: "read-only", task, async: true, dynamic: true }).level, "none", `${agentName}: ${task}`);
+				const writer = resolveEffectiveAcceptance({ agentName, acceptanceRole: "writer", task, async: true, dynamic: true });
+				assert.equal(writer.level, "checked", `${agentName}: ${task}`);
+				assert.equal(writer.review && writer.review !== false ? writer.review.required : undefined, true, `${agentName}: ${task}`);
+			}
+		}
 	});
 
 	it("explicit acceptance can strengthen inferred policy", () => {
@@ -63,6 +121,52 @@ describe("acceptance gates", () => {
 
 		assert.equal(resolved.level, "verified");
 		assert.equal(resolved.verify[0]?.id, "ok");
+	});
+
+	it("agent contract disables inferred acceptance without changing current defaults", () => {
+		const current = resolveEffectiveAcceptance({ agentName: "worker", acceptanceRole: "writer", task: "Implement the fix", mode: "single", async: true });
+		assert.equal(current.level, "checked");
+		assert.equal(current.review && current.review !== false ? current.review.required : undefined, true);
+		assert.deepEqual(current.inferredReason, ["async declared writer"]);
+
+		for (const explicit of [undefined, "auto" as const, false] as const) {
+			const resolved = resolveEffectiveAcceptance({ agentName: "worker", acceptanceRole: "writer", task: "Implement the fix", mode: "single", async: true, explicit, agentContract: { version: 1 } });
+			assert.equal(resolved.level, "none");
+			assert.deepEqual(resolved.inferredReason, []);
+			assert.equal(resolved.explicit, explicit !== undefined);
+		}
+	});
+
+	it("agent contract keeps explicit acceptance report-optional and verify-only", async () => {
+		const checked = resolveEffectiveAcceptance({
+			agentName: "worker",
+			task: "Implement the fix",
+			explicit: "checked",
+			agentContract: { version: 1 },
+		});
+		assert.equal(formatAcceptancePrompt(checked, { reportOptional: true }), "");
+		const checkedLedger = await evaluateAcceptance({ acceptance: checked, output: "done", cwd: process.cwd(), reportOptional: true });
+		assert.equal(checkedLedger.status, "checked");
+		assert.equal(acceptanceFailureMessage(checkedLedger), undefined);
+
+		const verified = resolveEffectiveAcceptance({
+			agentName: "worker",
+			task: "Implement the fix",
+			explicit: { level: "verified", verify: [{ id: "ok", command: `${process.execPath} -e "process.exit(0)"` }] },
+			agentContract: { version: 1 },
+		});
+		assert.equal(formatAcceptancePrompt(verified, { reportOptional: true }), "");
+		const verifiedLedger = await evaluateAcceptance({ acceptance: verified, output: "done", cwd: process.cwd(), reportOptional: true });
+		assert.equal(verifiedLedger.status, "verified");
+		assert.equal(verifiedLedger.verifyRuns[0]?.status, "passed");
+	});
+
+	it("current/default acceptance still rejects missing required reports", async () => {
+		const current = resolveEffectiveAcceptance({ agentName: "worker", task: "Implement the fix", explicit: "checked" });
+		const ledger = await evaluateAcceptance({ acceptance: current, output: "done", cwd: process.cwd() });
+
+		assert.equal(ledger.status, "rejected");
+		assert.match(acceptanceFailureMessage(ledger) ?? "", /Structured acceptance report not found/);
 	});
 
 	it("formats a standardized child prompt section", () => {
@@ -78,13 +182,52 @@ describe("acceptance gates", () => {
 		assert.match(prompt, /Patch the bug/);
 		assert.match(prompt, /```acceptance-report/);
 		assert.match(prompt, /array fields contain strings/);
+		assert.match(prompt, /empty-string entr(?:y|ies).*\[\s*""\s*\]/i);
 		assert.match(prompt, /criteriaSatisfied\[\]\.status.*satisfied, not-satisfied, not-applicable/);
 		assert.match(prompt, /commandsRun\[\]\.result.*passed, failed, not-run/);
+		assert.match(prompt, /manualNotes.*optional strings.*empty string.*does not satisfy.*manual-notes/);
 		assert.match(prompt, /"reviewFindings": \[\n    "blocker:/);
 	});
 
+	it("labels declared review gates as optional when required is false", () => {
+		const optional = resolveEffectiveAcceptance({
+			agentName: "worker",
+			task: "Implement a fix",
+			explicit: { level: "checked", review: { agent: "reviewer", required: false } },
+		});
+
+		assert.match(formatAcceptancePrompt(optional), /Review gate: optional by reviewer\./);
+	});
+
+	it("omits inferred read-only prompts while preserving explicit acceptance", () => {
+		const inferred = resolveEffectiveAcceptance({
+			agentName: "reviewer",
+			acceptanceRole: "read-only",
+			task: "Review the diff and return findings only.",
+		});
+		assert.equal(inferred.level, "none");
+		assert.equal(formatAcceptancePrompt(inferred), "");
+
+		const explicit = resolveEffectiveAcceptance({
+			agentName: "reviewer",
+			acceptanceRole: "read-only",
+			task: "Review the diff and return findings only.",
+			explicit: { level: "checked", criteria: ["Return the review findings"] },
+		});
+		assert.match(formatAcceptancePrompt(explicit), /```acceptance-report/);
+
+		const explicitCriteria = resolveEffectiveAcceptance({
+			agentName: "reviewer",
+			acceptanceRole: "read-only",
+			task: "Review the diff and return findings only.",
+			explicit: { criteria: ["Return the review findings"] },
+		});
+		assert.equal(explicitCriteria.level, "attested");
+		assert.match(formatAcceptancePrompt(explicitCriteria), /```acceptance-report/);
+	});
+
 	it("includes every required resolved criterion in report examples", () => {
-		const inferred = resolveEffectiveAcceptance({ agentName: "worker", task: "Implement the fix", mode: "single", async: true });
+		const inferred = resolveEffectiveAcceptance({ agentName: "worker", acceptanceRole: "writer", task: "Implement the fix", mode: "single", async: true });
 		const inferredExample = formatAcceptancePrompt(inferred).match(/```acceptance-report\n([\s\S]*?)\n```/);
 		assert.ok(inferredExample?.[1]);
 		assert.deepEqual(
@@ -160,13 +303,29 @@ describe("acceptance gates", () => {
 		for (const malformedOutput of [
 			"```acceptance-report\n{bad-json\n```",
 			"```acceptance-report\n```",
-			"```acceptance-report\n{\"criteriaSatisfied\": []}",
+			"```acceptance-report\n{\"changedFiles\": false}",
 			"ACCEPTANCE_REPORT: { not json",
 			"ACCEPTANCE_REPORT: no object",
 		]) {
 			const malformed = parseAcceptanceReport(malformedOutput);
 			assert.equal(malformed.report, undefined);
 			assert.match(malformed.error ?? "", /Failed to parse acceptance-report/, malformedOutput);
+		}
+	});
+
+	it("recovers a valid report from an unterminated explicit fence only", () => {
+		const recovered = parseAcceptanceReport(`done\n\`\`\`acceptance-report\n${JSON.stringify(reportData())}`);
+		assert.deepEqual(recovered.report?.changedFiles, ["src/file.ts"]);
+		assert.equal(recovered.error, undefined);
+
+		for (const invalid of [
+			"```acceptance-report\n{ not json",
+			`\`\`\`acceptance-report\n${JSON.stringify(reportData())}\ntrailing prose`,
+			`\`\`\`acceptance-report\n${JSON.stringify({ changedFiles: false })}`,
+		]) {
+			const parsed = parseAcceptanceReport(invalid);
+			assert.equal(parsed.report, undefined);
+			assert.match(parsed.error ?? "", /Failed to parse acceptance-report/);
 		}
 	});
 
@@ -298,12 +457,66 @@ describe("acceptance gates", () => {
 			[{ criteriaSatisfied: [{ id: "criterion-1", status: "maybe", evidence: "proof" }] }, /criteriaSatisfied\[0\]\.status.*got "maybe"/],
 			[{ criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "proof", confidence: 1 }] }, /criteriaSatisfied\[0\]\.confidence: unsupported acceptance criterion field/],
 			[{ criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "proof" }, { id: "Criterion_1", status: "satisfied", evidence: "proof" }] }, /duplicate normalized criterion id 'criterion-1'/],
-			[{ reviewFindings: [""] }, /reviewFindings\[0\]: expected non-empty string; got ""/],
+			[{ reviewFindings: [{}] }, /reviewFindings\[0\]: expected non-empty string; got object/],
 			[{ noStagedFiles: "yes" }, /noStagedFiles: expected boolean; got "yes"/],
 		] as const) {
 			const parsed = parseAcceptanceReport(report(overrides));
 			assert.equal(parsed.report, undefined);
 			assert.match(parsed.error ?? "", expected);
+		}
+	});
+
+	it("tolerates empty-string entries in string-array fields by dropping them at parse time", () => {
+		// A model writing ["\"\""] for "no items" must not fail the whole report.
+		for (const field of ["changedFiles", "testsAddedOrUpdated", "validationOutput", "residualRisks", "reviewFindings"] as const) {
+			const parsed = parseAcceptanceReport(report({ [field]: [""] }));
+			assert.equal(parsed.error, undefined, `${field}: ["\"\""] should parse`);
+			assert.deepEqual(parsed.report?.[field], [], `${field}: empty-string entries dropped`);
+		}
+
+		const mixed = parseAcceptanceReport(report({ reviewFindings: ["blocker: file.ts:12", ""] }));
+		assert.equal(mixed.error, undefined);
+		assert.deepEqual(mixed.report?.reviewFindings, ["blocker: file.ts:12"]);
+
+		const whitespace = parseAcceptanceReport(report({ validationOutput: ["  "] }));
+		assert.equal(whitespace.error, undefined);
+		assert.deepEqual(whitespace.report?.validationOutput, []);
+
+		const coerced = parseAcceptanceReport(report({ changedFiles: "src/file.ts" }));
+		assert.equal(coerced.error, undefined);
+		assert.deepEqual(coerced.report?.changedFiles, ["src/file.ts"]);
+
+		const invalid = parseAcceptanceReport(report({ reviewFindings: [{}] }));
+		assert.equal(invalid.report, undefined);
+		assert.match(invalid.error ?? "", /reviewFindings\[0\]: expected non-empty string; got object/);
+	});
+
+	it("accepts empty optional note strings without treating them as evidence", async () => {
+		for (const field of ["manualNotes", "notes"] as const) {
+			const parsed = parseAcceptanceReport(report({ notes: undefined, [field]: "" }));
+			assert.equal(parsed.error, undefined);
+			assert.equal(parsed.report?.[field], "");
+		}
+
+		const cwd = tempRepo();
+		try {
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "worker",
+				acceptanceRole: "writer",
+				task: "Return a concise result",
+				explicit: { level: "attested", evidence: ["manual-notes"] },
+			});
+			const ledger = await evaluateAcceptance({
+				acceptance,
+				output: report({ notes: undefined, manualNotes: "" }),
+				cwd,
+			});
+			assert.equal(ledger.childReportParseError, undefined);
+			assert.equal(ledger.childReport?.manualNotes, "");
+			assert.equal(ledger.status, "rejected");
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "evidence:manual-notes")?.status, "failed");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 
@@ -358,6 +571,168 @@ describe("acceptance gates", () => {
 			assert.equal(ledger.status, "checked");
 			assert.equal(ledger.runtimeChecks.find((check) => check.id === "evidence:changed-files")?.status, "not-applicable");
 			assert.equal(ledger.runtimeChecks.find((check) => check.id === "evidence:tests-added")?.status, "not-applicable");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts read-only reviewer reports that omit child no-staged-files evidence when the worktree is clean", async () => {
+		const cwd = tempGitRepo();
+		try {
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "reviewer",
+				task: "Review-only. Do not edit.",
+				explicit: { level: "checked", evidence: ["review-findings", "commands-run", "validation-output", "residual-risks"] },
+			});
+			const ledger = await evaluateAcceptance({
+				acceptance,
+				output: report({
+					changedFiles: [],
+					testsAddedOrUpdated: [],
+					validationOutput: ["Read-only review completed."],
+					reviewFindings: [],
+					noStagedFiles: undefined,
+				}),
+				cwd,
+			});
+
+			assert.equal(ledger.status, "checked");
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "evidence:no-staged-files"), undefined);
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "no-staged-files")?.status, "passed");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("still rejects aggregate no-staged-files evidence when a child worktree reports staged files", async () => {
+		const cwd = tempGitRepo();
+		try {
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "reviewer",
+				task: "Review-only. Do not edit.",
+				explicit: { level: "checked", evidence: ["review-findings", "commands-run", "validation-output", "residual-risks"] },
+			});
+			const ledger = await evaluateAcceptance({
+				acceptance,
+				output: report({
+					changedFiles: [],
+					testsAddedOrUpdated: [],
+					validationOutput: ["Dynamic fanout review completed."],
+					reviewFindings: [],
+					noStagedFiles: false,
+				}),
+				cwd,
+			});
+
+			assert.equal(ledger.status, "rejected");
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "evidence:no-staged-files")?.status, "failed");
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "no-staged-files")?.status, "passed");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("still rejects omitted child no-staged-files evidence when the parent git check finds staged files", async () => {
+		const cwd = tempGitRepo();
+		try {
+			fs.writeFileSync(path.join(cwd, "staged.txt"), "staged\n", "utf-8");
+			execFileSync("git", ["add", "staged.txt"], { cwd });
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "reviewer",
+				task: "Review-only. Do not edit.",
+				explicit: { level: "checked", evidence: ["review-findings", "commands-run", "validation-output", "residual-risks"] },
+			});
+			const ledger = await evaluateAcceptance({
+				acceptance,
+				output: report({
+					changedFiles: [],
+					testsAddedOrUpdated: [],
+					validationOutput: ["Read-only review completed."],
+					reviewFindings: [],
+					noStagedFiles: undefined,
+				}),
+				cwd,
+			});
+
+			assert.equal(ledger.status, "rejected");
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "evidence:no-staged-files"), undefined);
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "no-staged-files")?.status, "failed");
+			assert.match(acceptanceFailureMessage(ledger) ?? "", /Staged files present/);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts an explicitly preserved staged index when only working-tree content changes", async () => {
+		const cwd = tempGitRepo();
+		try {
+			fs.writeFileSync(path.join(cwd, "owned.txt"), "parent staged\n", "utf-8");
+			execFileSync("git", ["add", "owned.txt"], { cwd });
+			fs.mkdirSync(path.join(cwd, "nested"));
+			const baseline = captureStagedIndexBaseline(path.join(cwd, "nested"));
+			fs.writeFileSync(path.join(cwd, "working-only.txt"), "child fix\n", "utf-8");
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "worker",
+				task: "Implement a fix",
+				explicit: { level: "checked", preserveStagedIndex: true },
+			});
+			const ledger = await evaluateAcceptance({
+				acceptance,
+				output: report({ noStagedFiles: false }),
+				cwd: path.join(cwd, "nested"),
+				stagedIndexBaseline: baseline,
+			});
+
+			assert.equal(ledger.status, "checked");
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "evidence:no-staged-files"), undefined);
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "staged-index-unchanged")?.status, "passed");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a changed or unavailable staged-index baseline", async () => {
+		const cwd = tempGitRepo();
+		try {
+			fs.writeFileSync(path.join(cwd, "owned.txt"), "parent staged\n", "utf-8");
+			execFileSync("git", ["add", "owned.txt"], { cwd });
+			const baseline = captureStagedIndexBaseline(cwd);
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "worker",
+				task: "Implement a fix",
+				explicit: { level: "checked", preserveStagedIndex: true },
+			});
+			fs.writeFileSync(path.join(cwd, "child-staged.txt"), "unexpected\n", "utf-8");
+			execFileSync("git", ["add", "child-staged.txt"], { cwd });
+
+			const changed = await evaluateAcceptance({ acceptance, output: report({ noStagedFiles: false }), cwd, stagedIndexBaseline: baseline });
+			const unavailable = await evaluateAcceptance({ acceptance, output: report({ noStagedFiles: false }), cwd });
+
+			assert.equal(changed.status, "rejected");
+			assert.equal(changed.runtimeChecks.find((check) => check.id === "staged-index-unchanged")?.status, "failed");
+			assert.equal(unavailable.status, "rejected");
+			assert.match(acceptanceFailureMessage(unavailable) ?? "", /baseline is unavailable/);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when a staged-index baseline cannot be captured", () => {
+		const cwd = tempRepo();
+		try {
+			assert.throws(() => captureStagedIndexBaseline(cwd), /Unable to capture staged index baseline/);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("captures staged-index baselines in SHA-256 repositories", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "acceptance-sha256-"));
+		try {
+			execFileSync("git", ["init", "--object-format=sha256", "-q"], { cwd });
+			fs.writeFileSync(path.join(cwd, "staged.txt"), "content\n", "utf-8");
+			execFileSync("git", ["add", "staged.txt"], { cwd });
+			assert.match(captureStagedIndexBaseline(cwd), /^[0-9a-f]{64}$/);
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
@@ -443,6 +818,15 @@ describe("acceptance gates", () => {
 			});
 			assert.equal(malformedDirect.status, "rejected");
 			assert.match(malformedDirect.childReportParseError ?? "", /unexpected: unsupported acceptance report field/);
+
+			const nullDirect = await evaluateAcceptance({
+				acceptance,
+				output: report({ changedFiles: [], testsAddedOrUpdated: [] }),
+				report: null as never,
+				cwd,
+			});
+			assert.equal(nullDirect.status, "rejected");
+			assert.match(nullDirect.childReportParseError ?? "", /acceptance-report: expected object; got null/);
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
@@ -495,22 +879,51 @@ describe("acceptance gates", () => {
 		}
 	});
 
-	it("reviewed mode records no-blocker and blocker reviewer outcomes", async () => {
+	it("rejects when a successful verify command changes a preserved staged index", async () => {
+		const cwd = tempGitRepo();
+		try {
+			fs.writeFileSync(path.join(cwd, "owned.txt"), "parent staged\n", "utf-8");
+			execFileSync("git", ["add", "owned.txt"], { cwd });
+			const baseline = captureStagedIndexBaseline(cwd);
+			fs.writeFileSync(path.join(cwd, "verify-staged.txt"), "verify mutation\n", "utf-8");
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "worker",
+				task: "Implement a fix",
+				explicit: {
+					level: "verified",
+					preserveStagedIndex: true,
+					verify: [{ id: "stage", command: "git add verify-staged.txt" }],
+				},
+			});
+
+			const ledger = await evaluateAcceptance({ acceptance, output: report({ noStagedFiles: false }), cwd, stagedIndexBaseline: baseline });
+
+			assert.equal(ledger.status, "rejected");
+			assert.equal(ledger.verifyRuns[0]?.status, "passed");
+			assert.equal(ledger.runtimeChecks.find((check) => check.id === "staged-index-unchanged")?.status, "failed");
+			assert.notEqual(captureStagedIndexBaseline(cwd), baseline);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("records achieved, blocked, and pending independent review separately from evidence", async () => {
 		const cwd = tempRepo();
 		try {
 			const acceptance = resolveEffectiveAcceptance({
 				agentName: "worker",
 				task: "Implement a risky fix",
-				explicit: { level: "reviewed", review: { agent: "reviewer", required: true } },
+				explicit: { level: "checked", review: { agent: "reviewer", required: true } },
 			});
-			const noBlockers = await evaluateAcceptance({
+			const reviewed = await evaluateAcceptance({
 				acceptance,
 				output: report(),
 				cwd,
-				reviewResult: { status: "no-blockers", findings: [] },
+				reviewResult: { status: "reviewed", findings: [] },
 			});
-			assert.equal(noBlockers.status, "reviewed");
-			assert.equal(noBlockers.reviewResult?.status, "no-blockers");
+			assert.equal(reviewed.status, "reviewed");
+			assert.equal(reviewed.evidenceStatus, "checked");
+			assert.equal(reviewed.reviewResult?.status, "reviewed");
 
 			const blockers = await evaluateAcceptance({
 				acceptance,
@@ -522,81 +935,68 @@ describe("acceptance gates", () => {
 				},
 			});
 			assert.equal(blockers.status, "rejected");
+			assert.equal(blockers.evidenceStatus, "checked");
 			assert.equal(blockers.reviewResult?.status, "blockers");
 
-			const unavailable = await evaluateAcceptance({ acceptance, output: report(), cwd });
-			assert.equal(unavailable.status, "rejected");
-			assert.equal(unavailable.reviewResult?.status, "needs-parent-decision");
+			const pending = await evaluateAcceptance({ acceptance, output: report(), cwd });
+			assert.equal(pending.status, "review-required");
+			assert.equal(pending.evidenceStatus, "checked");
+			assert.equal(pending.reviewResult?.status, "review-required");
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 
-	it("does not make explicit checked acceptance an explicit reviewed blocker when inference recommends review", async () => {
+	it("keeps inferred review required when callers explicitly select checked or auto evidence", async () => {
 		const cwd = tempRepo();
 		try {
-			const acceptance = resolveEffectiveAcceptance({
-				agentName: "worker",
-				task: "Implement each dynamic item",
-				dynamic: true,
-				explicit: { level: "checked" },
-			});
-
-			assert.equal(acceptance.level, "reviewed");
-			assert.equal(acceptance.review && acceptance.review !== false ? acceptance.review.required : undefined, false);
-			const ledger = await evaluateAcceptance({ acceptance, output: report({ criteriaSatisfied: [
-				{ id: "criterion-1", status: "satisfied", evidence: "implemented" },
-				{ id: "criterion-2", status: "satisfied", evidence: "evidence returned" },
-			] }), cwd });
-			assert.equal(ledger.status, "checked");
-			assert.equal(ledger.reviewResult?.status, "needs-parent-decision");
-		} finally {
-			fs.rmSync(cwd, { recursive: true, force: true });
-		}
-	});
-
-	it("keeps inferred review non-blocking when explicit auto is supplied", async () => {
-		const cwd = tempRepo();
-		try {
-			for (const explicit of ["auto", { level: "auto" }] as const) {
+			for (const explicit of [{ level: "checked" }, "auto", { level: "auto" }] as const) {
 				const acceptance = resolveEffectiveAcceptance({
 					agentName: "worker",
-					task: "Implement the async fix",
-					async: true,
+					acceptanceRole: "writer",
+					task: "Implement each dynamic item",
+					dynamic: true,
 					explicit,
 				});
 
-				assert.equal(acceptance.level, "reviewed");
-				assert.equal(acceptance.review && acceptance.review !== false ? acceptance.review.required : undefined, false);
+				assert.equal(acceptance.level, "checked");
+				assert.equal(acceptance.review && acceptance.review !== false ? acceptance.review.required : undefined, true);
 				const ledger = await evaluateAcceptance({ acceptance, output: report({ criteriaSatisfied: [
 					{ id: "criterion-1", status: "satisfied", evidence: "implemented" },
 					{ id: "criterion-2", status: "satisfied", evidence: "evidence returned" },
 				] }), cwd });
-				assert.equal(ledger.status, "checked");
-				assert.equal(ledger.reviewResult?.status, "needs-parent-decision");
+				assert.equal(ledger.status, "review-required");
+				assert.equal(ledger.evidenceStatus, "checked");
+				assert.equal(ledger.reviewResult?.status, "review-required");
 			}
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 
-	it("does not mark reviewed without an independent reviewer result", async () => {
+	it("allows an explicit review opt-out without claiming reviewed status", async () => {
 		const cwd = tempRepo();
 		try {
-			const acceptance = resolveEffectiveAcceptance({
-				agentName: "worker",
-				task: "Implement a fix",
-				explicit: {
-					level: "reviewed",
-					review: false,
-				},
-			});
-			assert.equal(acceptance.level, "reviewed");
-
-			const ledger = await evaluateAcceptance({ acceptance, output: report(), cwd });
-			assert.equal(ledger.status, "rejected");
-			assert.equal(ledger.reviewResult?.status, "needs-parent-decision");
-			assert.match(acceptanceFailureMessage(ledger) ?? "", /review required/i);
+			for (const review of [false, { agent: "reviewer", required: false }] as const) {
+				const acceptance = resolveEffectiveAcceptance({
+					agentName: "worker",
+					task: "Implement an async fix",
+					async: true,
+					explicit: { level: "checked", review },
+				});
+				const ledger = await evaluateAcceptance({
+					acceptance,
+					output: report({ criteriaSatisfied: [
+						{ id: "criterion-1", status: "satisfied", evidence: "implemented" },
+						{ id: "criterion-2", status: "satisfied", evidence: "evidence returned" },
+					] }),
+					cwd,
+					reviewResult: { status: "review-required", findings: [] },
+				});
+				assert.equal(ledger.status, "checked");
+				assert.equal(ledger.evidenceStatus, "checked");
+				assert.equal(ledger.reviewResult, undefined);
+			}
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
@@ -730,7 +1130,7 @@ describe("acceptance gates", () => {
 			const malformedReports = [
 				"```acceptance-report\n{ not json\n```",
 				"```acceptance-report\n```",
-				"```acceptance-report\n{\"criteriaSatisfied\": []}",
+				"```acceptance-report\n{\"changedFiles\": false}",
 				"ACCEPTANCE_REPORT: { not json",
 			];
 
@@ -753,6 +1153,70 @@ describe("acceptance gates", () => {
 			});
 			assert.equal(inline.status, "rejected");
 			assert.match(inline.childReportParseError ?? "", /Failed to parse acceptance-report/);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("records durable malformed report evidence without relaxing rejection", async () => {
+		const cwd = tempRepo();
+		try {
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "worker",
+				task: "Implement a fix",
+				explicit: { level: "checked" },
+			});
+			const reportPath = path.join(cwd, "child-report.md");
+			const malformed = JSON.stringify({ criteriaSatisfied: true, commandsRun: ["npm test"] });
+			const ledger = await evaluateAcceptance({
+				acceptance,
+				output: "file-only child output",
+				fileOutput: { content: `ACCEPTANCE_REPORT: ${malformed}`, path: reportPath, authoritative: true, durable: true },
+				cwd,
+			});
+
+			assert.equal(ledger.status, "rejected");
+			assert.deepEqual(ledger.recovery, {
+				status: "available-for-review",
+				reason: "acceptance-metadata-rejected",
+				reportPath,
+				reportHash: createHash("sha256").update(`ACCEPTANCE_REPORT: ${malformed}`).digest("hex"),
+			});
+			const optional = await evaluateAcceptance({
+				acceptance,
+				output: "file-only child output",
+				fileOutput: { content: `ACCEPTANCE_REPORT: ${malformed}`, path: reportPath, authoritative: true, durable: true },
+				cwd,
+				reportOptional: true,
+			});
+			assert.equal(optional.status, "rejected");
+			assert.deepEqual(optional.recovery, ledger.recovery);
+
+			const missing = await evaluateAcceptance({
+				acceptance,
+				output: "file-only child output",
+				fileOutput: { content: "artifact without acceptance metadata", path: reportPath, authoritative: true, durable: true },
+				cwd,
+			});
+			assert.equal(missing.status, "rejected");
+			assert.equal(missing.recovery, undefined);
+			const textOnlyMalformed = await evaluateAcceptance({
+				acceptance,
+				output: `ACCEPTANCE_REPORT: ${malformed}`,
+				fileOutput: { content: "artifact without acceptance metadata", path: reportPath, authoritative: true, durable: true },
+				cwd,
+			});
+			assert.equal(textOnlyMalformed.status, "rejected");
+			assert.equal(textOnlyMalformed.recovery, undefined);
+
+			const unmet = await evaluateAcceptance({
+				acceptance,
+				output: report({ criteriaSatisfied: [{ id: "criterion-1", status: "not-satisfied", evidence: "not proved" }] }),
+				fileOutput: { content: report({ criteriaSatisfied: [{ id: "criterion-1", status: "not-satisfied", evidence: "not proved" }] }), path: reportPath, authoritative: true, durable: true },
+				cwd,
+			});
+			assert.equal(unmet.status, "rejected");
+			assert.equal(unmet.recovery, undefined);
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
@@ -795,61 +1259,56 @@ describe("acceptance gates", () => {
 		});
 
 		assert.equal(errors.length, 5);
-		assert.match(errors[0] ?? "", /^acceptance cannot be requested explicitly/);
-		assert.match(errors[1] ?? "", /^tasks\[0\]\.acceptance\.level cannot be requested explicitly/);
-		assert.match(errors[2] ?? "", /^chain\[0\]\.acceptance cannot be requested explicitly/);
-		assert.match(errors[3] ?? "", /^chain\[1\]\.parallel\[0\]\.acceptance\.level cannot be requested explicitly/);
-		assert.match(errors[4] ?? "", /^chain\[2\]\.parallel\.acceptance cannot be requested explicitly/);
-		assert.match(errors.join("\n"), /independent reviewer result/);
+		assert.match(errors[0] ?? "", /^acceptance is an achieved status/);
+		assert.match(errors[1] ?? "", /^tasks\[0\]\.acceptance\.level is an achieved status/);
+		assert.match(errors[2] ?? "", /^chain\[0\]\.acceptance is an achieved status/);
+		assert.match(errors[3] ?? "", /^chain\[1\]\.parallel\[0\]\.acceptance\.level is an achieved status/);
+		assert.match(errors[4] ?? "", /^chain\[2\]\.parallel\.acceptance is an achieved status/);
+		assert.match(errors.join("\n"), /acceptance\.review\.required/);
 	});
 
-	it("blanket read-only wording is not inferred as a risky write task", () => {
-		const readOnlyWorker = resolveEffectiveAcceptance({
-			agentName: "worker",
-			task: "Report on the extraction pipeline. Do not modify project/source files.",
-			async: true,
+	it("rejects transport-permitted true acceptance before execution, including nested inputs", () => {
+		const errors = validateExecutionAcceptance({
+			acceptance: true,
+			tasks: [{ acceptance: true }],
+			chain: [{ acceptance: true }, { parallel: [{ acceptance: true }] }, { parallel: { acceptance: true } }],
 		});
-		assert.equal(readOnlyWorker.level, "attested");
-		for (const task of [
-			"Inspect the extraction pipeline",
-			"Summarize the extraction pipeline",
-			"Review only: return findings",
-			"Analyze the extraction pipeline without edits",
-		]) {
-			assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task, async: true }).level, "attested", task);
-		}
-
-		assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task: "Inspect the failure and implement the fix" }).level, "checked");
-		assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task: "Inspect the failure and implement the fix", async: true }).level, "reviewed");
-		assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task: "Do not modify tests; implement the fix", async: true }).level, "reviewed");
-		assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task: "Do not modify tests but implement the fix", async: true }).level, "reviewed");
-		assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task: "Do not modify tests and implement the fix", async: true }).level, "reviewed");
-		for (const task of [
-			"Do not modify tests - implement the fix",
-			"Do not modify tests – implement the fix",
-			"Do not modify tests — implement the fix",
-		]) {
-			assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task }).level, "checked", task);
-			assert.equal(resolveEffectiveAcceptance({ agentName: "worker", task, async: true }).level, "reviewed", task);
-		}
+		const paths = ["acceptance", "tasks[0].acceptance", "chain[0].acceptance", "chain[1].parallel[0].acceptance", "chain[2].parallel.acceptance"];
+		assert.equal(errors.length, paths.length);
+		paths.forEach((path, index) => assert.ok(errors[index]?.startsWith(`${path} must be a string level, false, or an object.`)));
 	});
 
-	it("bare write verbs keep their reviewed gate for async tasks on any agent", () => {
-		const tasks = [
-			"Write the code",
-			"Commit the changes",
-			"Delete temporary data",
-			"Remove obsolete assets",
-			"Update dependencies",
-		];
-		for (const task of tasks) {
-			assert.equal(resolveEffectiveAcceptance({ agentName: "delegate", task, async: true }).level, "reviewed", task);
-		}
+	it("requires outputSchema for explicit structured acceptance report mode", () => {
+		const schema = { type: "object" as const };
+		const errors = validateExecutionAcceptance({
+			acceptance: { level: "checked", report: "on" },
+			tasks: [
+				{ acceptance: { level: "checked", report: "off" } },
+				{ outputSchema: schema, acceptance: { level: "checked", report: "on" } },
+				{ outputSchema: false, acceptance: { level: "checked", report: "on" } },
+			],
+			chain: [
+				{ acceptance: { level: "checked", report: "on" } },
+				{ outputSchema: schema, acceptance: { level: "checked", report: "off" } },
+				{ parallel: [{ acceptance: { level: "checked", report: "on" } }, { outputSchema: schema, acceptance: { level: "checked", report: "on" } }] },
+				{ parallel: { acceptance: { level: "checked", report: "off" } } },
+			],
+		});
+
+		assert.deepEqual(errors, [
+			"acceptance.report requires outputSchema.",
+			"tasks[0].acceptance.report requires outputSchema.",
+			"tasks[2].acceptance.report requires outputSchema.",
+			"chain[0].acceptance.report requires outputSchema.",
+			"chain[2].parallel[0].acceptance.report requires outputSchema.",
+			"chain[3].parallel.acceptance.report requires outputSchema.",
+		]);
 	});
 
-	it("explicit levels are honored over a read-only inference without silent escalation", () => {
+	it("explicit levels are honored over declared read-only policy without silent escalation", () => {
 		const resolved = resolveEffectiveAcceptance({
 			agentName: "researcher",
+			acceptanceRole: "read-only",
 			task: "Research PDF backends. Do not modify project/source files.",
 			explicit: "checked",
 			async: true,
@@ -857,15 +1316,139 @@ describe("acceptance gates", () => {
 		assert.equal(resolved.level, "checked");
 	});
 
+	it("normalizes one gate command and rejects acceptance combinations", () => {
+		assert.deepEqual(normalizeGateAcceptance(" npm run check ", undefined), {
+			ok: true,
+			acceptance: { level: "verified", verify: [{ id: "gate", command: "npm run check" }] },
+		});
+		const emptyGate = normalizeGateAcceptance("", undefined);
+		assert.equal(emptyGate.ok, false);
+		assert.match(emptyGate.error, /non-empty command string/);
+		const conflictingGate = normalizeGateAcceptance("npm test", "checked");
+		assert.equal(conflictingGate.ok, false);
+		assert.match(conflictingGate.error, /cannot be combined with acceptance/);
+		assert.match(conflictingGate.error, /Both fields were present: gate="npm test" acceptance="checked"/);
+		const oversizedAcceptance = normalizeGateAcceptance("npm test", { level: "checked", evidence: ["a".repeat(200)] });
+		assert.equal(oversizedAcceptance.ok, false);
+		assert.match(oversizedAcceptance.error || "", /Both fields were present/);
+		assert.ok(!(oversizedAcceptance.error || "").includes("a".repeat(200)));
+		const disabledAcceptance = normalizeGateAcceptance("npm test", false);
+		assert.deepEqual(disabledAcceptance, {
+			ok: true,
+			acceptance: { level: "verified", verify: [{ id: "gate", command: "npm test" }] },
+		});
+	});
+
+	it("keeps explicit acceptance.verify arrays as existing verified acceptance", async () => {
+		const cwd = tempGitRepo();
+		const artifactsDir = path.join(cwd, ".artifacts");
+		try {
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "worker",
+				task: "run explicit verification",
+				explicit: { level: "verified", verify: [
+					{ id: "one", command: `${process.execPath} -e "require('node:fs').writeFileSync('one.txt','ok')"` },
+					{ id: "two", command: `${process.execPath} -e "require('node:fs').writeFileSync('two.txt','ok')"` },
+				] },
+				agentContract: { version: 1 },
+			});
+			const ledger = await evaluateAcceptance({ acceptance, output: "done", cwd, reportOptional: true, artifactsDir, runId: "multi-verify" });
+			assert.equal(ledger.status, "verified");
+			assert.deepEqual(ledger.verifyRuns.map((run) => [run.id, run.status]), [["one", "passed"], ["two", "passed"]]);
+			assert.equal(fs.readFileSync(path.join(cwd, "one.txt"), "utf-8"), "ok");
+			assert.equal(fs.readFileSync(path.join(cwd, "two.txt"), "utf-8"), "ok");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("memoizes host verification by tracked Git state, including failures", async () => {
+		const cwd = tempGitRepo();
+		const artifactsDir = path.join(cwd, ".artifacts");
+		const previousInheritedSecret = process.env.GATE_INHERITED_SECRET;
+		process.env.GATE_INHERITED_SECRET = "host-secret-not-persisted";
+		try {
+			const passing = resolveEffectiveAcceptance({
+				agentName: "worker",
+				task: "run gate",
+				explicit: { level: "verified", verify: [{ id: "gate", command: `${process.execPath} -e "process.stdout.write(process.env.GATE_SECRET+':'+process.env.GATE_INHERITED_SECRET);require('node:fs').appendFileSync('count.txt','x')"`, env: { GATE_SECRET: "not-persisted" } }] },
+				agentContract: { version: 1 },
+			});
+			const evaluate = () => evaluateAcceptance({ acceptance: passing, output: "done", cwd, reportOptional: true, artifactsDir, runId: "memo-run" });
+			const first = await evaluate();
+			const same = await evaluate();
+			fs.writeFileSync(path.join(cwd, "untracked.txt"), "ignored\n", "utf-8");
+			const untracked = await evaluate();
+			process.env.GATE_INHERITED_SECRET = "host-secret-changed";
+			const inheritedChanged = await evaluate();
+			fs.writeFileSync(path.join(cwd, "file.txt"), "tracked change\n", "utf-8");
+			const tracked = await evaluate();
+			assert.equal(fs.readFileSync(path.join(cwd, "count.txt"), "utf-8"), "xxx");
+			assert.equal(first.verifyRuns[0]?.memoized, false);
+			assert.equal(first.verifyRuns[0]?.stdout, "[REDACTED]:[REDACTED]");
+			assert.equal(same.verifyRuns[0]?.memoized, true);
+			assert.equal(untracked.verifyRuns[0]?.memoized, true);
+			assert.equal(inheritedChanged.verifyRuns[0]?.memoized, false);
+			assert.equal(inheritedChanged.verifyRuns[0]?.stdout, "[REDACTED]:[REDACTED]");
+			assert.equal(tracked.verifyRuns[0]?.memoized, false);
+			const artifact = fs.readFileSync(first.verifyRuns[0]!.artifactPath!, "utf-8");
+			assert.doesNotMatch(artifact, /not-persisted/);
+			assert.doesNotMatch(artifact, /host-secret-not-persisted/);
+			assert.doesNotMatch(artifact, /host-secret-changed/);
+			assert.match(artifact, /GATE_SECRET/);
+
+			const failing = resolveEffectiveAcceptance({
+				agentName: "worker",
+				task: "run gate",
+				explicit: { level: "verified", verify: [{ id: "gate", command: `${process.execPath} -e "require('node:fs').appendFileSync('fail-count.txt','x');process.exit(7)"` }] },
+				agentContract: { version: 1 },
+			});
+			const failOnce = await evaluateAcceptance({ acceptance: failing, output: "done", cwd, reportOptional: true, artifactsDir, runId: "failure-run" });
+			const failCached = await evaluateAcceptance({ acceptance: failing, output: "done", cwd, reportOptional: true, artifactsDir, runId: "failure-run" });
+			assert.equal(failOnce.status, "rejected");
+			assert.equal(failCached.status, "rejected");
+			assert.equal(failCached.verifyRuns[0]?.memoized, true);
+			assert.equal(failCached.verifyRuns[0]?.exitCode, 7);
+			assert.equal(fs.readFileSync(path.join(cwd, "fail-count.txt"), "utf-8"), "x");
+		} finally {
+			if (previousInheritedSecret === undefined) delete process.env.GATE_INHERITED_SECRET;
+			else process.env.GATE_INHERITED_SECRET = previousInheritedSecret;
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("normalizes JSON-encoded acceptance objects before existing validation", () => {
+		const inline = { level: "checked" as const, evidence: ["commands-run" as const, "changed-files" as const] };
+		const encoded = JSON.stringify(inline);
+
+		assert.deepEqual(normalizeAcceptanceInput(encoded), inline);
+		assert.deepEqual(validateAcceptanceInput(encoded), validateAcceptanceInput(inline));
+		assert.match(validateAcceptanceInput(JSON.stringify({ evidence: "commands-run" })).join("\n"), /acceptance\.evidence must be an array/);
+		assert.match(validateAcceptanceInput('{"level":"checked"').join("\n"), /acceptance JSON string must encode a valid acceptance object/i);
+		assert.match(validateAcceptanceInput(JSON.stringify(["checked"])).join("\n"), /acceptance JSON string must encode an object/i);
+	});
+
 	it("validates invalid disable and verify shapes", () => {
 		assert.deepEqual(validateAcceptanceInput({ level: "none" }), ["acceptance.reason is required when level is none."]);
 		assert.deepEqual(validateAcceptanceInput("none"), ["acceptance level \"none\" requires a reason; use { level: \"none\", reason: \"...\" }."]);
+		assert.match(validateAcceptanceInput("verified").join("\n"), /object form with at least one runtime verify command.*Use level "checked" or provide a non-empty acceptance\.verify array/);
+		for (const input of [{ level: "verified" }, { level: "verified", verify: [] }]) {
+			assert.match(validateAcceptanceInput(input).join("\n"), /at least one runtime command when level is verified.*Use level "checked" or provide a non-empty acceptance\.verify array/);
+		}
+		assert.deepEqual(validateAcceptanceInput({ level: "verified", verify: [{ id: "tests", command: "npm test" }] }), []);
+		assert.deepEqual(validateAcceptanceInput({ level: "verified", verify: [{ id: "tests", command: "npm test" }, { id: "lint", command: "npm run lint" }] }), []);
+		assert.deepEqual(validateAcceptanceInput({ level: "checked" }), []);
+		assert.deepEqual(validateAcceptanceInput({ level: "checked", report: "on" }), []);
+		assert.deepEqual(validateAcceptanceInput({ level: "checked", preserveStagedIndex: true }), []);
+		assert.match(validateAcceptanceInput({ level: "checked", preserveStagedIndex: false }).join("\n"), /preserveStagedIndex must be true/);
+		assert.match(validateAcceptanceInput({ preserveStagedIndex: true }).join("\n"), /requires level checked or verified/);
+		assert.match(validateAcceptanceInput({ report: "sometimes" }).join("\n"), /acceptance\.report must be on or off/);
 		assert.deepEqual(validateAcceptanceInput({ verify: [{ id: "missing-command" }] }), ["acceptance.verify[0].command is required."]);
 		assert.deepEqual(validateAcceptanceInput({ verify: [{ id: "fractional", command: "npm test", timeoutMs: 1.5 }] }), ["acceptance.verify[0].timeoutMs must be an integer >= 1."]);
 		assert.deepEqual(validateAcceptanceInput(false), []);
 		assert.deepEqual(validateAcceptanceInput("checked"), []);
-		assert.match(validateAcceptanceInput("reviewed").join("\n"), /cannot be requested explicitly.*independent reviewer result/i);
-		assert.match(validateAcceptanceInput({ level: "reviewed" }).join("\n"), /cannot be requested explicitly.*independent reviewer result/i);
+		assert.match(validateAcceptanceInput("reviewed").join("\n"), /achieved status.*omit acceptance.*acceptance\.review\.required/i);
+		assert.match(validateAcceptanceInput({ level: "reviewed" }).join("\n"), /achieved status.*omit acceptance.*acceptance\.review\.required/i);
 		assert.deepEqual(validateAcceptanceInput({ criteria: ["ship the fix"], review: false, stopRules: ["stay scoped"] }), []);
 		assert.match(validateAcceptanceInput({ criteria: [{ id: "missing-must" }] }).join("\n"), /acceptance\.criteria\[0\]\.must is required/);
 		assert.match(validateAcceptanceInput({ criteria: [
@@ -873,10 +1456,129 @@ describe("acceptance gates", () => {
 			{ id: "release check", must: "second" },
 		] }).join("\n"), /acceptance\.criteria\[1\]\.id duplicates normalized criterion id 'release-check'/);
 		assert.match(validateAcceptanceInput({ criteria: [123] }).join("\n"), /acceptance\.criteria\[0\] must be a string or an object/);
-		assert.match(validateAcceptanceInput({ evidence: ["bogus"] }).join("\n"), /acceptance\.evidence\[0\] is not a supported evidence kind/);
+		assert.match(validateAcceptanceInput({ evidence: "commands-run" }).join("\n"), /acceptance\.evidence must be an array.*Supported evidence kinds:.*commands-run.*changed-files/s);
+		assert.match(validateAcceptanceInput({ evidence: ["bogus"] }).join("\n"), /acceptance\.evidence\[0\] "bogus" is not a supported evidence kind.*Supported evidence kinds:.*manual-notes.*Example:/s);
+		assert.match(validateAcceptanceInput({ criteria: [{ id: "ship", must: "ship", evidence: ["commands_run"] }] }).join("\n"), /acceptance\.criteria\[0\]\.evidence\[0\] "commands_run" is not a supported evidence kind.*Supported evidence kinds:/s);
 		assert.match(validateAcceptanceInput({ review: true }).join("\n"), /acceptance\.review must be false or an object/);
 		assert.match(validateAcceptanceInput({ review: { required: "yes" } }).join("\n"), /acceptance\.review\.required must be a boolean/);
 		assert.match(validateAcceptanceInput({ stopRules: [123] }).join("\n"), /acceptance\.stopRules\[0\] must be a string/);
 		assert.match(validateAcceptanceInput({ surprise: true }).join("\n"), /acceptance\.surprise is not supported/);
+	});
+
+	it("resolves structured acceptance report capture without changing the omitted default", () => {
+		assert.equal(resolveAcceptanceReportMode(undefined), "optional");
+		assert.equal(resolveAcceptanceReportMode("checked"), "optional");
+		assert.equal(resolveAcceptanceReportMode(false), "off");
+		assert.equal(resolveAcceptanceReportMode({ report: "off" }), "off");
+		assert.equal(resolveAcceptanceReportMode({ report: "on" }), "required");
+	});
+});
+
+describe("quoteExecutableForShell", () => {
+	it("quotes an unquoted Windows executable path containing spaces", () => {
+		assert.equal(
+			quoteExecutableForShell("C:\\Program Files\\vendor\\tool.exe --flag", "win32"),
+			"\"C:\\Program Files\\vendor\\tool.exe\" --flag",
+		);
+	});
+
+	it("quotes an unquoted Windows executable path with parentheses", () => {
+		assert.equal(
+			quoteExecutableForShell("C:\\Program Files (x86)\\vendor\\tool.exe --flag", "win32"),
+			"\"C:\\Program Files (x86)\\vendor\\tool.exe\" --flag",
+		);
+	});
+
+	it("quotes an extensionless spaced executable before a later drive-root argument", () => {
+		assert.equal(
+			quoteExecutableForShell("C:\\Program Files\\Tool\\verify C:\\path\\to\\file.exe", "win32"),
+			"\"C:\\Program Files\\Tool\\verify\" C:\\path\\to\\file.exe",
+		);
+	});
+
+	it("quotes an extensionless spaced executable before a flag argument", () => {
+		assert.equal(
+			quoteExecutableForShell("C:\\Program Files\\Tool\\verify --flag", "win32"),
+			"\"C:\\Program Files\\Tool\\verify\" --flag",
+		);
+	});
+
+	it("quotes an extensionless spaced executable filename before a flag argument", () => {
+		assert.equal(
+			quoteExecutableForShell("C:\\Program Files\\my tool --flag", "win32"),
+			"\"C:\\Program Files\\my tool\" --flag",
+		);
+	});
+
+	it("quotes a spaced executable before a later drive-root executable argument", () => {
+		assert.equal(
+			quoteExecutableForShell("C:\\Program Files\\Tool\\verify.exe C:\\path\\to\\file.exe", "win32"),
+			"\"C:\\Program Files\\Tool\\verify.exe\" C:\\path\\to\\file.exe",
+		);
+	});
+
+	it("quotes a spaced executable filename", () => {
+		assert.equal(
+			quoteExecutableForShell("C:\\Program Files\\my tool.exe --flag", "win32"),
+			"\"C:\\Program Files\\my tool.exe\" --flag",
+		);
+	});
+
+	it("leaves an already-quoted command unchanged", () => {
+		const command = "\"C:\\Program Files\\vendor\\tool.exe\" --flag";
+		assert.equal(quoteExecutableForShell(command, "win32"), command);
+	});
+
+	it("leaves a single-token command unchanged", () => {
+		assert.equal(quoteExecutableForShell("phpunit", "win32"), "phpunit");
+	});
+
+	it("leaves a first token without spaces unchanged", () => {
+		const command = "node script.js --check";
+		assert.equal(quoteExecutableForShell(command, "win32"), command);
+	});
+
+	it("leaves a Windows executable path without spaces unchanged", () => {
+		const command = "C:\\tools\\tool.exe --flag";
+		assert.equal(quoteExecutableForShell(command, "win32"), command);
+	});
+
+	it("leaves an executable followed by an executable-looking argument unchanged", () => {
+		const command = "C:\\tools\\node script.exe";
+		assert.equal(quoteExecutableForShell(command, "win32"), command);
+	});
+
+	it("quotes a shallow spaced executable filename", () => {
+		assert.equal(
+			quoteExecutableForShell("C:\\Program Files\\node script.exe", "win32"),
+			"\"C:\\Program Files\\node script.exe\"",
+		);
+	});
+
+	it("leaves ambiguous shell syntax in extensionless commands unchanged", () => {
+		const command = "C:\\Program Files\\Tool\\verify&echo C:\\arg";
+		assert.equal(quoteExecutableForShell(command, "win32"), command);
+	});
+
+	it("leaves a spaced executable argument after an executable unchanged", () => {
+		const command = "C:\\tools\\tool.exe C:\\Program Files\\data\\file.exe";
+		assert.equal(quoteExecutableForShell(command, "win32"), command);
+	});
+
+	it("leaves a spaced executable-looking argument after an extensionless executable unchanged", () => {
+		const command = "C:\\tools\\verify C:\\Program Files\\data\\file.exe";
+		assert.equal(quoteExecutableForShell(command, "win32"), command);
+	});
+
+	it("passes commands through unchanged on non-Windows platforms", () => {
+		const command = "/opt/my tools/runner --flag";
+		assert.equal(quoteExecutableForShell(command, "linux"), command);
+		assert.equal(quoteExecutableForShell(command, "darwin"), command);
+	});
+
+	it("leaves ambiguous Windows commands unchanged", () => {
+		for (const command of ["tool file.exe", "cmd /c tool.exe", "echo hi > out.exe"]) {
+			assert.equal(quoteExecutableForShell(command, "win32"), command);
+		}
 	});
 });

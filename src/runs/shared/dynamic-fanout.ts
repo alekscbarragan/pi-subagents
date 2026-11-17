@@ -42,16 +42,16 @@ const SAFE_OUTPUT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ITEM_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ITEM_REF_PATTERN = /\{([A-Za-z_][A-Za-z0-9_]*)(?:\.([^{}]+))?\}/g;
 const RESERVED_TEMPLATE_NAMES = new Set(["task", "previous", "chain_dir", "outputs"]);
-const DYNAMIC_STEP_KEYS = new Set(["expand", "parallel", "collect", "concurrency", "failFast", "phase", "label", "acceptance"]);
-const RUNNER_DYNAMIC_STEP_KEYS = new Set([...DYNAMIC_STEP_KEYS, "effectiveAcceptance", "sessionFiles", "thinkingOverrides"]);
+const DYNAMIC_STEP_KEYS = new Set(["expand", "parallel", "collect", "concurrency", "failFast", "phase", "label", "acceptance", "agentContract", "gateOn"]);
+const RUNNER_DYNAMIC_STEP_KEYS = new Set([...DYNAMIC_STEP_KEYS, "effectiveAcceptance", "acceptanceInput", "acceptanceRole", "sessionFiles", "thinkingOverrides"]);
 const DYNAMIC_EXPAND_KEYS = new Set(["from", "item", "key", "maxItems", "onEmpty"]);
 const DYNAMIC_EXPAND_FROM_KEYS = new Set(["output", "path"]);
-const DYNAMIC_PARALLEL_KEYS = new Set(["agent", "task", "phase", "label", "outputSchema", "cwd", "output", "outputMode", "reads", "progress", "skill", "model", "toolBudget", "acceptance"]);
+const DYNAMIC_PARALLEL_KEYS = new Set(["agent", "task", "phase", "label", "outputSchema", "cwd", "machine", "output", "outputMode", "reads", "progress", "skill", "model", "fast", "toolBudget", "acceptance", "agentContract", "gateOn"]);
 const RUNNER_DYNAMIC_PARALLEL_KEYS = new Set([
 	...DYNAMIC_PARALLEL_KEYS,
-	"outputName", "structured", "inheritProjectContext", "inheritSkills", "skills", "outputPath", "namespaceOutputPath", "maxSubagentDepth",
-	"structuredOutput", "structuredOutputSchema", "tools", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "completionGuard", "systemPrompt",
-	"systemPromptMode", "thinking", "modelCandidates", "sessionFile", "effectiveAcceptance", "parentSessionId",
+	"runner", "outputName", "structured", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "skills", "outputPath", "namespaceOutputPath", "maxSubagentDepth", "timeoutMs", "waitToolEnabled", "waitToolDefaultTimeoutMs",
+	"structuredOutput", "structuredOutputSchema", "tools", "excludeTools", "allowNestedSubagents", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "builtinMcpTools", "mutationTools", "capabilityCeiling", "systemPrompt",
+	"systemPromptMode", "thinking", "requestedModel", "sessionFile", "effectiveAcceptance", "acceptanceInput", "acceptanceRole", "parentSessionId", "parentSessionFile", "requiredExtensions", "launchResolvedExtensions", "requestedCwd", "machineEnv",
 ]);
 const DYNAMIC_COLLECT_KEYS = new Set(["as", "outputSchema"]);
 
@@ -264,7 +264,7 @@ export function materializeDynamicParallelStep(step: DynamicParallelStep, output
 export function collectDynamicResults(
 	step: DynamicParallelStep,
 	items: DynamicMaterializedItem[],
-	results: Array<Pick<SingleResult, "agent" | "exitCode" | "error" | "timedOut" | "stopped" | "structuredOutput" | "artifactPaths" | "savedOutputPath"> & { output?: string; finalOutput?: string }>,
+	results: Array<Pick<SingleResult, "agent" | "error" | "timedOut" | "stopped" | "structuredOutput" | "artifactPaths" | "savedOutputPath"> & { exitCode: number | null; output?: string; finalOutput?: string }>,
 ): DynamicCollectedResult[] {
 	return items.map((entry, index) => {
 		const result = results[index];
@@ -288,9 +288,9 @@ export function collectDynamicResults(
 	});
 }
 
-export function validateDynamicCollection(schema: JsonSchemaObject | undefined, value: DynamicCollectedResult[]): void {
+export async function validateDynamicCollection(schema: JsonSchemaObject | undefined, value: DynamicCollectedResult[]): Promise<void> {
 	if (!schema) return;
-	const validation = validateStructuredOutputValue(schema, value);
+	const validation = await validateStructuredOutputValue(schema, value);
 	if (validation.status === "invalid") {
 		throw new DynamicFanoutError(`Collected output validation failed: ${validation.message}`);
 	}
